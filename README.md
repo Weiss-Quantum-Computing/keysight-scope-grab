@@ -101,7 +101,7 @@ touch it.
 
 ```json
 {
-  "outdir": "C:\Users\you\Desktop\scope_data",
+  "outdir": "C:\\Users\\you\\Desktop\\scope_data",
   "prefix": "EOM run",
   "channel_names": { "1": "EOM drive", "2": "cavity refl", "3": "", "4": "" }
 }
