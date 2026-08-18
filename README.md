@@ -8,7 +8,7 @@ Press GRAB (or the space bar) and you get, in your chosen folder:
 
 | File | Contents |
 |------|----------|
-| `<prefix>_<timestamp>.csv` | Waveform samples: `time_s` plus one `CH<n>_V` column per selected channel |
+| `<prefix>_<timestamp>.csv` | Waveform samples: `time_s` plus one column per selected channel, headed `CH<n>_V`, or `CH<n>_<name>_V` for a channel you have named |
 | `<prefix>_<timestamp>.png` | Screenshot of the scope display |
 | `<prefix>_<timestamp>.txt` | Acquisition metadata: sample rate, timebase, trigger and per-channel settings |
 
@@ -33,7 +33,8 @@ pythonw scope_grab.py
 `pythonw` keeps the console window from appearing. The app auto-connects to the first
 Keysight/Agilent USB instrument it finds; hit **Connect** to retry.
 
-- **Channels** - tick the channels to capture. Each becomes a column in the CSV.
+- **Channels** - tick the channels to capture and optionally name each one. Each
+  ticked channel becomes a column in the CSV.
 - **Save to** - output folder. Defaults to `~/Desktop/scope_data`.
 - **Filename prefix** - prepended to every file. Surrounding whitespace is trimmed and
   characters illegal in filenames are replaced with `_`.
@@ -41,6 +42,21 @@ Keysight/Agilent USB instrument it finds; hit **Connect** to retry.
   the space bar itself - so typing a space in the prefix box does not fire an
   acquisition.
 - **Auto-grab** - repeat on a fixed interval.
+
+## Channel names
+
+Naming a channel changes its CSV header from `CH1_V` to `CH1_EOM_drive_V`, and adds
+a `CH1 name` line to the metadata file recording the name exactly as typed. The
+column the name will produce is shown next to the box as you type.
+
+The channel number stays in the header even when a channel is named, so a column
+is always traceable to the per-channel settings in the metadata file, and two
+channels sharing a name cannot collide. Headers are reduced to ASCII letters,
+digits, `-`, `.` and `_`, so no name can introduce a stray delimiter or an
+encoding problem: `cavity refl,fast` becomes `CH3_cavity_refl_fast_V`.
+
+Names are per-session - they are not written to disk, so they start empty each time
+the app opens.
 
 ## Scope settings
 

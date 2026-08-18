@@ -76,6 +76,17 @@ CHANNEL_SETTINGS = [
 ]
 
 
+def safe_column(name):
+    """Turn a typed channel name into something safe to put in a CSV header:
+    ASCII word characters only, so no delimiter or encoding surprises when the
+    header is written or parsed."""
+    out = "".join(c if (c.isascii() and (c.isalnum() or c in "-.")) else "_"
+                  for c in name.strip())
+    while "__" in out:
+        out = out.replace("__", "_")
+    return out.strip("_")
+
+
 def fmt_setting(kind, raw):
     """Normalise a scope reply into what the panel displays."""
     raw = raw.strip()
@@ -214,7 +225,7 @@ class Scope:
             found.append(resp)
         return found
 
-    def metadata(self, channels, settings):
+    def metadata(self, channels, settings, names=None):
         """Format the metadata file. `settings` is the raw {scpi root: reply}
         snapshot already read for the panel, so a grab only asks the scope once
         and the file describes the same instant the panel shows. Values are the
@@ -234,6 +245,8 @@ class Scope:
             f"trigger slope      : {s(':TRIGger:EDGE:SLOPe')}",
         ]
         for ch in channels:
+            if names and names.get(ch):
+                lines.append(f"CH{ch} name          : {names[ch]}")
             lines += [
                 f"CH{ch} V/div         : {s(f':CHANnel{ch}:SCALe')}",
                 f"CH{ch} offset        : {s(f':CHANnel{ch}:OFFSet')}",
@@ -291,10 +304,26 @@ class App:
         chf = ttk.LabelFrame(left, text="Channels")
         chf.pack(fill="x", **pad)
         self.ch_vars = {}
-        for ch in (1, 2, 3, 4):
+        self.ch_names = {}
+        ttk.Label(chf, text="capture").grid(row=0, column=0, padx=(8, 4))
+        ttk.Label(chf, text="name").grid(row=0, column=1, sticky="w", padx=4)
+        ttk.Label(chf, text="CSV column").grid(row=0, column=2, sticky="w", padx=4)
+        for i, ch in enumerate((1, 2, 3, 4)):
             v = tk.BooleanVar(value=(ch == 1))
-            ttk.Checkbutton(chf, text=f"CH{ch}", variable=v).pack(side="left", padx=10, pady=6)
+            ttk.Checkbutton(chf, text=f"CH{ch}", variable=v).grid(
+                row=i + 1, column=0, sticky="w", padx=(8, 4), pady=1)
             self.ch_vars[ch] = v
+            name = tk.StringVar()
+            self.ch_names[ch] = name
+            ttk.Entry(chf, textvariable=name, width=18).grid(
+                row=i + 1, column=1, sticky="w", padx=4, pady=1)
+            # Show the header the name will actually produce, so the sanitising
+            # is never a surprise after the fact.
+            shown = tk.StringVar(value=f"CH{ch}_V")
+            ttk.Label(chf, textvariable=shown, foreground="#666").grid(
+                row=i + 1, column=2, sticky="w", padx=4, pady=1)
+            name.trace_add("write",
+                           lambda *_, c=ch, s=shown: s.set(self.column_name(c)))
 
         # --- output folder + prefix
         of = ttk.LabelFrame(left, text="Save to")
@@ -434,6 +463,13 @@ class App:
             except Exception as exc:
                 self.log(f"ERROR: {exc}")
 
+    def column_name(self, ch):
+        """CSV header for a channel. The channel number is kept even when named,
+        so a column stays traceable to the settings in the metadata file and two
+        channels sharing a name cannot collide."""
+        name = safe_column(self.ch_names[ch].get())
+        return f"CH{ch}_{name}_V" if name else f"CH{ch}_V"
+
     def channels(self):
         return [ch for ch, v in self.ch_vars.items() if v.get()]
 
@@ -484,12 +520,13 @@ class App:
                 self.log("  (no trigger within 10 s - forced stop, "
                          "reading memory contents)")
 
+            names = {ch: self.ch_names[ch].get().strip() for ch in chans}
             cols = {}
             for ch in chans:
                 t, v = self.scope.waveform(ch)
                 if "time_s" not in cols:
                     cols["time_s"] = t
-                cols[f"CH{ch}_V"] = v
+                cols[self.column_name(ch)] = v
 
             data = np.column_stack([cols[k] for k in cols])
             csv_path = base + ".csv"
@@ -504,7 +541,7 @@ class App:
             self.root.after(0, lambda v=settings: self.show_settings(v))
 
             with open(base + ".txt", "w") as fh:
-                fh.write(self.scope.metadata(chans, settings))
+                fh.write(self.scope.metadata(chans, settings, names))
 
             if self.save_png.get():
                 img = self.scope.screenshot()
