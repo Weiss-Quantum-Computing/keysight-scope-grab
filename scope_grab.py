@@ -59,6 +59,13 @@ GLOBAL_SETTINGS = [
     ("Trigger slope", ":TRIGger:EDGE:SLOPe", "choice", ("POS", "NEG", "EITH")),
     ("Acquisition", ":ACQuire:TYPE", "choice", ("NORM", "AVER", "HRES", "PEAK")),
 ]
+# Read-only values, refreshed on the same pass as the settings above. They are
+# per-acquisition results rather than knobs, so the panel shows them but never
+# writes them.
+INFO_SETTINGS = [
+    ("Sample rate (Sa/s)", ":ACQuire:SRATe"),
+    ("Points acquired", ":ACQuire:POINts"),
+]
 CHANNEL_SETTINGS = [
     ("V/div", ":CHANnel{ch}:SCALe", "num", None),
     ("Offset", ":CHANnel{ch}:OFFSet", "num", None),
@@ -74,7 +81,7 @@ def fmt_setting(kind, raw):
     raw = raw.strip()
     if kind == "bool":
         return "OFF" if raw in ("0", "OFF", "off") else "ON"
-    if kind == "num":
+    if kind in ("num", "info"):
         try:
             return f"{float(raw):g}"
         except ValueError:
@@ -207,28 +214,32 @@ class Scope:
             found.append(resp)
         return found
 
-    def metadata(self, channels):
-        q = self.inst.query
+    def metadata(self, channels, settings):
+        """Format the metadata file. `settings` is the raw {scpi root: reply}
+        snapshot already read for the panel, so a grab only asks the scope once
+        and the file describes the same instant the panel shows. Values are the
+        instrument's own strings, unrounded."""
+        s = lambda scpi: settings.get(scpi, "?")
         lines = [
             f"captured           : {datetime.datetime.now().isoformat()}",
             f"instrument         : {self.idn}",
             f"visa address       : {self.addr}",
-            f"sample rate (Sa/s) : {q(':ACQuire:SRATe?').strip()}",
-            f"points acquired    : {q(':ACQuire:POINts?').strip()}",
-            f"acquisition type   : {q(':ACQuire:TYPE?').strip()}",
-            f"timebase s/div     : {q(':TIMebase:SCALe?').strip()}",
-            f"timebase position  : {q(':TIMebase:POSition?').strip()}",
-            f"trigger source     : {q(':TRIGger:EDGE:SOURce?').strip()}",
-            f"trigger level      : {q(':TRIGger:EDGE:LEVel?').strip()}",
-            f"trigger slope      : {q(':TRIGger:EDGE:SLOPe?').strip()}",
+            f"sample rate (Sa/s) : {s(':ACQuire:SRATe')}",
+            f"points acquired    : {s(':ACQuire:POINts')}",
+            f"acquisition type   : {s(':ACQuire:TYPE')}",
+            f"timebase s/div     : {s(':TIMebase:SCALe')}",
+            f"timebase position  : {s(':TIMebase:POSition')}",
+            f"trigger source     : {s(':TRIGger:EDGE:SOURce')}",
+            f"trigger level      : {s(':TRIGger:EDGE:LEVel')}",
+            f"trigger slope      : {s(':TRIGger:EDGE:SLOPe')}",
         ]
         for ch in channels:
             lines += [
-                f"CH{ch} V/div         : {q(f':CHANnel{ch}:SCALe?').strip()}",
-                f"CH{ch} offset        : {q(f':CHANnel{ch}:OFFSet?').strip()}",
-                f"CH{ch} coupling      : {q(f':CHANnel{ch}:COUPling?').strip()}",
-                f"CH{ch} probe atten   : {q(f':CHANnel{ch}:PROBe?').strip()}",
-                f"CH{ch} bandwidth lim : {q(f':CHANnel{ch}:BWLimit?').strip()}",
+                f"CH{ch} V/div         : {s(f':CHANnel{ch}:SCALe')}",
+                f"CH{ch} offset        : {s(f':CHANnel{ch}:OFFSet')}",
+                f"CH{ch} coupling      : {s(f':CHANnel{ch}:COUPling')}",
+                f"CH{ch} probe atten   : {s(f':CHANnel{ch}:PROBe')}",
+                f"CH{ch} bandwidth lim : {s(f':CHANnel{ch}:BWLimit')}",
             ]
         return "\n".join(lines) + "\n"
 
@@ -487,8 +498,13 @@ class App:
             self.log(f"{os.path.basename(csv_path)}  "
                      f"({data.shape[0]} pts x {data.shape[1]} cols)")
 
+            # One settings read per grab: the panel and the metadata file are
+            # built from the same snapshot.
+            settings = self.read_all_settings()
+            self.root.after(0, lambda v=settings: self.show_settings(v))
+
             with open(base + ".txt", "w") as fh:
-                fh.write(self.scope.metadata(chans))
+                fh.write(self.scope.metadata(chans, settings))
 
             if self.save_png.get():
                 img = self.scope.screenshot()
@@ -497,11 +513,6 @@ class App:
                     fh.write(img)
                 self.log(f"{os.path.basename(png_path)}  ({len(img)} bytes)")
                 self.root.after(0, lambda p=png_path: self.show_preview(p))
-
-            # The knobs may have been turned on the scope itself since the
-            # last look, so refresh the panel from the instrument.
-            values = self.read_all_settings()
-            self.root.after(0, lambda v=values: self.show_settings(v))
 
             self.scope.run()
         except Exception as exc:
@@ -529,6 +540,13 @@ class App:
                                                 sticky="e", padx=(0, 4), pady=2)
             self.setting_widget(g, scpi, kind, choices, row, col * 2 + 1, 11)
 
+        for i, (label, scpi) in enumerate(INFO_SETTINGS):
+            row = len(GLOBAL_SETTINGS) // 2 + i // 2
+            col = (i % 2) * 2
+            ttk.Label(g, text=label + ":").grid(row=row, column=col, sticky="e",
+                                                padx=(0, 4), pady=2)
+            self.setting_widget(g, scpi, "info", None, row, col + 1, 11)
+
         c = ttk.Frame(sf)
         c.pack(fill="x", padx=6, pady=(6, 2))
         for j, (label, _, _, _) in enumerate(CHANNEL_SETTINGS):
@@ -553,19 +571,22 @@ class App:
         cell = ttk.Frame(parent)
         cell.grid(row=row, column=col, sticky="w", padx=2, pady=1)
         var = tk.StringVar()
-        if kind == "num":
-            w = ttk.Entry(cell, textvariable=var, width=width)
+        if kind == "info":
+            # read-only: no entry to edit, no edited-marker, never written back
+            ttk.Label(cell, textvariable=var, width=width).pack(side="left")
+        elif kind == "num":
+            ttk.Entry(cell, textvariable=var, width=width).pack(side="left")
         else:
-            w = ttk.Combobox(cell, textvariable=var, values=list(choices),
-                             width=max(4, width - 3), state="readonly")
-        w.pack(side="left")
-        mark = ttk.Label(cell, text=" ", width=1, foreground="#c60")
-        mark.pack(side="left")
+            ttk.Combobox(cell, textvariable=var, values=list(choices),
+                         width=max(4, width - 3), state="readonly").pack(side="left")
+        if kind != "info":
+            mark = ttk.Label(cell, text=" ", width=1, foreground="#c60")
+            mark.pack(side="left")
+            self.set_marks[scpi] = mark
+            var.trace_add("write", lambda *_: self.refresh_marks())
         self.set_vars[scpi] = var
-        self.set_marks[scpi] = mark
         self.set_kinds[scpi] = kind
         self.set_scope[scpi] = ""
-        var.trace_add("write", lambda *_: self.refresh_marks())
 
     def edited(self, scpi):
         """True if the panel value differs from what the scope last reported."""
@@ -594,7 +615,8 @@ class App:
         user has not applied yet - unless overwrite is set, which is the case
         after an Apply, when the scope is the authority on what took effect."""
         kept = 0
-        for scpi, value in values.items():
+        for scpi, raw in values.items():
+            value = fmt_setting(self.set_kinds[scpi], raw)
             was_edited = self.edited(scpi)
             self.set_scope[scpi] = value
             if overwrite or not was_edited:
@@ -607,11 +629,13 @@ class App:
         self.refresh_marks()
 
     def read_all_settings(self):
-        """Instrument thread only. Returns {scpi root: value to display}."""
+        """Instrument thread only. Returns the scope's own replies, unrounded, as
+        {scpi root: reply} - show_settings formats them for display and
+        Scope.metadata writes them verbatim."""
         values = {}
-        for scpi, kind in self.set_kinds.items():
+        for scpi in self.set_kinds:
             try:
-                values[scpi] = fmt_setting(kind, self.scope.get(scpi))
+                values[scpi] = self.scope.get(scpi)
             except Exception as exc:
                 self.log(f"  {scpi}? failed: {exc}")
         return values

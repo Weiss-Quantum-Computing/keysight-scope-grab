@@ -48,6 +48,9 @@ The **Scope settings** panel mirrors the instrument: timebase, trigger and
 acquisition mode, plus V/div, offset, coupling, probe attenuation, bandwidth limit
 and display state for each channel.
 
+Sample rate and points acquired sit alongside them, read-only - they are results
+of an acquisition rather than knobs.
+
 It reads from the scope when it connects, on **Read from scope**, and
 automatically after every grab - so settings changed with the scope's own knobs
 show up without asking.
@@ -75,3 +78,8 @@ and the screenshot matches the CSV data. If no trigger arrives within 10 s the s
 stopped and whatever is in acquisition memory is read out, with a note in the log.
 Waveforms are transferred as unsigned bytes in `RAW` points mode and scaled to volts
 using the preamble.
+
+Each grab reads the instrument's settings exactly once, and both the panel and the
+`.txt` file are rendered from that single snapshot - so the two can never disagree
+about what the scope was doing. The file records the scope's own strings unrounded;
+the panel shows the same values trimmed for legibility.
