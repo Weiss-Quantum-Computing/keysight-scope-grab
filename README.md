@@ -55,8 +55,7 @@ channels sharing a name cannot collide. Headers are reduced to ASCII letters,
 digits, `-`, `.` and `_`, so no name can introduce a stray delimiter or an
 encoding problem: `cavity refl,fast` becomes `CH3_cavity_refl_fast_V`.
 
-Names are per-session - they are not written to disk, so they start empty each time
-the app opens.
+Names are remembered between sessions - see below.
 
 ## Scope settings
 
@@ -86,6 +85,32 @@ To change a setting from the window, edit the field and press **Apply changes**:
 
 Settings traffic and captures share one VISA session, so they are serialised: the
 buttons grey out while a grab is running and vice versa.
+
+## Remembered settings
+
+The output folder, filename prefix and channel names are written to
+
+```
+%APPDATA%\ScopeGrab\config.json
+```
+
+so a session starts where the last one left off. The file is written after a
+capture, when you pick a folder, and on close - only when something actually
+changed. It lives outside the program folder, so updating this repo will not
+touch it.
+
+```json
+{
+  "outdir": "C:\Users\you\Desktop\scope_data",
+  "prefix": "EOM run",
+  "channel_names": { "1": "EOM drive", "2": "cavity refl", "3": "", "4": "" }
+}
+```
+
+Delete the file to go back to defaults. A missing, truncated or malformed file is
+ignored - each value falls back to its default independently, and the log notes
+when a file could not be read, so a bad config can never stop the app from
+starting.
 
 ## Notes on acquisition
 

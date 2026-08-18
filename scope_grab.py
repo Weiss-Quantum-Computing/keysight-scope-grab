@@ -11,6 +11,7 @@ Run with:  pythonw scope_grab.py      (pythonw = no console window)
 """
 
 import datetime
+import json
 import os
 import queue
 import threading
@@ -27,6 +28,10 @@ except ImportError:                       # without pillow: Tk's integer subsamp
     Image = ImageTk = None
 
 KTVISA = r"C:\Windows\System32\ktvisa32.dll"
+# Remembered between sessions: output folder, filename prefix, channel names.
+# Kept out of the program folder so a git pull cannot clobber it.
+CONFIG_PATH = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"),
+                           "ScopeGrab", "config.json")
 NOT_MEASURED = 9.9e37
 
 # Screenshot preview box, sized to fill the panel width. The scope sends
@@ -383,6 +388,8 @@ class App:
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(100, self.pump)
         self.root.after(300, self.do_connect)
+        self.saved_cfg = None
+        self.load_config()
         self.load_latest_preview()
 
     # -- helpers ----------------------------------------------------------
@@ -401,6 +408,58 @@ class App:
         if d:
             self.outdir.set(d)
             self.load_latest_preview()
+            self.save_config()
+
+    def current_cfg(self):
+        return {
+            "outdir": self.outdir.get(),
+            "prefix": self.prefix.get(),
+            "channel_names": {str(ch): var.get() for ch, var in self.ch_names.items()},
+        }
+
+    def load_config(self):
+        """Restore what the last session was using. Anything missing, malformed
+        or of the wrong type is ignored and leaves the default in place."""
+        try:
+            with open(CONFIG_PATH, encoding="utf-8") as fh:
+                cfg = json.load(fh)
+            if not isinstance(cfg, dict):
+                raise ValueError("not a JSON object")
+        except FileNotFoundError:
+            return
+        except Exception as exc:
+            self.log(f"Ignoring unreadable {CONFIG_PATH}: {exc}")
+            return
+
+        for key, var in (("outdir", self.outdir), ("prefix", self.prefix)):
+            value = cfg.get(key)
+            if isinstance(value, str) and value.strip():
+                var.set(value)
+        names = cfg.get("channel_names")
+        if isinstance(names, dict):
+            for ch, var in self.ch_names.items():
+                value = names.get(str(ch))
+                if isinstance(value, str):
+                    var.set(value)
+
+        self.saved_cfg = self.current_cfg()
+        self.log(f"Restored last session from {CONFIG_PATH}")
+        if not os.path.isdir(self.outdir.get()):
+            self.log(f"  (that folder does not exist yet: {self.outdir.get()})")
+
+    def save_config(self):
+        """Called after a grab, when the folder is picked, and on close. Writes
+        only when something actually changed."""
+        cfg = self.current_cfg()
+        if cfg == self.saved_cfg:
+            return
+        try:
+            os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+            with open(CONFIG_PATH, "w", encoding="utf-8") as fh:
+                json.dump(cfg, fh, indent=2)
+            self.saved_cfg = cfg
+        except Exception as exc:
+            self.log(f"Could not save {CONFIG_PATH}: {exc}")
 
     def on_space(self, event):
         try:
@@ -552,6 +611,7 @@ class App:
                 self.root.after(0, lambda p=png_path: self.show_preview(p))
 
             self.scope.run()
+            self.root.after(0, self.save_config)
         except Exception as exc:
             self.log(f"ERROR: {exc}")
         finally:
@@ -734,6 +794,7 @@ class App:
         self.auto_job = self.root.after(ms, self.schedule_auto)
 
     def on_close(self):
+        self.save_config()
         self.auto.set(False)
         self.toggle_auto()
         self.scope.close()
