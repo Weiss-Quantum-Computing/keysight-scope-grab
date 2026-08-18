@@ -41,7 +41,8 @@ Keysight/Agilent USB instrument it finds; hit **Connect** to retry.
 - **Space** grabs, except while the focus is in a text field or on a control that uses
   the space bar itself - so typing a space in the prefix box does not fire an
   acquisition.
-- **Auto-grab** - repeat on a fixed interval.
+- **Auto-grab** - repeat on a fixed interval, keeping timestamped names.
+- **Sequence** - a fixed number of runs with incrementing labels, see below.
 - **save screenshot?** - whether each grab also writes the PNG. The preview only
   updates when this is on, since it displays the file that was written.
 
@@ -58,6 +59,50 @@ digits, `-`, `.` and `_`, so no name can introduce a stray delimiter or an
 encoding problem: `cavity refl,fast` becomes `CH3_cavity_refl_fast_V`.
 
 Names are remembered between sessions - see below.
+
+## Numbered sequences
+
+A sequence takes a set number of captures and labels them by number instead of by
+clock time: `EOM ramp_001.csv`, `EOM ramp_002.csv`, and so on, with the matching
+`.txt` and `.png`. Set the number of runs, the interval, and the first label, then
+press **Start sequence**. The next file name is shown under the button.
+
+Nothing is lost by dropping the timestamp - the wall-clock time is still recorded
+inside each `.txt`, which also gains a `sequence label` line.
+
+- **Runs are chained off completion, not off a timer.** The next run is scheduled
+  once the previous one has finished writing, so a transfer that overruns the
+  interval can never overlap the next run or skip a label. You always get the
+  number of files you asked for, contiguously numbered.
+- The interval is measured from the *start* of each run, so a 1 s interval with a
+  0.3 s run gives a 1 s cadence. If a run takes longer than the interval the next
+  begins immediately and the log says so - which is how you find out the interval
+  is too short to honour.
+- **Existing files are never overwritten.** If the first label is already on disk
+  the sequence advances to the first free one and notes it in the log. When a
+  sequence ends, **First label** moves past the end, so pressing Start again
+  continues the series rather than colliding with it.
+- **Stop** ends a sequence early. A run already under way finishes and is saved,
+  and is included in the count.
+- Auto-grab is switched off when a sequence starts, since only one repeating
+  mechanism should drive the scope at a time.
+
+### How short can the interval be?
+
+The limit is usually writing the CSV rather than the USB transfer. Measured with
+`numpy.savetxt` on this machine:
+
+| Points | Columns | CSV write | File size |
+|-------:|--------:|----------:|----------:|
+| 500k | time + 1 channel | 2.0 s | 26 MB |
+| 500k | time + 4 channels | 3.6 s | 64 MB |
+| 1M | time + 1 channel | 3.9 s | 52 MB |
+| 2M | time + 1 channel | 7.9 s | 103 MB |
+
+So a 1 s interval is only realistic for short records. Ask for it anyway if you
+like - the sequence will simply run as fast as it can and tell you it could not
+keep up. Note also the disk cost: 100 runs of a 4-channel 500k-point capture is
+about 6 GB.
 
 ## Scope settings
 

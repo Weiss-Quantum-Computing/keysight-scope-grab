@@ -230,7 +230,7 @@ class Scope:
             found.append(resp)
         return found
 
-    def metadata(self, channels, settings, names=None):
+    def metadata(self, channels, settings, names=None, label=None):
         """Format the metadata file. `settings` is the raw {scpi root: reply}
         snapshot already read for the panel, so a grab only asks the scope once
         and the file describes the same instant the panel shows. Values are the
@@ -240,6 +240,7 @@ class Scope:
             f"captured           : {datetime.datetime.now().isoformat()}",
             f"instrument         : {self.idn}",
             f"visa address       : {self.addr}",
+        ] + ([f"sequence label     : {label}"] if label else []) + [
             f"sample rate (Sa/s) : {s(':ACQuire:SRATe')}",
             f"points acquired    : {s(':ACQuire:POINts')}",
             f"acquisition type   : {s(':ACQuire:TYPE')}",
@@ -279,6 +280,16 @@ class App:
         self.msgs = queue.Queue()
         self.busy = False
         self.auto_job = None
+        self.seq_active = False   # a numbered sequence is running
+        self.seq_job = None       # pending after() for the next run
+        self.seq_index = 0
+        self.seq_last = 0
+        self.seq_width = 3
+        self.seq_gap = 0.0
+        self.seq_started = 0.0
+        self.seq_t0 = 0.0
+        self.seq_inflight = None  # label of the run currently being captured
+        self.seq_done = 0
 
         root.title("Scope Grab - MSO-X 2014A")
         # Tall enough for the screenshot preview, but never taller than the
@@ -364,6 +375,35 @@ class App:
         self.save_png = tk.BooleanVar(value=True)
         ttk.Checkbutton(af, text="save screenshot?",
                         variable=self.save_png).pack(side="left", padx=12)
+
+        # --- numbered sequence
+        qf = ttk.LabelFrame(left, text="Sequence (numbered instead of timestamped)")
+        qf.pack(fill="x", **pad)
+        row = ttk.Frame(qf)
+        row.pack(fill="x", padx=6, pady=(6, 2))
+        ttk.Label(row, text="Runs:").pack(side="left")
+        self.seq_count = tk.StringVar(value="10")
+        ttk.Entry(row, textvariable=self.seq_count, width=6).pack(side="left", padx=(4, 10))
+        ttk.Label(row, text="Interval (s):").pack(side="left")
+        self.seq_interval = tk.StringVar(value="1")
+        ttk.Entry(row, textvariable=self.seq_interval, width=6).pack(side="left", padx=(4, 10))
+        ttk.Label(row, text="First label:").pack(side="left")
+        self.seq_start = tk.StringVar(value="1")
+        ttk.Entry(row, textvariable=self.seq_start, width=6).pack(side="left", padx=4)
+
+        row2 = ttk.Frame(qf)
+        row2.pack(fill="x", padx=6, pady=(2, 6))
+        self.seq_btn = ttk.Button(row2, text="Start sequence",
+                                  command=self.do_sequence, state="disabled")
+        self.seq_btn.pack(side="left")
+        self.seq_status = ttk.Label(row2, text="idle", foreground="#666")
+        self.seq_status.pack(side="left", padx=8)
+        self.seq_next = tk.StringVar()
+        ttk.Label(qf, textvariable=self.seq_next, foreground="#666").pack(
+            anchor="w", padx=8, pady=(0, 6))
+        for var in (self.prefix, self.seq_start, self.seq_count):
+            var.trace_add("write", lambda *_: self.show_next_name())
+        self.show_next_name()
 
         self.build_settings(left, pad)
 
@@ -542,9 +582,13 @@ class App:
 
     def set_busy(self, busy):
         self.busy = busy
-        state = "disabled" if busy or not self.scope.inst else "normal"
+        state = "disabled" if busy or self.seq_active or not self.scope.inst else "normal"
         for btn in (self.grab_btn, self.read_btn, self.apply_btn):
             btn.configure(state=state)
+        # The sequence button stays live while a sequence runs, so it can stop it.
+        self.seq_btn.configure(
+            state="normal" if self.scope.inst and (self.seq_active or not busy)
+            else "disabled")
 
     # -- actions ----------------------------------------------------------
 
@@ -575,12 +619,14 @@ class App:
         self.set_busy(True)
         threading.Thread(target=self._grab_worker, args=(chans,), daemon=True).start()
 
-    def _grab_worker(self, chans):
+    def _grab_worker(self, chans, label=None):
         try:
             outdir = self.outdir.get()
             os.makedirs(outdir, exist_ok=True)
-            stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            base = os.path.join(outdir, f"{self.safe_prefix()}_{stamp}")
+            # A sequence run is identified by its number; a one-off by the clock.
+            # Either way the wall-clock time is recorded inside the .txt file.
+            tag = label or datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            base = os.path.join(outdir, f"{self.safe_prefix()}_{tag}")
 
             triggered = self.scope.single(wait_s=10.0)
             if not triggered:
@@ -608,7 +654,7 @@ class App:
             self.root.after(0, lambda v=settings: self.show_settings(v))
 
             with open(base + ".txt", "w") as fh:
-                fh.write(self.scope.metadata(chans, settings, names))
+                fh.write(self.scope.metadata(chans, settings, names, label))
 
             if self.save_png.get():
                 img = self.scope.screenshot()
@@ -623,7 +669,7 @@ class App:
         except Exception as exc:
             self.log(f"ERROR: {exc}")
         finally:
-            self.root.after(0, lambda: self.set_busy(False))
+            self.root.after(0, self.grab_done)
 
     # -- settings panel ---------------------------------------------------
 
@@ -784,7 +830,129 @@ class App:
         except Exception as exc:
             self.log(f"ERROR: {exc}")
         finally:
+            # Settings I/O must not advance a sequence - only a grab does that.
             self.root.after(0, lambda: self.set_busy(False))
+
+    # -- numbered sequence -------------------------------------------------
+
+    def show_next_name(self):
+        """Live preview of the next file name the sequence will write."""
+        try:
+            start = max(1, int(self.seq_start.get()))
+            count = max(1, int(self.seq_count.get()))
+        except ValueError:
+            self.seq_next.set("next file: (runs and first label must be whole numbers)")
+            return
+        width = max(3, len(str(start + count - 1)))
+        self.seq_next.set(f"next file: {self.safe_prefix()}_{start:0{width}d}.csv")
+
+    def do_sequence(self):
+        if self.seq_active:
+            self.stop_sequence(aborted=True)
+            return
+        if self.busy or not self.scope.inst:
+            return
+        try:
+            count = int(self.seq_count.get())
+            start = int(self.seq_start.get())
+            gap = float(self.seq_interval.get())
+        except ValueError:
+            self.log("Sequence: runs, first label and interval must be numbers.")
+            return
+        if count < 1 or start < 1:
+            self.log("Sequence: runs and first label must be at least 1.")
+            return
+        chans = self.channels()
+        if not chans:
+            self.log("Pick at least one channel.")
+            return
+        if self.auto.get():          # only one repeating mechanism at a time
+            self.auto.set(False)
+            self.toggle_auto()
+            self.log("Sequence: switched auto-grab off.")
+
+        self.seq_width = max(3, len(str(start + count - 1)))
+        first = self.first_free(start)
+        if first != start:
+            self.log(f"Sequence: {self.safe_prefix()}_{start:0{self.seq_width}d}.csv "
+                     f"already exists, starting at {first:0{self.seq_width}d} instead")
+        self.seq_index = first
+        self.seq_last = first + count - 1
+        self.seq_gap = max(0.0, gap)
+        self.seq_done = 0
+        self.seq_t0 = time.time()
+        self.seq_active = True
+        self.seq_btn.configure(text="Stop sequence")
+        self.log(f"Sequence: {count} runs labelled "
+                 f"{first:0{self.seq_width}d}-{self.seq_last:0{self.seq_width}d}, "
+                 f"{self.seq_gap:g} s apart")
+        self.run_sequence_step()
+
+    def first_free(self, start):
+        """First label whose CSV does not exist yet, so a repeated sequence adds
+        to the series instead of overwriting it."""
+        outdir, prefix = self.outdir.get(), self.safe_prefix()
+        i = start
+        while os.path.exists(os.path.join(outdir, f"{prefix}_{i:0{self.seq_width}d}.csv")):
+            i += 1
+        return i
+
+    def run_sequence_step(self):
+        self.seq_job = None
+        if not self.seq_active:
+            return
+        label = f"{self.seq_index:0{self.seq_width}d}"
+        self.seq_inflight = label
+        self.seq_status.configure(
+            text=f"run {label} of {self.seq_last:0{self.seq_width}d}", foreground="#060")
+        self.seq_started = time.time()
+        self.set_busy(True)
+        threading.Thread(target=self._grab_worker, args=(self.channels(), label),
+                         daemon=True).start()
+
+    def grab_done(self):
+        """Every grab ends here, whether one-off or part of a sequence."""
+        self.set_busy(False)
+        label, self.seq_inflight = self.seq_inflight, None
+        if label is not None:
+            self.seq_done += 1        # its files are on disk, so it counts
+        if not self.seq_active:
+            if label is not None:
+                # Stop was pressed while this run was mid-flight; it still saved.
+                self.log(f"  (run {label} was already under way and was saved)")
+                self.seq_status.configure(text=f"stopped after {self.seq_done}")
+            return
+        elapsed = time.time() - self.seq_started
+        if self.seq_index >= self.seq_last:
+            self.log(f"Sequence finished: {self.seq_done} runs in "
+                     f"{time.time() - self.seq_t0:.1f} s")
+            self.stop_sequence()
+            return
+        self.seq_index += 1
+        wait = self.seq_gap - elapsed
+        if wait <= 0:
+            if elapsed > self.seq_gap + 0.05:
+                self.log(f"  (run took {elapsed:.1f} s, more than the "
+                         f"{self.seq_gap:g} s interval - continuing without waiting)")
+            wait = 0.0
+        self.seq_job = self.root.after(int(wait * 1000), self.run_sequence_step)
+
+    def stop_sequence(self, aborted=False):
+        if self.seq_job is not None:
+            self.root.after_cancel(self.seq_job)
+            self.seq_job = None
+        self.seq_active = False
+        self.seq_btn.configure(text="Start sequence")
+        self.seq_status.configure(
+            text=f"stopped after {self.seq_done}" if aborted else f"done ({self.seq_done} runs)",
+            foreground="#c60" if aborted else "#666")
+        if aborted:
+            self.log(f"Sequence stopped after {self.seq_done} run(s).")
+        # A run already in flight finishes and writes its files; grab_done then
+        # sees an inactive sequence and stops there.
+        self.set_busy(self.busy)
+        used = (not aborted) or self.busy   # a run mid-flight still writes its label
+        self.seq_start.set(str(self.seq_index + (1 if used else 0)))
 
     def toggle_auto(self):
         if self.auto.get():
@@ -802,6 +970,7 @@ class App:
         self.auto_job = self.root.after(ms, self.schedule_auto)
 
     def on_close(self):
+        self.stop_sequence()
         self.save_config()
         self.auto.set(False)
         self.toggle_auto()
