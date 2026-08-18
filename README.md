@@ -78,11 +78,27 @@ burning through the remaining labels, and the log says which label it stopped at
 Press **Cancel wait** (or **Stop sequence**) to call off a wait; a transfer already
 under way finishes rather than being thrown away.
 
-> **Triggers that arrive during a transfer are missed.** The scope is not armed
-> while its data is being read out, which takes seconds for a long record. If the
-> experiment triggers faster than a run takes, run `005` will not be the fifth
-> shot. Space the experiment's triggers by more than one run, or shorten the run
-> with fewer **Transfer points**.
+> **Triggers that arrive during a run are missed.** The scope is not armed while
+> its data is being read out and written, which takes seconds for a long record.
+> If the source triggers faster than a run takes, run `005` will not be the fifth
+> shot - it will be the fifth one that happened to land while the scope was
+> armed. Space the triggers wider than one run, or shorten the run with fewer
+> **Transfer points**.
+>
+> The log makes this visible. Every run reports where its time went, and if a
+> trigger was already waiting the moment the scope armed - meaning earlier ones
+> came and went unrecorded - it says so and names the interval you would need:
+>
+> ```
+>   run 002: 0.0 s waiting for the trigger, 4.3 s reading, 5.7 s writing (10.0 s total)
+>   ! a trigger was already waiting when the scope armed: triggers are arriving
+>     faster than a run takes, so some are being missed. Lower 'Transfer points',
+>     or slow the source to more than 10 s between triggers.
+> ```
+>
+> A worked example: 1M points on 4 channels takes about 10 s per run. Against a
+> source firing every 5 s that captures every second shot, so a 30-shot run
+> yields 15 files - each valid, but sampling every other shot.
 
 ## Reducing how much data each run takes
 

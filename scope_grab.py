@@ -713,8 +713,10 @@ class App:
 
             wait_s = self.trigger_wait_s()
             self.set_phase("waiting for trigger" + ("" if wait_s else " (no limit)"))
+            armed_at = time.time()
             triggered = self.scope.single(wait_s=wait_s,
                                           cancelled=self.stop_flag.is_set)
+            t_armed = time.time() - armed_at
             if triggered is None:
                 self.log("  cancelled while waiting for a trigger - nothing saved")
                 self.scope.run()
@@ -724,8 +726,11 @@ class App:
                          f"'Wait for trigger', or set it to 0 to wait indefinitely.")
                 self.scope.run()
                 return
-            self.set_phase("transferring")
-
+            # Everything that needs the instrument happens first, so the scope
+            # goes live again before the slow business of writing files. It is
+            # not armed during either phase - see the missed-trigger note below.
+            self.set_phase("reading from scope")
+            read_at = time.time()
             points = self.transfer_points()
             names = {ch: self.ch_names[ch].get().strip() for ch in chans}
             cols = {}
@@ -735,6 +740,17 @@ class App:
                     cols["time_s"] = t
                 cols[self.column_name(ch)] = v
 
+            # One settings read per grab: the panel and the metadata file are
+            # built from the same snapshot.
+            settings = self.read_all_settings()
+            # The screenshot has to be taken before :RUN, while the captured
+            # trace is still the one on screen.
+            img = self.scope.screenshot() if self.save_png.get() else None
+            self.scope.run()
+            t_read = time.time() - read_at
+
+            self.set_phase("writing files")
+            write_at = time.time()
             data = np.column_stack([cols[k] for k in cols])
             csv_path = base + ".csv"
             np.savetxt(csv_path, data, delimiter=",",
@@ -743,24 +759,32 @@ class App:
             self.log(f"{os.path.basename(csv_path)}  "
                      f"({data.shape[0]} pts x {data.shape[1]} cols)")
 
-            # One settings read per grab: the panel and the metadata file are
-            # built from the same snapshot.
-            settings = self.read_all_settings()
-            self.root.after(0, lambda v=settings: self.show_settings(v))
-
             with open(base + ".txt", "w") as fh:
                 fh.write(self.scope.metadata(chans, settings, names, label))
             self.grab_wrote = True
 
-            if self.save_png.get():
-                img = self.scope.screenshot()
+            if img is not None:
                 png_path = base + ".png"
                 with open(png_path, "wb") as fh:
                     fh.write(img)
                 self.log(f"{os.path.basename(png_path)}  ({len(img)} bytes)")
                 self.root.after(0, lambda p=png_path: self.show_preview(p))
+            t_write = time.time() - write_at
 
-            self.scope.run()
+            self.root.after(0, lambda v=settings: self.show_settings(v))
+            self.log(f"  {'run ' + label if label else 'grab'}: "
+                     f"{t_armed:.1f} s waiting for the trigger, "
+                     f"{t_read:.1f} s reading, {t_write:.1f} s writing "
+                     f"({t_armed + t_read + t_write:.1f} s total)")
+            if t_armed < 0.5:
+                # The scope cannot be armed while it is being read out, so a
+                # trigger that is already pending the moment it re-arms means
+                # earlier ones came and went unrecorded.
+                self.log("  ! a trigger was already waiting when the scope armed: "
+                         "triggers are arriving faster than a run takes, so some "
+                         "are being missed. Lower 'Transfer points', or slow the "
+                         "source to more than "
+                         f"{t_read + t_write:.0f} s between triggers.")
             self.root.after(0, self.save_config)
         except Exception as exc:
             self.log(f"ERROR: {exc}")
@@ -1019,6 +1043,9 @@ class App:
                 # Stop was pressed while this run was mid-flight; it still saved.
                 self.log(f"  (run {label} was already under way and was saved)")
                 self.seq_status.configure(text=f"stopped after {self.seq_done}")
+            elif label is not None:
+                # It was called off before saving, so that label is still free.
+                self.seq_start.set(str(int(label)))
             return
         if label is not None and not self.grab_wrote:
             # No trigger, a cancel, or an error: stop rather than burn through
@@ -1035,10 +1062,7 @@ class App:
         self.seq_index += 1
         wait = self.seq_gap - elapsed
         if wait <= 0:
-            if elapsed > self.seq_gap + 0.05:
-                self.log(f"  (run took {elapsed:.1f} s, more than the "
-                         f"{self.seq_gap:g} s interval - continuing without waiting)")
-            wait = 0.0
+            wait = 0.0            # already late; the per-run breakdown says why
         self.seq_job = self.root.after(int(wait * 1000), self.run_sequence_step)
 
     def stop_sequence(self, aborted=False):
