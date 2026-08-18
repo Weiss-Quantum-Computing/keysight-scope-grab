@@ -458,8 +458,28 @@ class App:
         self.preview = ttk.Label(box, text="(no screenshot yet)", anchor="center")
         self.preview.pack(fill="both", expand=True)
         self.preview.bind("<Double-Button-1>", self.open_preview)
+        # Wheel over the picture steps through the run, which is what "scroll
+        # through them" means with a mouse in hand.
+        self.preview.bind("<MouseWheel>",
+                          lambda e: self.step_shot(-1 if e.delta > 0 else 1))
         self.preview_img = None
         self.preview_path = None
+        self.shots = []           # screenshots of the current prefix, in order
+        self.shot_i = -1
+
+        nav = ttk.Frame(self.shot_frame)
+        nav.pack(fill="x", padx=4, pady=(0, 4))
+        self.prev_btn = ttk.Button(nav, text="< prev", width=8,
+                                   command=lambda: self.step_shot(-1))
+        self.prev_btn.pack(side="left")
+        self.next_btn = ttk.Button(nav, text="next >", width=8,
+                                   command=lambda: self.step_shot(1))
+        self.next_btn.pack(side="left", padx=4)
+        self.newest_btn = ttk.Button(nav, text="newest", width=8,
+                                     command=lambda: self.refresh_shots(newest=True))
+        self.newest_btn.pack(side="left")
+        self.shot_pos = ttk.Label(nav, text="", foreground="#666")
+        self.shot_pos.pack(side="left", padx=8)
 
         # --- log
         lf = ttk.LabelFrame(right, text="Log")
@@ -468,6 +488,8 @@ class App:
         self.logbox.pack(fill="both", expand=True, padx=4, pady=4)
 
         root.bind("<space>", self.on_space)
+        root.bind("<Left>", lambda e: self.on_arrow(e, -1))
+        root.bind("<Right>", lambda e: self.on_arrow(e, 1))
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(100, self.pump)
         self.root.after(300, self.do_connect)
@@ -555,14 +577,23 @@ class App:
         except Exception as exc:
             self.log(f"Could not save {CONFIG_PATH}: {exc}")
 
-    def on_space(self, event):
+    def widget_owns_key(self, event):
+        """True when the focused widget uses the key itself - typing in an entry
+        must not fire a capture or jump the screenshot browser."""
         try:
-            cls = event.widget.winfo_class()
+            return event.widget.winfo_class() in SPACE_OWNERS
         except AttributeError:
-            cls = ""
-        if cls in SPACE_OWNERS:
+            return False
+
+    def on_space(self, event):
+        if self.widget_owns_key(event):
             return
         self.do_grab()
+
+    def on_arrow(self, event, delta):
+        if self.widget_owns_key(event):
+            return
+        self.step_shot(delta)
 
     def safe_prefix(self):
         p = "".join("_" if c in BAD_NAME_CHARS else c
@@ -596,18 +627,65 @@ class App:
         self.preview_path = path
         self.preview.configure(image=img, text="")
         self.shot_frame.configure(
-            text=f"Last screenshot - {os.path.basename(path)}  "
-                 f"(double-click to open full size)")
+            text=f"Screenshot - {os.path.basename(path)}  "
+                 f"(wheel or arrow keys to scroll, double-click to open)")
+
+    def shot_paths(self):
+        """Screenshots in the output folder that belong to the current prefix.
+        Sorted by name, which puts a numbered sequence in run order and a
+        timestamped set in capture order."""
+        outdir, prefix = self.outdir.get(), self.safe_prefix() + "_"
+        try:
+            names = sorted(n for n in os.listdir(outdir)
+                           if n.lower().endswith(".png") and n.startswith(prefix))
+        except OSError:
+            return []
+        return [os.path.join(outdir, n) for n in names]
+
+    def refresh_shots(self, newest=False):
+        """Rescan after a capture or a folder change. Stays on the picture being
+        looked at, so screenshots arriving mid-sequence do not yank the view
+        forward - unless the newest was already on show, or `newest` is set."""
+        following = not self.shots or self.preview_path == self.shots[-1]
+        current = self.preview_path
+        self.shots = self.shot_paths()
+        if not self.shots:
+            self.shot_i = -1
+            self.preview_path = None
+            self.preview.configure(image="", text="(no screenshot yet)")
+            self.shot_frame.configure(text="Last screenshot")
+            self.shot_pos.configure(text="")
+            for btn in (self.prev_btn, self.next_btn, self.newest_btn):
+                btn.configure(state="disabled")
+            return
+        if newest or following or current not in self.shots:
+            self.shot_i = len(self.shots) - 1
+        else:
+            self.shot_i = self.shots.index(current)
+        self.show_shot()
+
+    def show_shot(self):
+        if not self.shots:
+            return
+        self.shot_i = max(0, min(self.shot_i, len(self.shots) - 1))
+        last = len(self.shots) - 1
+        self.show_preview(self.shots[self.shot_i])
+        behind = last - self.shot_i
+        self.shot_pos.configure(
+            text=f"{self.shot_i + 1} / {len(self.shots)}"
+                 + (f"   ({behind} newer)" if behind else ""),
+            foreground="#c60" if behind else "#666")
+        self.prev_btn.configure(state="normal" if self.shot_i > 0 else "disabled")
+        self.next_btn.configure(state="normal" if behind else "disabled")
+        self.newest_btn.configure(state="normal" if behind else "disabled")
+
+    def step_shot(self, delta):
+        if self.shots:
+            self.shot_i += delta
+            self.show_shot()
 
     def load_latest_preview(self):
-        outdir = self.outdir.get()
-        try:
-            shots = [os.path.join(outdir, n) for n in os.listdir(outdir)
-                     if n.lower().endswith(".png")]
-        except OSError:
-            return
-        if shots:
-            self.show_preview(max(shots, key=os.path.getmtime))
+        self.refresh_shots(newest=True)
 
     def open_preview(self, _event=None):
         if self.preview_path:
@@ -768,7 +846,7 @@ class App:
                 with open(png_path, "wb") as fh:
                     fh.write(img)
                 self.log(f"{os.path.basename(png_path)}  ({len(img)} bytes)")
-                self.root.after(0, lambda p=png_path: self.show_preview(p))
+                self.root.after(0, self.refresh_shots)
             t_write = time.time() - write_at
 
             self.root.after(0, lambda v=settings: self.show_settings(v))

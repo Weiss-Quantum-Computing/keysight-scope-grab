@@ -12,8 +12,8 @@ Press GRAB (or the space bar) and you get, in your chosen folder:
 | `<prefix>_<timestamp>.png` | Screenshot of the scope display |
 | `<prefix>_<timestamp>.txt` | Acquisition metadata: sample rate, timebase, trigger and per-channel settings |
 
-The panel shows the most recent screenshot inline; double-click it to open the
-full-resolution PNG.
+The panel shows the screenshots inline and you can scroll back through them while
+a run is still going - see [Watching a run come in](#watching-a-run-come-in).
 
 ## Requirements
 
@@ -64,6 +64,22 @@ digits, `-`, `.` and `_`, so no name can introduce a stray delimiter or an
 encoding problem: `cavity refl,fast` becomes `CH3_cavity_refl_fast_V`.
 
 Names are remembered between sessions - see below.
+
+## Watching a run come in
+
+The screenshot pane browses every PNG of the current prefix in the output folder,
+in order. Use the mouse wheel over the picture, the left and right arrow keys, or
+the **< prev** / **next >** buttons; double-click opens the full-resolution file.
+The counter reads `6 / 10`, and `(4 newer)` in amber when you are behind the front.
+
+While a sequence runs, a new screenshot pulls the view forward **only if you were
+already on the newest one**. Scroll back to compare two runs and the view stays
+put while captures keep landing, with the counter showing how many have arrived.
+**newest** jumps to the front and resumes following.
+
+Only screenshots matching the current filename prefix are browsed, so several runs
+can share one folder without their screenshots interleaving. A prefix with no
+captures yet shows an empty pane rather than someone else's run.
 
 ## Priming a capture for an external trigger
 
