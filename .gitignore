@@ -1,0 +1,11 @@
+# Captured data - these belong in the lab notebook, not in git
+scope_data/
+*.csv
+*.png
+*.txt
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
