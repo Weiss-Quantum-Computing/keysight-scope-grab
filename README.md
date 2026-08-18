@@ -41,6 +41,11 @@ Keysight/Agilent USB instrument it finds; hit **Connect** to retry.
 - **Space** grabs, except while the focus is in a text field or on a control that uses
   the space bar itself - so typing a space in the prefix box does not fire an
   acquisition.
+- **Wait for trigger** - how long a capture stays armed. `0` waits indefinitely,
+  for priming before an experiment elsewhere starts triggering. While a one-off
+  grab is armed, GRAB becomes **Cancel wait**.
+- **Transfer points** - how many samples to pull per channel; `max` takes the whole
+  acquisition memory. Fewer points means smaller, faster files.
 - **Auto-grab** - repeat on a fixed interval, keeping timestamped names.
 - **Sequence** - a fixed number of runs with incrementing labels, see below.
 - **save screenshot?** - whether each grab also writes the PNG. The preview only
@@ -59,6 +64,42 @@ digits, `-`, `.` and `_`, so no name can introduce a stray delimiter or an
 encoding problem: `cavity refl,fast` becomes `CH3_cavity_refl_fast_V`.
 
 Names are remembered between sessions - see below.
+
+## Priming a capture for an external trigger
+
+Set **Wait for trigger** to `0` and the scope stays armed indefinitely, so you can
+start a capture here and then start the experiment on another machine. A sequence
+with **Interval** `0` and no trigger limit paces itself off the incoming triggers:
+each run arms, waits for its trigger, saves, and arms again.
+
+A run that never triggers **writes no files at all** - not a CSV of whatever was
+left in acquisition memory. If a run saves nothing, a sequence stops rather than
+burning through the remaining labels, and the log says which label it stopped at.
+Press **Cancel wait** (or **Stop sequence**) to call off a wait; a transfer already
+under way finishes rather than being thrown away.
+
+> **Triggers that arrive during a transfer are missed.** The scope is not armed
+> while its data is being read out, which takes seconds for a long record. If the
+> experiment triggers faster than a run takes, run `005` will not be the fifth
+> shot. Space the experiment's triggers by more than one run, or shorten the run
+> with fewer **Transfer points**.
+
+## Reducing how much data each run takes
+
+The sample rate is not directly settable on this scope - it follows from the
+timebase and the memory depth, which is why the panel shows it read-only. Two
+things do reduce the data:
+
+- **Transfer points** limits what is read out and written (`:WAVeform:POINts`). The
+  scope still samples at full rate and then decimates the transfer, so this shrinks
+  files and shortens runs but does not change what the instrument acquired. Narrow
+  features can be decimated away. The scope rounds the request to a value it likes,
+  and the time axis is always taken from the waveform preamble, so the file stays
+  self-consistent whatever it gives you - worth checking the first capture's time
+  column against the scope screen.
+- **A slower timebase** genuinely lowers the sample rate for a given memory depth,
+  and can be set from the settings panel. Memory depth itself lives in the scope's
+  own Acquire menu.
 
 ## Numbered sequences
 
@@ -99,6 +140,12 @@ The limit is usually writing the CSV rather than the USB transfer. Measured with
 | 1M | time + 1 channel | 3.9 s | 52 MB |
 | 2M | time + 1 channel | 7.9 s | 103 MB |
 
+Those figures are for the old 18-digit format; volts are now written as `%.6e`,
+which is about 40% smaller and correspondingly quicker. Samples arrive from the
+scope as 8-bit codes - 256 levels - so six significant figures record far more than
+the instrument resolves. Time keeps ten digits, enough to separate adjacent samples
+in a long record.
+
 So a 1 s interval is only realistic for short records. Ask for it anyway if you
 like - the sequence will simply run as fast as it can and tell you it could not
 keep up. Note also the disk cost: 100 runs of a 4-channel 500k-point capture is
@@ -135,8 +182,8 @@ buttons grey out while a grab is running and vice versa.
 
 ## Remembered settings
 
-The output folder, filename prefix, channel names and which channels are ticked
-are written to
+The output folder, filename prefix, channel names, which channels are ticked, the
+trigger wait and the transfer point count are written to
 
 ```
 %APPDATA%\ScopeGrab\config.json
@@ -152,7 +199,9 @@ touch it.
   "outdir": "C:\\Users\\you\\Desktop\\scope_data",
   "prefix": "EOM run",
   "channel_names": { "1": "EOM drive", "2": "cavity refl", "3": "", "4": "" },
-  "channels": { "1": true, "2": true, "3": false, "4": false }
+  "channels": { "1": true, "2": true, "3": false, "4": false },
+  "trigger_wait": "0",
+  "transfer_points": "max"
 }
 ```
 

@@ -34,6 +34,13 @@ CONFIG_PATH = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"),
                            "ScopeGrab", "config.json")
 NOT_MEASURED = 9.9e37
 
+# CSV number formats. Samples arrive as 8-bit codes - 256 levels - so six
+# significant digits already record far more than the scope resolves, and the
+# default %.18e was writing (and costing) fifteen digits of noise per sample.
+# Time keeps more digits because a long record has to separate adjacent samples.
+TIME_FMT = "%.9e"
+VOLT_FMT = "%.6e"
+
 # Screenshot preview box, sized to fill the panel width. The scope sends
 # 800x503 PNGs, which fit this at ~72%.
 PREVIEW_W, PREVIEW_H = 576, 362
@@ -164,33 +171,49 @@ class Scope:
 
     # -- acquisition ------------------------------------------------------
 
-    def single(self, wait_s=10.0):
+    def single(self, wait_s=10.0, cancelled=None):
         """Arm a single acquisition and wait for it to complete.
 
         Uses :SINGle rather than :DIGitize so the captured trace stays on the
         scope display - which matters if you also want the screenshot to match
-        the data. Returns True if it triggered, False if it timed out and we
-        forced a stop.
+        the data.
+
+        wait_s <= 0 waits indefinitely, which is how a capture is primed before
+        an experiment running elsewhere starts sending triggers. `cancelled` is
+        polled so a long wait can be called off from the panel.
+
+        Returns True if it triggered, False on timeout, None if cancelled.
         """
         self.inst.write(":SINGle")
-        deadline = time.time() + wait_s
-        while time.time() < deadline:
+        started = time.time()
+        deadline = None if wait_s <= 0 else started + wait_s
+        while deadline is None or time.time() < deadline:
+            if cancelled is not None and cancelled():
+                self.inst.write(":STOP")
+                return None
             try:
                 # Bit 3 of the Operation Status Condition register is the Run bit.
                 cond = int(self.inst.query(":OPERegister:CONDition?"))
             except Exception:
-                time.sleep(min(wait_s, 1.0))
+                time.sleep(1.0 if wait_s <= 0 else min(wait_s, 1.0))
                 return True
             if not (cond & 8):
                 return True
-            time.sleep(0.05)
+            # Poll hard at first for a quick handoff, then back off: a wait of
+            # minutes should not hammer the USB link 20 times a second.
+            time.sleep(0.05 if time.time() - started < 2.0 else 0.25)
         self.inst.write(":STOP")
         return False
 
-    def waveform(self, channel, points_mode="RAW"):
+    def waveform(self, channel, points_mode="RAW", points=None):
         w = self.inst
         w.write(f":WAVeform:SOURce CHANnel{channel}")
         w.write(f":WAVeform:POINts:MODE {points_mode}")
+        # Setting the mode resets the point count, so ask for it afterwards. The
+        # scope rounds to a value it likes; the preamble read below reports what
+        # it actually gave, so the time axis stays right either way.
+        if points:
+            w.write(f":WAVeform:POINts {points}")
         w.write(":WAVeform:FORMat BYTE")
         w.write(":WAVeform:UNSigned ON")
 
@@ -289,6 +312,8 @@ class App:
         self.seq_started = 0.0
         self.seq_t0 = 0.0
         self.seq_inflight = None  # label of the run currently being captured
+        self.stop_flag = threading.Event()   # asks a waiting capture to give up
+        self.grab_wrote = False              # did the last run produce files?
         self.seq_done = 0
 
         root.title("Scope Grab - MSO-X 2014A")
@@ -363,6 +388,23 @@ class App:
         self.grab_btn = ttk.Button(gf, text="GRAB  (or press Space)",
                                    command=self.do_grab, state="disabled")
         self.grab_btn.pack(side="left", fill="x", expand=True, ipady=8)
+
+        tf = ttk.Frame(left)
+        tf.pack(fill="x", **pad)
+        ttk.Label(tf, text="Wait for trigger:").pack(side="left")
+        self.trig_wait = tk.StringVar(value="10")
+        ttk.Entry(tf, textvariable=self.trig_wait, width=7).pack(side="left", padx=4)
+        ttk.Label(tf, text="s (0 = no limit)").pack(side="left")
+        self.phase = ttk.Label(tf, text="", foreground="#060")
+        self.phase.pack(side="left", padx=10)
+
+        nf = ttk.Frame(left)
+        nf.pack(fill="x", **pad)
+        ttk.Label(nf, text="Transfer points:").pack(side="left")
+        self.trans_pts = tk.StringVar(value="max")
+        ttk.Entry(nf, textvariable=self.trans_pts, width=10).pack(side="left", padx=4)
+        ttk.Label(nf, text='"max" = whole acquisition memory',
+                  foreground="#666").pack(side="left")
 
         af = ttk.Frame(left)
         af.pack(fill="x", **pad)
@@ -457,6 +499,8 @@ class App:
             "prefix": self.prefix.get(),
             "channel_names": {str(ch): var.get() for ch, var in self.ch_names.items()},
             "channels": {str(ch): var.get() for ch, var in self.ch_vars.items()},
+            "trigger_wait": self.trig_wait.get(),
+            "transfer_points": self.trans_pts.get(),
         }
 
     def load_config(self):
@@ -473,7 +517,9 @@ class App:
             self.log(f"Ignoring unreadable {CONFIG_PATH}: {exc}")
             return
 
-        for key, var in (("outdir", self.outdir), ("prefix", self.prefix)):
+        for key, var in (("outdir", self.outdir), ("prefix", self.prefix),
+                         ("trigger_wait", self.trig_wait),
+                         ("transfer_points", self.trans_pts)):
             value = cfg.get(key)
             if isinstance(value, str) and value.strip():
                 var.set(value)
@@ -583,8 +629,16 @@ class App:
     def set_busy(self, busy):
         self.busy = busy
         state = "disabled" if busy or self.seq_active or not self.scope.inst else "normal"
-        for btn in (self.grab_btn, self.read_btn, self.apply_btn):
+        for btn in (self.read_btn, self.apply_btn):
             btn.configure(state=state)
+        # During a one-off grab the GRAB button becomes the way to call off a
+        # long trigger wait. A sequence has its own Stop button instead.
+        if busy and not self.seq_active:
+            self.grab_btn.configure(text="Cancel wait", state="normal",
+                                    command=self.cancel_grab)
+        else:
+            self.grab_btn.configure(text="GRAB  (or press Space)", state=state,
+                                    command=self.do_grab)
         # The sequence button stays live while a sequence runs, so it can stop it.
         self.seq_btn.configure(
             state="normal" if self.scope.inst and (self.seq_active or not busy)
@@ -616,10 +670,39 @@ class App:
         if not chans:
             self.log("Pick at least one channel.")
             return
+        self.stop_flag.clear()
         self.set_busy(True)
         threading.Thread(target=self._grab_worker, args=(chans,), daemon=True).start()
 
+    def cancel_grab(self):
+        self.stop_flag.set()
+        self.log("Cancel requested - takes effect while waiting for a trigger; "
+                 "a transfer already under way will finish.")
+
+    def set_phase(self, text):
+        """Called from the capture thread."""
+        self.root.after(0, lambda: self.phase.configure(text=text))
+
+    def trigger_wait_s(self):
+        try:
+            return max(0.0, float(self.trig_wait.get()))
+        except ValueError:
+            return 10.0
+
+    def transfer_points(self):
+        """None means take everything in acquisition memory."""
+        text = self.trans_pts.get().strip().lower()
+        if text in ("", "max", "all", "0"):
+            return None
+        try:
+            return max(100, int(float(text)))
+        except ValueError:
+            self.log(f"Transfer points: '{self.trans_pts.get()}' is not a number, "
+                     f"taking the whole record.")
+            return None
+
     def _grab_worker(self, chans, label=None):
+        self.grab_wrote = False
         try:
             outdir = self.outdir.get()
             os.makedirs(outdir, exist_ok=True)
@@ -628,15 +711,26 @@ class App:
             tag = label or datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             base = os.path.join(outdir, f"{self.safe_prefix()}_{tag}")
 
-            triggered = self.scope.single(wait_s=10.0)
-            if not triggered:
-                self.log("  (no trigger within 10 s - forced stop, "
-                         "reading memory contents)")
+            wait_s = self.trigger_wait_s()
+            self.set_phase("waiting for trigger" + ("" if wait_s else " (no limit)"))
+            triggered = self.scope.single(wait_s=wait_s,
+                                          cancelled=self.stop_flag.is_set)
+            if triggered is None:
+                self.log("  cancelled while waiting for a trigger - nothing saved")
+                self.scope.run()
+                return
+            if triggered is False:
+                self.log(f"  no trigger within {wait_s:g} s - nothing saved. Raise "
+                         f"'Wait for trigger', or set it to 0 to wait indefinitely.")
+                self.scope.run()
+                return
+            self.set_phase("transferring")
 
+            points = self.transfer_points()
             names = {ch: self.ch_names[ch].get().strip() for ch in chans}
             cols = {}
             for ch in chans:
-                t, v = self.scope.waveform(ch)
+                t, v = self.scope.waveform(ch, points=points)
                 if "time_s" not in cols:
                     cols["time_s"] = t
                 cols[self.column_name(ch)] = v
@@ -644,7 +738,8 @@ class App:
             data = np.column_stack([cols[k] for k in cols])
             csv_path = base + ".csv"
             np.savetxt(csv_path, data, delimiter=",",
-                       header=",".join(cols.keys()), comments="")
+                       header=",".join(cols.keys()), comments="",
+                       fmt=[TIME_FMT] + [VOLT_FMT] * (data.shape[1] - 1))
             self.log(f"{os.path.basename(csv_path)}  "
                      f"({data.shape[0]} pts x {data.shape[1]} cols)")
 
@@ -655,6 +750,7 @@ class App:
 
             with open(base + ".txt", "w") as fh:
                 fh.write(self.scope.metadata(chans, settings, names, label))
+            self.grab_wrote = True
 
             if self.save_png.get():
                 img = self.scope.screenshot()
@@ -881,6 +977,7 @@ class App:
         self.seq_gap = max(0.0, gap)
         self.seq_done = 0
         self.seq_t0 = time.time()
+        self.stop_flag.clear()
         self.seq_active = True
         self.seq_btn.configure(text="Stop sequence")
         self.log(f"Sequence: {count} runs labelled "
@@ -913,14 +1010,21 @@ class App:
     def grab_done(self):
         """Every grab ends here, whether one-off or part of a sequence."""
         self.set_busy(False)
+        self.phase.configure(text="")
         label, self.seq_inflight = self.seq_inflight, None
-        if label is not None:
+        if label is not None and self.grab_wrote:
             self.seq_done += 1        # its files are on disk, so it counts
         if not self.seq_active:
-            if label is not None:
+            if label is not None and self.grab_wrote:
                 # Stop was pressed while this run was mid-flight; it still saved.
                 self.log(f"  (run {label} was already under way and was saved)")
                 self.seq_status.configure(text=f"stopped after {self.seq_done}")
+            return
+        if label is not None and not self.grab_wrote:
+            # No trigger, a cancel, or an error: stop rather than burn through
+            # the remaining labels writing nothing.
+            self.log(f"Sequence stopped at {label}: that run saved no files.")
+            self.stop_sequence(aborted=True)
             return
         elapsed = time.time() - self.seq_started
         if self.seq_index >= self.seq_last:
@@ -938,6 +1042,8 @@ class App:
         self.seq_job = self.root.after(int(wait * 1000), self.run_sequence_step)
 
     def stop_sequence(self, aborted=False):
+        if aborted:
+            self.stop_flag.set()      # break out of a trigger wait in progress
         if self.seq_job is not None:
             self.root.after_cancel(self.seq_job)
             self.seq_job = None
@@ -970,6 +1076,7 @@ class App:
         self.auto_job = self.root.after(ms, self.schedule_auto)
 
     def on_close(self):
+        self.stop_flag.set()
         self.stop_sequence()
         self.save_config()
         self.auto.set(False)
