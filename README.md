@@ -42,6 +42,8 @@ Keysight/Agilent USB instrument it finds; hit **Connect** to retry.
   the space bar itself - so typing a space in the prefix box does not fire an
   acquisition.
 - **Auto-grab** - repeat on a fixed interval.
+- **save screenshot?** - whether each grab also writes the PNG. The preview only
+  updates when this is on, since it displays the file that was written.
 
 ## Channel names
 
@@ -88,7 +90,8 @@ buttons grey out while a grab is running and vice versa.
 
 ## Remembered settings
 
-The output folder, filename prefix and channel names are written to
+The output folder, filename prefix, channel names and which channels are ticked
+are written to
 
 ```
 %APPDATA%\ScopeGrab\config.json
@@ -103,7 +106,8 @@ touch it.
 {
   "outdir": "C:\\Users\\you\\Desktop\\scope_data",
   "prefix": "EOM run",
-  "channel_names": { "1": "EOM drive", "2": "cavity refl", "3": "", "4": "" }
+  "channel_names": { "1": "EOM drive", "2": "cavity refl", "3": "", "4": "" },
+  "channels": { "1": true, "2": true, "3": false, "4": false }
 }
 ```
 

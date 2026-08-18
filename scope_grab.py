@@ -343,10 +343,8 @@ class App:
         pf.pack(fill="x", **pad)
         ttk.Label(pf, text="Filename prefix:").pack(side="left")
         self.prefix = tk.StringVar(value="scope")
-        ttk.Entry(pf, textvariable=self.prefix, width=20).pack(side="left", padx=6)
-        self.save_png = tk.BooleanVar(value=True)
-        ttk.Checkbutton(pf, text="also save screenshot",
-                        variable=self.save_png).pack(side="left", padx=12)
+        ttk.Entry(pf, textvariable=self.prefix).pack(side="left", fill="x",
+                                                    expand=True, padx=6)
 
         # --- grab
         gf = ttk.Frame(left)
@@ -363,6 +361,9 @@ class App:
         self.interval = tk.StringVar(value="10")
         ttk.Entry(af, textvariable=self.interval, width=6).pack(side="left", padx=4)
         ttk.Label(af, text="seconds").pack(side="left")
+        self.save_png = tk.BooleanVar(value=True)
+        ttk.Checkbutton(af, text="save screenshot?",
+                        variable=self.save_png).pack(side="left", padx=12)
 
         self.build_settings(left, pad)
 
@@ -415,6 +416,7 @@ class App:
             "outdir": self.outdir.get(),
             "prefix": self.prefix.get(),
             "channel_names": {str(ch): var.get() for ch, var in self.ch_names.items()},
+            "channels": {str(ch): var.get() for ch, var in self.ch_vars.items()},
         }
 
     def load_config(self):
@@ -441,6 +443,12 @@ class App:
                 value = names.get(str(ch))
                 if isinstance(value, str):
                     var.set(value)
+        ticked = cfg.get("channels")
+        if isinstance(ticked, dict):
+            for ch, var in self.ch_vars.items():
+                value = ticked.get(str(ch))
+                if isinstance(value, (bool, int)):
+                    var.set(bool(value))
 
         self.saved_cfg = self.current_cfg()
         self.log(f"Restored last session from {CONFIG_PATH}")
