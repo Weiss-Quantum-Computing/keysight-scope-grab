@@ -44,6 +44,43 @@ SPACE_OWNERS = {
 
 BAD_NAME_CHARS = r'<>:"/\|?*'
 
+# Settings the panel shows and can push back. Each entry is
+# (label, SCPI root, kind, choices); the root is queried as "<root>?" and
+# written as "<root> <value>", and doubles as the dict key.
+#   num    - free-form number
+#   choice - fixed list, scope answers with the same mnemonics
+#   bool   - fixed list, but the scope answers 1/0
+GLOBAL_SETTINGS = [
+    ("Timebase s/div", ":TIMebase:SCALe", "num", None),
+    ("Position (s)", ":TIMebase:POSition", "num", None),
+    ("Trigger source", ":TRIGger:EDGE:SOURce", "choice",
+     ("CHAN1", "CHAN2", "CHAN3", "CHAN4", "EXT", "LINE", "WGEN")),
+    ("Trigger level (V)", ":TRIGger:EDGE:LEVel", "num", None),
+    ("Trigger slope", ":TRIGger:EDGE:SLOPe", "choice", ("POS", "NEG", "EITH")),
+    ("Acquisition", ":ACQuire:TYPE", "choice", ("NORM", "AVER", "HRES", "PEAK")),
+]
+CHANNEL_SETTINGS = [
+    ("V/div", ":CHANnel{ch}:SCALe", "num", None),
+    ("Offset", ":CHANnel{ch}:OFFSet", "num", None),
+    ("Coupling", ":CHANnel{ch}:COUPling", "choice", ("AC", "DC")),
+    ("Probe", ":CHANnel{ch}:PROBe", "num", None),
+    ("BW lim", ":CHANnel{ch}:BWLimit", "bool", ("ON", "OFF")),
+    ("Display", ":CHANnel{ch}:DISPlay", "bool", ("ON", "OFF")),
+]
+
+
+def fmt_setting(kind, raw):
+    """Normalise a scope reply into what the panel displays."""
+    raw = raw.strip()
+    if kind == "bool":
+        return "OFF" if raw in ("0", "OFF", "off") else "ON"
+    if kind == "num":
+        try:
+            return f"{float(raw):g}"
+        except ValueError:
+            return raw
+    return raw.upper()
+
 
 # ---------------------------------------------------------------------------
 # Instrument layer
@@ -148,6 +185,28 @@ class Scope:
         return self.inst.query_binary_values(":DISPlay:DATA? PNG,COLor",
                                              datatype="B", container=bytearray)
 
+    # -- settings ---------------------------------------------------------
+
+    def get(self, scpi):
+        return self.inst.query(scpi + "?").strip()
+
+    def put(self, scpi, value):
+        self.inst.write(f"{scpi} {value}")
+
+    def errors(self):
+        """Drain the scope's error queue, so a rejected setting gets reported
+        instead of silently ignored."""
+        found = []
+        for _ in range(10):
+            try:
+                resp = self.inst.query(":SYSTem:ERRor?").strip()
+            except Exception:
+                break
+            if resp.startswith("+0,") or resp.startswith("0,"):
+                break
+            found.append(resp)
+        return found
+
     def metadata(self, channels):
         q = self.inst.query
         lines = [
@@ -195,20 +254,30 @@ class App:
         root.title("Scope Grab - MSO-X 2014A")
         # Tall enough for the screenshot preview, but never taller than the
         # screen - otherwise the log ends up behind the taskbar.
-        win_h = min(870, root.winfo_screenheight() - 120)
-        root.geometry(f"620x{win_h}+60+20")
+        win_w = min(1160, root.winfo_screenwidth() - 80)
+        win_h = min(880, root.winfo_screenheight() - 120)
+        root.geometry(f"{win_w}x{win_h}+40+20")
 
         pad = dict(padx=8, pady=4)
 
+        # Capture controls and scope settings on the left, screenshot preview
+        # and log on the right.
+        body = ttk.Frame(root)
+        body.pack(fill="both", expand=True)
+        left = ttk.Frame(body)
+        left.pack(side="left", fill="y")
+        right = ttk.Frame(body)
+        right.pack(side="left", fill="both", expand=True)
+
         # --- connection row
-        top = ttk.Frame(root)
+        top = ttk.Frame(left)
         top.pack(fill="x", **pad)
         self.status = ttk.Label(top, text="Not connected", foreground="#a00")
         self.status.pack(side="left")
         ttk.Button(top, text="Connect", command=self.do_connect).pack(side="right")
 
         # --- channels
-        chf = ttk.LabelFrame(root, text="Channels")
+        chf = ttk.LabelFrame(left, text="Channels")
         chf.pack(fill="x", **pad)
         self.ch_vars = {}
         for ch in (1, 2, 3, 4):
@@ -217,7 +286,7 @@ class App:
             self.ch_vars[ch] = v
 
         # --- output folder + prefix
-        of = ttk.LabelFrame(root, text="Save to")
+        of = ttk.LabelFrame(left, text="Save to")
         of.pack(fill="x", **pad)
         default_dir = os.path.join(os.path.expanduser("~"), "Desktop", "scope_data")
         self.outdir = tk.StringVar(value=default_dir)
@@ -225,7 +294,7 @@ class App:
                                                     expand=True, padx=6, pady=6)
         ttk.Button(of, text="...", width=3, command=self.pick_dir).pack(side="left", padx=6)
 
-        pf = ttk.Frame(root)
+        pf = ttk.Frame(left)
         pf.pack(fill="x", **pad)
         ttk.Label(pf, text="Filename prefix:").pack(side="left")
         self.prefix = tk.StringVar(value="scope")
@@ -235,13 +304,13 @@ class App:
                         variable=self.save_png).pack(side="left", padx=12)
 
         # --- grab
-        gf = ttk.Frame(root)
+        gf = ttk.Frame(left)
         gf.pack(fill="x", **pad)
         self.grab_btn = ttk.Button(gf, text="GRAB  (or press Space)",
                                    command=self.do_grab, state="disabled")
         self.grab_btn.pack(side="left", fill="x", expand=True, ipady=8)
 
-        af = ttk.Frame(root)
+        af = ttk.Frame(left)
         af.pack(fill="x", **pad)
         self.auto = tk.BooleanVar(value=False)
         ttk.Checkbutton(af, text="Auto-grab every", variable=self.auto,
@@ -250,8 +319,10 @@ class App:
         ttk.Entry(af, textvariable=self.interval, width=6).pack(side="left", padx=4)
         ttk.Label(af, text="seconds").pack(side="left")
 
+        self.build_settings(left, pad)
+
         # --- last screenshot
-        self.shot_frame = ttk.LabelFrame(root, text="Last screenshot")
+        self.shot_frame = ttk.LabelFrame(right, text="Last screenshot")
         self.shot_frame.pack(fill="x", **pad)
         box = tk.Frame(self.shot_frame, width=PREVIEW_W, height=PREVIEW_H)
         box.pack(padx=4, pady=4)
@@ -263,7 +334,7 @@ class App:
         self.preview_path = None
 
         # --- log
-        lf = ttk.LabelFrame(root, text="Log")
+        lf = ttk.LabelFrame(right, text="Log")
         lf.pack(fill="both", expand=True, **pad)
         self.logbox = tk.Text(lf, height=6, wrap="none", font=("Consolas", 9))
         self.logbox.pack(fill="both", expand=True, padx=4, pady=4)
@@ -357,7 +428,9 @@ class App:
 
     def set_busy(self, busy):
         self.busy = busy
-        self.grab_btn.configure(state="disabled" if busy or not self.scope.inst else "normal")
+        state = "disabled" if busy or not self.scope.inst else "normal"
+        for btn in (self.grab_btn, self.read_btn, self.apply_btn):
+            btn.configure(state=state)
 
     # -- actions ----------------------------------------------------------
 
@@ -369,7 +442,9 @@ class App:
                     text=idn[:70], foreground="#060"))
                 self.log(f"Connected: {idn}")
                 self.log(f"Address:   {self.scope.addr}")
-                self.root.after(0, lambda: self.grab_btn.configure(state="normal"))
+                self.root.after(0, lambda: self.set_busy(False))
+                values = self.read_all_settings()
+                self.root.after(0, lambda v=values: self.show_settings(v))
             except Exception as exc:
                 self.root.after(0, lambda: self.status.configure(
                     text="Not connected", foreground="#a00"))
@@ -423,7 +498,160 @@ class App:
                 self.log(f"{os.path.basename(png_path)}  ({len(img)} bytes)")
                 self.root.after(0, lambda p=png_path: self.show_preview(p))
 
+            # The knobs may have been turned on the scope itself since the
+            # last look, so refresh the panel from the instrument.
+            values = self.read_all_settings()
+            self.root.after(0, lambda v=values: self.show_settings(v))
+
             self.scope.run()
+        except Exception as exc:
+            self.log(f"ERROR: {exc}")
+        finally:
+            self.root.after(0, lambda: self.set_busy(False))
+
+    # -- settings panel ---------------------------------------------------
+
+    def build_settings(self, parent, pad):
+        self.set_vars = {}        # scpi root -> StringVar shown in the panel
+        self.set_marks = {}       # scpi root -> "edited" marker label
+        self.set_kinds = {}       # scpi root -> num/choice/bool
+        self.set_scope = {}       # scpi root -> value the scope last reported
+        self.read_stamp = ""      # when the panel last matched the instrument
+
+        sf = ttk.LabelFrame(parent, text="Scope settings")
+        sf.pack(fill="x", **pad)
+
+        g = ttk.Frame(sf)
+        g.pack(fill="x", padx=6, pady=(6, 2))
+        for i, (label, scpi, kind, choices) in enumerate(GLOBAL_SETTINGS):
+            row, col = divmod(i, 2)
+            ttk.Label(g, text=label + ":").grid(row=row, column=col * 2,
+                                                sticky="e", padx=(0, 4), pady=2)
+            self.setting_widget(g, scpi, kind, choices, row, col * 2 + 1, 11)
+
+        c = ttk.Frame(sf)
+        c.pack(fill="x", padx=6, pady=(6, 2))
+        for j, (label, _, _, _) in enumerate(CHANNEL_SETTINGS):
+            ttk.Label(c, text=label).grid(row=0, column=j + 1, pady=(0, 2))
+        for i, ch in enumerate((1, 2, 3, 4)):
+            ttk.Label(c, text=f"CH{ch}").grid(row=i + 1, column=0, sticky="e", padx=(0, 4))
+            for j, (_, tmpl, kind, choices) in enumerate(CHANNEL_SETTINGS):
+                self.setting_widget(c, tmpl.format(ch=ch), kind, choices, i + 1, j + 1, 8)
+
+        bar = ttk.Frame(sf)
+        bar.pack(fill="x", padx=6, pady=(2, 6))
+        self.read_btn = ttk.Button(bar, text="Read from scope",
+                                   command=self.do_read_settings, state="disabled")
+        self.read_btn.pack(side="left")
+        self.apply_btn = ttk.Button(bar, text="Apply changes",
+                                    command=self.do_apply_settings, state="disabled")
+        self.apply_btn.pack(side="left", padx=6)
+        self.set_status = ttk.Label(bar, text="not read yet", foreground="#666")
+        self.set_status.pack(side="left", padx=6)
+
+    def setting_widget(self, parent, scpi, kind, choices, row, col, width):
+        cell = ttk.Frame(parent)
+        cell.grid(row=row, column=col, sticky="w", padx=2, pady=1)
+        var = tk.StringVar()
+        if kind == "num":
+            w = ttk.Entry(cell, textvariable=var, width=width)
+        else:
+            w = ttk.Combobox(cell, textvariable=var, values=list(choices),
+                             width=max(4, width - 3), state="readonly")
+        w.pack(side="left")
+        mark = ttk.Label(cell, text=" ", width=1, foreground="#c60")
+        mark.pack(side="left")
+        self.set_vars[scpi] = var
+        self.set_marks[scpi] = mark
+        self.set_kinds[scpi] = kind
+        self.set_scope[scpi] = ""
+        var.trace_add("write", lambda *_: self.refresh_marks())
+
+    def edited(self, scpi):
+        """True if the panel value differs from what the scope last reported."""
+        return self.set_vars[scpi].get().strip() != self.set_scope[scpi]
+
+    def refresh_marks(self):
+        pending = 0
+        for scpi, mark in self.set_marks.items():
+            if self.edited(scpi):
+                pending += 1
+                mark.configure(text="*")
+            else:
+                mark.configure(text=" ")
+        if not self.read_stamp:
+            self.set_status.configure(text="not read yet", foreground="#666")
+        elif pending:
+            self.set_status.configure(
+                text=f"{pending} edit(s) not applied - press Apply changes",
+                foreground="#c60")
+        else:
+            self.set_status.configure(text=f"in sync with scope ({self.read_stamp})",
+                                      foreground="#060")
+
+    def show_settings(self, values, overwrite=False):
+        """Main thread only. Puts scope values in the panel, keeping any edit the
+        user has not applied yet - unless overwrite is set, which is the case
+        after an Apply, when the scope is the authority on what took effect."""
+        kept = 0
+        for scpi, value in values.items():
+            was_edited = self.edited(scpi)
+            self.set_scope[scpi] = value
+            if overwrite or not was_edited:
+                self.set_vars[scpi].set(value)
+            elif self.set_vars[scpi].get().strip() != value:
+                kept += 1
+        self.read_stamp = datetime.datetime.now().strftime("%H:%M:%S")
+        if kept:
+            self.log(f"  (panel: kept {kept} unapplied edit(s), scope value differs)")
+        self.refresh_marks()
+
+    def read_all_settings(self):
+        """Instrument thread only. Returns {scpi root: value to display}."""
+        values = {}
+        for scpi, kind in self.set_kinds.items():
+            try:
+                values[scpi] = fmt_setting(kind, self.scope.get(scpi))
+            except Exception as exc:
+                self.log(f"  {scpi}? failed: {exc}")
+        return values
+
+    def do_read_settings(self):
+        if self.busy or not self.scope.inst:
+            return
+        self.set_busy(True)
+        threading.Thread(target=self._settings_worker, args=(None,), daemon=True).start()
+
+    def do_apply_settings(self):
+        if self.busy or not self.scope.inst:
+            return
+        changes = {scpi: var.get().strip() for scpi, var in self.set_vars.items()
+                   if self.edited(scpi)}
+        if not changes:
+            self.log("No setting changes to apply.")
+            return
+        self.set_busy(True)
+        threading.Thread(target=self._settings_worker, args=(changes,), daemon=True).start()
+
+    def _settings_worker(self, changes):
+        try:
+            if changes:
+                for scpi, value in changes.items():
+                    if self.set_kinds[scpi] == "num":
+                        try:
+                            value = f"{float(value):g}"
+                        except ValueError:
+                            self.log(f"  {scpi} <- '{value}' is not a number, skipped")
+                            continue
+                    self.scope.put(scpi, value)
+                    self.log(f"  {scpi} <- {value}")
+                for err in self.scope.errors():
+                    self.log(f"  scope rejected something: {err}")
+            # Read back either way: after a write the scope is the authority on
+            # what it actually accepted, since it clamps values it dislikes.
+            values = self.read_all_settings()
+            self.root.after(0,
+                            lambda v=values: self.show_settings(v, overwrite=bool(changes)))
         except Exception as exc:
             self.log(f"ERROR: {exc}")
         finally:

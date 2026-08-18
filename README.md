@@ -42,6 +42,32 @@ Keysight/Agilent USB instrument it finds; hit **Connect** to retry.
   acquisition.
 - **Auto-grab** - repeat on a fixed interval.
 
+## Scope settings
+
+The **Scope settings** panel mirrors the instrument: timebase, trigger and
+acquisition mode, plus V/div, offset, coupling, probe attenuation, bandwidth limit
+and display state for each channel.
+
+It reads from the scope when it connects, on **Read from scope**, and
+automatically after every grab - so settings changed with the scope's own knobs
+show up without asking.
+
+To change a setting from the window, edit the field and press **Apply changes**:
+
+- Only edited fields are written. A `*` next to a field marks it as edited but not
+  yet applied, and the status line counts them.
+- A pull never discards an edit you have not applied yet. If a value changes on the
+  scope while you have a pending edit for the same field, your edit stays in the
+  box and the log notes that the scope disagrees.
+- After a write the panel re-reads the instrument, so what you see is what the
+  scope actually accepted rather than what you asked for - relevant because the
+  scope silently clamps values outside its range.
+- The scope's error queue is drained after every apply and anything it reports is
+  written to the log.
+
+Settings traffic and captures share one VISA session, so they are serialised: the
+buttons grey out while a grab is running and vice versa.
+
 ## Notes on acquisition
 
 Capture uses `:SINGle` rather than `:DIGitize`, so the trace stays on the scope display
