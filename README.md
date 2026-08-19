@@ -41,6 +41,8 @@ Keysight/Agilent USB instrument it finds; hit **Connect** to retry.
 - **Space** grabs, except while the focus is in a text field or on a control that uses
   the space bar itself - so typing a space in the prefix box does not fire an
   acquisition.
+- **take the trace already on the scope** - save what the scope has already
+  captured instead of arming a new acquisition, see below.
 - **Wait for trigger** - how long a capture stays armed. `0` waits indefinitely,
   for priming before an experiment elsewhere starts triggering. While a one-off
   grab is armed, GRAB becomes **Cancel wait**.
@@ -80,6 +82,30 @@ put while captures keep landing, with the counter showing how many have arrived.
 Only screenshots matching the current filename prefix are browsed, so several runs
 can share one folder without their screenshots interleaving. A prefix with no
 captures yet shows an empty pane rather than someone else's run.
+
+## Taking the trace already on the scope
+
+Tick **take the trace already on the scope (no new trigger)** and GRAB saves what
+is in acquisition memory right now - the run you are already looking at - instead
+of arming and waiting for another trigger. The trigger wait greys out, because
+nothing is being waited for.
+
+- The scope is stopped first, then read. That matters: reading memory while the
+  scope is still acquiring returns a record torn between two acquisitions.
+- Its run state is put back afterwards. A scope you had stopped on an interesting
+  trace stays stopped on it, so you can grab it again - with other channels ticked,
+  or under a different prefix. A scope that was live goes back to running.
+- The metadata file records `capture mode : existing trace on the scope, not a new
+  trigger`, so a file that was not a fresh acquisition says so months later. Normal
+  captures are unchanged and gain no such line.
+- The setting is **not** remembered between sessions. Left on by accident it would
+  quietly save a stale trace as though it were a new capture, so every launch
+  starts with it off.
+
+A sequence refuses to start in this mode: nothing re-arms, so acquisition memory
+never changes and every run would write a copy of the same trace. To capture
+successive triggers - including ones you send by hand from the scope's own Single
+button - leave it off and set **Wait for trigger** to `0`.
 
 ## Priming a capture for an external trigger
 

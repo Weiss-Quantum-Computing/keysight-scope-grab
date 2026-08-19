@@ -205,6 +205,22 @@ class Scope:
         self.inst.write(":STOP")
         return False
 
+    def is_running(self):
+        # Bit 3 of the Operation Status Condition register is the Run bit.
+        try:
+            return bool(int(self.inst.query(":OPERegister:CONDition?")) & 8)
+        except Exception:
+            return False
+
+    def freeze(self):
+        """Use what the scope has already captured instead of arming a new
+        acquisition. Stopping first matters: reading memory while the scope is
+        still acquiring returns a record torn between two acquisitions. Returns
+        whether it had been running, so its state can be put back."""
+        was_running = self.is_running()
+        self.inst.write(":STOP")
+        return was_running
+
     def waveform(self, channel, points_mode="RAW", points=None):
         w = self.inst
         w.write(f":WAVeform:SOURce CHANnel{channel}")
@@ -253,7 +269,7 @@ class Scope:
             found.append(resp)
         return found
 
-    def metadata(self, channels, settings, names=None, label=None):
+    def metadata(self, channels, settings, names=None, label=None, existing=False):
         """Format the metadata file. `settings` is the raw {scpi root: reply}
         snapshot already read for the panel, so a grab only asks the scope once
         and the file describes the same instant the panel shows. Values are the
@@ -263,7 +279,9 @@ class Scope:
             f"captured           : {datetime.datetime.now().isoformat()}",
             f"instrument         : {self.idn}",
             f"visa address       : {self.addr}",
-        ] + ([f"sequence label     : {label}"] if label else []) + [
+        ] + ([f"sequence label     : {label}"] if label else []) + (
+            ["capture mode       : existing trace on the scope, not a new trigger"]
+            if existing else []) + [
             f"sample rate (Sa/s) : {s(':ACQuire:SRATe')}",
             f"points acquired    : {s(':ACQuire:POINts')}",
             f"acquisition type   : {s(':ACQuire:TYPE')}",
@@ -389,11 +407,21 @@ class App:
                                    command=self.do_grab, state="disabled")
         self.grab_btn.pack(side="left", fill="x", expand=True, ipady=8)
 
+        ef = ttk.Frame(left)
+        ef.pack(fill="x", **pad)
+        # Deliberately not remembered between sessions: leaving it on by
+        # accident would quietly save a stale trace as if it were a new capture.
+        self.use_existing = tk.BooleanVar(value=False)
+        ttk.Checkbutton(ef, text="take the trace already on the scope (no new trigger)",
+                        variable=self.use_existing,
+                        command=self.toggle_existing).pack(side="left")
+
         tf = ttk.Frame(left)
         tf.pack(fill="x", **pad)
         ttk.Label(tf, text="Wait for trigger:").pack(side="left")
         self.trig_wait = tk.StringVar(value="10")
-        ttk.Entry(tf, textvariable=self.trig_wait, width=7).pack(side="left", padx=4)
+        self.trig_entry = ttk.Entry(tf, textvariable=self.trig_wait, width=7)
+        self.trig_entry.pack(side="left", padx=4)
         ttk.Label(tf, text="s (0 = no limit)").pack(side="left")
         self.phase = ttk.Label(tf, text="", foreground="#060")
         self.phase.pack(side="left", padx=10)
@@ -447,6 +475,7 @@ class App:
             var.trace_add("write", lambda *_: self.show_next_name())
         self.show_next_name()
 
+        self.toggle_existing()
         self.build_settings(left, pad)
 
         # --- last screenshot
@@ -752,6 +781,11 @@ class App:
         self.set_busy(True)
         threading.Thread(target=self._grab_worker, args=(chans,), daemon=True).start()
 
+    def toggle_existing(self):
+        """The trigger wait is meaningless when we are not waiting for one."""
+        self.trig_entry.configure(
+            state="disabled" if self.use_existing.get() else "normal")
+
     def cancel_grab(self):
         self.stop_flag.set()
         self.log("Cancel requested - takes effect while waiting for a trigger; "
@@ -789,21 +823,32 @@ class App:
             tag = label or datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             base = os.path.join(outdir, f"{self.safe_prefix()}_{tag}")
 
-            wait_s = self.trigger_wait_s()
-            self.set_phase("waiting for trigger" + ("" if wait_s else " (no limit)"))
+            existing = self.use_existing.get()
             armed_at = time.time()
-            triggered = self.scope.single(wait_s=wait_s,
-                                          cancelled=self.stop_flag.is_set)
+            if existing:
+                # Take what is in acquisition memory now. Put the run state back
+                # afterwards so a scope that was live stays live.
+                self.set_phase("reading the trace on screen")
+                resume = self.scope.freeze()
+                self.log("  using the trace already on the scope"
+                         + (" (it was running, so it was stopped first)" if resume
+                            else " (it was already stopped)"))
+            else:
+                resume = True
+                wait_s = self.trigger_wait_s()
+                self.set_phase("waiting for trigger" + ("" if wait_s else " (no limit)"))
+                triggered = self.scope.single(wait_s=wait_s,
+                                              cancelled=self.stop_flag.is_set)
+                if triggered is None:
+                    self.log("  cancelled while waiting for a trigger - nothing saved")
+                    self.scope.run()
+                    return
+                if triggered is False:
+                    self.log(f"  no trigger within {wait_s:g} s - nothing saved. Raise "
+                             f"'Wait for trigger', or set it to 0 to wait indefinitely.")
+                    self.scope.run()
+                    return
             t_armed = time.time() - armed_at
-            if triggered is None:
-                self.log("  cancelled while waiting for a trigger - nothing saved")
-                self.scope.run()
-                return
-            if triggered is False:
-                self.log(f"  no trigger within {wait_s:g} s - nothing saved. Raise "
-                         f"'Wait for trigger', or set it to 0 to wait indefinitely.")
-                self.scope.run()
-                return
             # Everything that needs the instrument happens first, so the scope
             # goes live again before the slow business of writing files. It is
             # not armed during either phase - see the missed-trigger note below.
@@ -824,7 +869,8 @@ class App:
             # The screenshot has to be taken before :RUN, while the captured
             # trace is still the one on screen.
             img = self.scope.screenshot() if self.save_png.get() else None
-            self.scope.run()
+            if resume:
+                self.scope.run()
             t_read = time.time() - read_at
 
             self.set_phase("writing files")
@@ -838,7 +884,7 @@ class App:
                      f"({data.shape[0]} pts x {data.shape[1]} cols)")
 
             with open(base + ".txt", "w") as fh:
-                fh.write(self.scope.metadata(chans, settings, names, label))
+                fh.write(self.scope.metadata(chans, settings, names, label, existing))
             self.grab_wrote = True
 
             if img is not None:
@@ -854,7 +900,7 @@ class App:
                      f"{t_armed:.1f} s waiting for the trigger, "
                      f"{t_read:.1f} s reading, {t_write:.1f} s writing "
                      f"({t_armed + t_read + t_write:.1f} s total)")
-            if t_armed < 0.5:
+            if t_armed < 0.5 and not existing:
                 # The scope cannot be armed while it is being read out, so a
                 # trigger that is already pending the moment it re-arms means
                 # earlier ones came and went unrecorded.
@@ -1063,6 +1109,14 @@ class App:
         chans = self.channels()
         if not chans:
             self.log("Pick at least one channel.")
+            return
+        if self.use_existing.get():
+            # Nothing re-arms, so acquisition memory never changes: every run
+            # would write a copy of the same trace.
+            self.log("Sequence: untick 'take the trace already on the scope' first - "
+                     "without a new trigger every run would save the same trace. To "
+                     "capture successive triggers, leave it off and set 'Wait for "
+                     "trigger' to 0.")
             return
         if self.auto.get():          # only one repeating mechanism at a time
             self.auto.set(False)
