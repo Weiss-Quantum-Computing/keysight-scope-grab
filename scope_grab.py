@@ -513,7 +513,11 @@ class App:
         # --- log
         lf = ttk.LabelFrame(right, text="Log")
         lf.pack(fill="both", expand=True, **pad)
-        self.logbox = tk.Text(lf, height=6, wrap="none", font=("Consolas", 9))
+        self.logbox = tk.Text(lf, height=6, wrap="word", font=("Consolas", 9))
+        # Wrapped continuations are indented, so a long message reads as one
+        # entry rather than as several. Wrapping by width rather than at a fixed
+        # column means it still fits after the window is resized.
+        self.logbox.tag_configure("entry", lmargin2=30)
         self.logbox.pack(fill="both", expand=True, padx=4, pady=4)
 
         root.bind("<space>", self.on_space)
@@ -533,7 +537,7 @@ class App:
 
     def pump(self):
         while not self.msgs.empty():
-            self.logbox.insert("end", self.msgs.get() + "\n")
+            self.logbox.insert("end", self.msgs.get() + "\n", "entry")
             self.logbox.see("end")
         self.root.after(100, self.pump)
 
@@ -788,8 +792,8 @@ class App:
 
     def cancel_grab(self):
         self.stop_flag.set()
-        self.log("Cancel requested - takes effect while waiting for a trigger; "
-                 "a transfer already under way will finish.")
+        self.log("Cancel requested - takes effect while waiting for a trigger")
+        self.log("  a transfer already under way will finish")
 
     def set_phase(self, text):
         """Called from the capture thread."""
@@ -844,8 +848,9 @@ class App:
                     self.scope.run()
                     return
                 if triggered is False:
-                    self.log(f"  no trigger within {wait_s:g} s - nothing saved. Raise "
-                             f"'Wait for trigger', or set it to 0 to wait indefinitely.")
+                    self.log(f"  no trigger within {wait_s:g} s - nothing saved")
+                    self.log("    raise 'Wait for trigger', or set it to 0 to wait "
+                             "indefinitely")
                     self.scope.run()
                     return
             t_armed = time.time() - armed_at
@@ -896,19 +901,18 @@ class App:
             t_write = time.time() - write_at
 
             self.root.after(0, lambda v=settings: self.show_settings(v))
-            self.log(f"  {'run ' + label if label else 'grab'}: "
-                     f"{t_armed:.1f} s waiting for the trigger, "
+            self.log(f"  {'run ' + label if label else 'grab'}: {t_armed:.1f} s armed, "
                      f"{t_read:.1f} s reading, {t_write:.1f} s writing "
-                     f"({t_armed + t_read + t_write:.1f} s total)")
+                     f"= {t_armed + t_read + t_write:.1f} s")
             if t_armed < 0.5 and not existing:
                 # The scope cannot be armed while it is being read out, so a
                 # trigger that is already pending the moment it re-arms means
                 # earlier ones came and went unrecorded.
-                self.log("  ! a trigger was already waiting when the scope armed: "
-                         "triggers are arriving faster than a run takes, so some "
-                         "are being missed. Lower 'Transfer points', or slow the "
-                         "source to more than "
-                         f"{t_read + t_write:.0f} s between triggers.")
+                self.log("  ! a trigger was already waiting when the scope armed:")
+                self.log("    triggers are arriving faster than a run takes, so some "
+                         "are being missed")
+                self.log("    lower 'Transfer points', or leave more than "
+                         f"{t_read + t_write:.0f} s between triggers")
             self.root.after(0, self.save_config)
         except Exception as exc:
             self.log(f"ERROR: {exc}")
@@ -1113,10 +1117,10 @@ class App:
         if self.use_existing.get():
             # Nothing re-arms, so acquisition memory never changes: every run
             # would write a copy of the same trace.
-            self.log("Sequence: untick 'take the trace already on the scope' first - "
-                     "without a new trigger every run would save the same trace. To "
-                     "capture successive triggers, leave it off and set 'Wait for "
-                     "trigger' to 0.")
+            self.log("Sequence: untick 'take the trace already on the scope' first")
+            self.log("  without a new trigger, every run would save the same trace")
+            self.log("  to capture successive triggers, leave it off and set "
+                     "'Wait for trigger' to 0")
             return
         if self.auto.get():          # only one repeating mechanism at a time
             self.auto.set(False)
@@ -1126,8 +1130,10 @@ class App:
         self.seq_width = max(3, len(str(start + count - 1)))
         first = self.first_free(start)
         if first != start:
-            self.log(f"Sequence: {self.safe_prefix()}_{start:0{self.seq_width}d}.csv "
-                     f"already exists, starting at {first:0{self.seq_width}d} instead")
+            # Naming the labels rather than the whole filename keeps this on one
+            # line whatever the prefix is.
+            self.log(f"Sequence: {start:0{self.seq_width}d}-{first - 1:0{self.seq_width}d} "
+                     f"already exist, starting at {first:0{self.seq_width}d}")
         self.seq_index = first
         self.seq_last = first + count - 1
         self.seq_gap = max(0.0, gap)

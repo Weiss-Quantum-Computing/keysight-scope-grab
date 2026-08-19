@@ -132,10 +132,10 @@ under way finishes rather than being thrown away.
 > came and went unrecorded - it says so and names the interval you would need:
 >
 > ```
->   run 002: 0.0 s waiting for the trigger, 4.3 s reading, 5.7 s writing (10.0 s total)
->   ! a trigger was already waiting when the scope armed: triggers are arriving
->     faster than a run takes, so some are being missed. Lower 'Transfer points',
->     or slow the source to more than 10 s between triggers.
+>   run 002: 0.0 s armed, 4.3 s reading, 5.7 s writing = 10.0 s
+>   ! a trigger was already waiting when the scope armed:
+>     triggers are arriving faster than a run takes, so some are being missed
+>     lower 'Transfer points', or leave more than 10 s between triggers
 > ```
 >
 > A worked example: 1M points on 4 channels takes about 10 s per run. Against a
@@ -237,6 +237,15 @@ To change a setting from the window, edit the field and press **Apply changes**:
 
 Settings traffic and captures share one VISA session, so they are serialised: the
 buttons grey out while a grab is running and vice versa.
+
+## The log
+
+The log wraps rather than running off to the right, with continuations indented so
+a long entry still reads as one. Messages are kept to a line where they fit, and
+split across lines where they do not, so nothing depends on the window being a
+particular width - resize it and the text reflows. Because the wrapping is the
+widget's rather than baked into the text, copying an entry out gives you one line
+again.
 
 ## Remembered settings
 
