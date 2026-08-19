@@ -10,7 +10,9 @@ Requires: Keysight IO Libraries Suite + `pip install pyvisa numpy pillow`
 Run with:  pythonw scope_grab.py      (pythonw = no console window)
 """
 
+import base64
 import datetime
+import io
 import json
 import os
 import queue
@@ -97,6 +99,16 @@ def safe_column(name):
     while "__" in out:
         out = out.replace("__", "_")
     return out.strip("_")
+
+
+def free_base(base):
+    """Add a suffix rather than overwrite a capture that is already there."""
+    if not os.path.exists(base + ".csv"):
+        return base
+    n = 2
+    while os.path.exists(f"{base}_{n}.csv"):
+        n += 1
+    return f"{base}_{n}"
 
 
 def fmt_setting(kind, raw):
@@ -406,6 +418,9 @@ class App:
         self.grab_btn = ttk.Button(gf, text="GRAB  (or press Space)",
                                    command=self.do_grab, state="disabled")
         self.grab_btn.pack(side="left", fill="x", expand=True, ipady=8)
+        self.peek_btn = ttk.Button(gf, text="Peek (saves nothing)",
+                                   command=self.do_peek, state="disabled")
+        self.peek_btn.pack(side="left", padx=(6, 0), ipady=8)
 
         ef = ttk.Frame(left)
         ef.pack(fill="x", **pad)
@@ -495,6 +510,7 @@ class App:
         self.preview_path = None
         self.shots = []           # screenshots of the current prefix, in order
         self.shot_i = -1
+        self.follow = True        # sit on the newest as captures arrive
 
         nav = ttk.Frame(self.shot_frame)
         nav.pack(fill="x", padx=4, pady=(0, 4))
@@ -633,12 +649,14 @@ class App:
                     for c in self.prefix.get()).strip()
         return p or "scope"
 
-    def show_preview(self, path):
-        """Put a PNG in the preview box. Main thread only (Tk images are not
-        thread safe)."""
+    def render_preview(self, source):
+        """Put a PNG in the preview box: `source` is a file path, or PNG bytes for
+        a screenshot that was never written to disk. Main thread only, since Tk
+        images are not thread safe."""
         try:
             if Image is not None:
-                im = Image.open(path)
+                im = Image.open(source if isinstance(source, str)
+                                else io.BytesIO(source))
                 im.load()
                 k = min(PREVIEW_W / im.width, PREVIEW_H / im.height, 1.0)
                 if k < 1.0:
@@ -647,7 +665,9 @@ class App:
                                    Image.LANCZOS)
                 img = ImageTk.PhotoImage(im)
             else:
-                img = tk.PhotoImage(file=path)     # Tk 8.6 reads PNG natively
+                # Tk 8.6 reads PNG natively, from a file or from base64 data.
+                img = (tk.PhotoImage(file=source) if isinstance(source, str)
+                       else tk.PhotoImage(data=base64.b64encode(source)))
                 k = 1
                 while img.width() // k > PREVIEW_W or img.height() // k > PREVIEW_H:
                     k += 1
@@ -655,13 +675,27 @@ class App:
                     img = img.subsample(k)         # integer factors only
         except Exception as exc:
             self.log(f"  (preview failed: {exc})")
-            return
+            return False
         self.preview_img = img            # keep a reference or Tk drops it
-        self.preview_path = path
         self.preview.configure(image=img, text="")
-        self.shot_frame.configure(
-            text=f"Screenshot - {os.path.basename(path)}  "
-                 f"(wheel or arrow keys to scroll, double-click to open)")
+        return True
+
+    def show_preview(self, path):
+        if self.render_preview(path):
+            self.preview_path = path
+            self.shot_frame.configure(
+                text=f"Screenshot - {os.path.basename(path)}  "
+                     f"(wheel or arrow keys to scroll, double-click to open)")
+
+    def show_peek(self, data):
+        """A screenshot held only in the window. preview_path goes to None: there
+        is no file to open, and the browser has nothing new to point at."""
+        if self.render_preview(data):
+            self.preview_path = None
+            stamp = datetime.datetime.now().strftime("%H:%M:%S")
+            self.shot_frame.configure(
+                text=f"Screenshot - scope screen at {stamp}, not saved")
+            self.shot_pos.configure(text="not saved", foreground="#c60")
 
     def shot_paths(self):
         """Screenshots in the output folder that belong to the current prefix.
@@ -679,11 +713,13 @@ class App:
         """Rescan after a capture or a folder change. Stays on the picture being
         looked at, so screenshots arriving mid-sequence do not yank the view
         forward - unless the newest was already on show, or `newest` is set."""
-        following = not self.shots or self.preview_path == self.shots[-1]
-        current = self.preview_path
+        # Tracked by index rather than by what is on screen, so a peek - which
+        # displays no file at all - does not stop new captures being followed.
+        current = self.shots[self.shot_i] if 0 <= self.shot_i < len(self.shots) else None
         self.shots = self.shot_paths()
         if not self.shots:
             self.shot_i = -1
+            self.follow = True
             self.preview_path = None
             self.preview.configure(image="", text="(no screenshot yet)")
             self.shot_frame.configure(text="Last screenshot")
@@ -691,7 +727,7 @@ class App:
             for btn in (self.prev_btn, self.next_btn, self.newest_btn):
                 btn.configure(state="disabled")
             return
-        if newest or following or current not in self.shots:
+        if newest or self.follow or current not in self.shots:
             self.shot_i = len(self.shots) - 1
         else:
             self.shot_i = self.shots.index(current)
@@ -702,6 +738,7 @@ class App:
             return
         self.shot_i = max(0, min(self.shot_i, len(self.shots) - 1))
         last = len(self.shots) - 1
+        self.follow = self.shot_i == last
         self.show_preview(self.shots[self.shot_i])
         behind = last - self.shot_i
         self.shot_pos.configure(
@@ -721,11 +758,13 @@ class App:
         self.refresh_shots(newest=True)
 
     def open_preview(self, _event=None):
-        if self.preview_path:
-            try:
-                os.startfile(self.preview_path)
-            except Exception as exc:
-                self.log(f"ERROR: {exc}")
+        if not self.preview_path:
+            self.log("That screenshot was not saved, so there is no file to open.")
+            return
+        try:
+            os.startfile(self.preview_path)
+        except Exception as exc:
+            self.log(f"ERROR: {exc}")
 
     def column_name(self, ch):
         """CSV header for a channel. The channel number is kept even when named,
@@ -740,7 +779,7 @@ class App:
     def set_busy(self, busy):
         self.busy = busy
         state = "disabled" if busy or self.seq_active or not self.scope.inst else "normal"
-        for btn in (self.read_btn, self.apply_btn):
+        for btn in (self.read_btn, self.apply_btn, self.peek_btn):
             btn.configure(state=state)
         # During a one-off grab the GRAB button becomes the way to call off a
         # long trigger wait. A sequence has its own Stop button instead.
@@ -773,6 +812,27 @@ class App:
                     text="Not connected", foreground="#a00"))
                 self.log(f"ERROR: {exc}")
         threading.Thread(target=work, daemon=True).start()
+
+    def do_peek(self):
+        """Show the scope's screen without writing a file. Deliberately does not
+        arm, stop or run the scope: it only asks for the rendered display, so a
+        test in progress is left exactly as it was."""
+        if self.busy or not self.scope.inst:
+            return
+        self.set_busy(True)
+        threading.Thread(target=self._peek_worker, daemon=True).start()
+
+    def _peek_worker(self):
+        try:
+            img = self.scope.screenshot()
+            self.log(f"screenshot pulled into the window, nothing saved "
+                     f"({len(img)} bytes)")
+            self.root.after(0, lambda d=bytes(img): self.show_peek(d))
+        except Exception as exc:
+            self.log(f"ERROR: {exc}")
+        finally:
+            # Not grab_done: a peek is not a run and must not advance a sequence.
+            self.root.after(0, lambda: self.set_busy(False))
 
     def do_grab(self):
         if self.busy or not self.scope.inst:
@@ -826,6 +886,11 @@ class App:
             # Either way the wall-clock time is recorded inside the .txt file.
             tag = label or datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             base = os.path.join(outdir, f"{self.safe_prefix()}_{tag}")
+            if label is None:
+                # The timestamp only resolves to a second, so two grabs inside
+                # the same second would otherwise overwrite each other. Sequence
+                # labels have their own collision check in first_free().
+                base = free_base(base)
 
             existing = self.use_existing.get()
             armed_at = time.time()

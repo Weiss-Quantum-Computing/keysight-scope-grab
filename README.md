@@ -41,6 +41,8 @@ Keysight/Agilent USB instrument it finds; hit **Connect** to retry.
 - **Space** grabs, except while the focus is in a text field or on a control that uses
   the space bar itself - so typing a space in the prefix box does not fire an
   acquisition.
+- **Peek (saves nothing)** - pull the scope's screen into the window and write no
+  files at all, for adjusting things without accumulating data. See below.
 - **take the trace already on the scope** - save what the scope has already
   captured instead of arming a new acquisition, see below.
 - **Wait for trigger** - how long a capture stays armed. `0` waits indefinitely,
@@ -82,6 +84,26 @@ put while captures keep landing, with the counter showing how many have arrived.
 Only screenshots matching the current filename prefix are browsed, so several runs
 can share one folder without their screenshots interleaving. A prefix with no
 captures yet shows an empty pane rather than someone else's run.
+
+## Looking without saving
+
+**Peek (saves nothing)** fetches the scope's screen into the panel and writes
+nothing - no CSV, no PNG, no metadata, and no sequence label consumed. It is for
+adjusting a setup and watching the effect without leaving a trail of files to sort
+out afterwards.
+
+It does not arm, stop or run the scope. Only the rendered display is read, so a
+test in progress is left exactly as it was, and a live scope stays live. Nothing is
+frozen because nothing is read out of acquisition memory.
+
+The pane shows the screen with the caption `not saved`, and the counter under it
+reads `not saved` rather than a position, since a peek is not in the browsed set.
+Double-clicking it says so rather than opening anything. **prev** / **next** go
+back to browsing the files on disk, and a capture arriving during a sequence still
+pulls the view forward if it was following - peeking does not interrupt that.
+
+Peek is greyed out while a capture or a sequence is running, since they share the
+one VISA session.
 
 ## Taking the trace already on the scope
 
@@ -284,6 +306,10 @@ and the screenshot matches the CSV data. If no trigger arrives within 10 s the s
 stopped and whatever is in acquisition memory is read out, with a note in the log.
 Waveforms are transferred as unsigned bytes in `RAW` points mode and scaled to volts
 using the preamble.
+
+A timestamped capture never overwrites one that is already there. The timestamp
+only resolves to a second, so a second capture inside the same second is saved with
+a `_2` suffix rather than replacing the first. Sequence labels have their own check.
 
 Each grab reads the instrument's settings exactly once, and both the panel and the
 `.txt` file are rendered from that single snapshot - so the two can never disagree
