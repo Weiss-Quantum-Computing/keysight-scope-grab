@@ -969,7 +969,9 @@ class App:
             self.log(f"  {'run ' + label if label else 'grab'}: {t_armed:.1f} s armed, "
                      f"{t_read:.1f} s reading, {t_write:.1f} s writing "
                      f"= {t_armed + t_read + t_write:.1f} s")
-            if t_armed < 0.5 and not existing:
+            # Only a sequence can silently lose shots to this. On a one-off
+            # grab a trigger already waiting is just a running signal.
+            if label is not None and t_armed < 0.5 and not existing:
                 # The scope cannot be armed while it is being read out, so a
                 # trigger that is already pending the moment it re-arms means
                 # earlier ones came and went unrecorded.
@@ -988,6 +990,7 @@ class App:
 
     def build_settings(self, parent, pad):
         self.set_vars = {}        # scpi root -> StringVar shown in the panel
+        self.set_widgets = {}     # scpi root -> the widget showing it
         self.set_marks = {}       # scpi root -> "edited" marker label
         self.set_kinds = {}       # scpi root -> num/choice/bool
         self.set_scope = {}       # scpi root -> value the scope last reported
@@ -1033,22 +1036,32 @@ class App:
 
     def setting_widget(self, parent, scpi, kind, choices, row, col, width):
         cell = ttk.Frame(parent)
-        cell.grid(row=row, column=col, sticky="w", padx=2, pady=1)
+        # A checkbox is much narrower than its column heading, so give those
+        # cells more room or the headings collide.
+        cell.grid(row=row, column=col, sticky="w",
+                  padx=(10 if kind == "bool" else 2), pady=1)
         var = tk.StringVar()
         if kind == "info":
             # read-only: no entry to edit, no edited-marker, never written back
-            ttk.Label(cell, textvariable=var, width=width).pack(side="left")
+            w = ttk.Label(cell, textvariable=var, width=width)
         elif kind == "num":
-            ttk.Entry(cell, textvariable=var, width=width).pack(side="left")
+            w = ttk.Entry(cell, textvariable=var, width=width)
+        elif kind == "bool":
+            # A checkbox driving the same ON/OFF string, so the edited-marker,
+            # the read-back and the write path all stay as they are. Before the
+            # first read the value is "", which Tk shows as neither state.
+            w = ttk.Checkbutton(cell, variable=var, onvalue="ON", offvalue="OFF")
         else:
-            ttk.Combobox(cell, textvariable=var, values=list(choices),
-                         width=max(4, width - 3), state="readonly").pack(side="left")
+            w = ttk.Combobox(cell, textvariable=var, values=list(choices),
+                             width=max(4, width - 3), state="readonly")
+        w.pack(side="left")
         if kind != "info":
             mark = ttk.Label(cell, text=" ", width=1, foreground="#c60")
             mark.pack(side="left")
             self.set_marks[scpi] = mark
             var.trace_add("write", lambda *_: self.refresh_marks())
         self.set_vars[scpi] = var
+        self.set_widgets[scpi] = w
         self.set_kinds[scpi] = kind
         self.set_scope[scpi] = ""
 
@@ -1140,6 +1153,15 @@ class App:
             values = self.read_all_settings()
             self.root.after(0,
                             lambda v=values: self.show_settings(v, overwrite=bool(changes)))
+            if changes:
+                # Show what the change did. The display needs a sweep to redraw
+                # after something like a timebase change, so give it a moment.
+                time.sleep(0.4)
+                try:
+                    img = self.scope.screenshot()
+                    self.root.after(0, lambda d=bytes(img): self.show_peek(d))
+                except Exception as exc:
+                    self.log(f"  (screenshot after applying failed: {exc})")
         except Exception as exc:
             self.log(f"ERROR: {exc}")
         finally:

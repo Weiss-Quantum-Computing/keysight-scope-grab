@@ -149,9 +149,11 @@ under way finishes rather than being thrown away.
 > armed. Space the triggers wider than one run, or shorten the run with fewer
 > **Transfer points**.
 >
-> The log makes this visible. Every run reports where its time went, and if a
-> trigger was already waiting the moment the scope armed - meaning earlier ones
-> came and went unrecorded - it says so and names the interval you would need:
+> The log makes this visible. Every capture reports where its time went, and in a
+> sequence, a trigger already waiting the moment the scope armed - meaning earlier
+> ones came and went unrecorded - is called out with the interval you would need.
+> A one-off grab reports its timings but does not warn: a trigger already waiting
+> there just means the signal is running.
 >
 > ```
 >   run 002: 0.0 s armed, 4.3 s reading, 5.7 s writing = 10.0 s
@@ -244,6 +246,8 @@ It reads from the scope when it connects, on **Read from scope**, and
 automatically after every grab - so settings changed with the scope's own knobs
 show up without asking.
 
+Bandwidth limit and display are checkboxes; the rest are text boxes and drop-downs.
+
 To change a setting from the window, edit the field and press **Apply changes**:
 
 - Only edited fields are written. A `*` next to a field marks it as edited but not
@@ -256,6 +260,11 @@ To change a setting from the window, edit the field and press **Apply changes**:
   scope silently clamps values outside its range.
 - The scope's error queue is drained after every apply and anything it reports is
   written to the log.
+- Applying ends with a peek: the scope's screen is pulled into the pane so the
+  effect of the change is visible without saving anything. The display is given a
+  moment to redraw first, so on a slow timebase the picture may still be one sweep
+  behind - peek again to catch up. **Read from scope** does not peek, and neither
+  does an Apply with nothing edited.
 
 Settings traffic and captures share one VISA session, so they are serialised: the
 buttons grey out while a grab is running and vice versa.
