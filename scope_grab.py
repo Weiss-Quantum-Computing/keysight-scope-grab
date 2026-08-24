@@ -271,6 +271,55 @@ class Scope:
         self.inst.write(":STOP")
         return False
 
+    def accumulate(self, count, wait_s=10.0, cancelled=None, progress=None):
+        """Run until the averager has folded `count` acquisitions into the record.
+
+        An average builds over successive triggers while the scope is running;
+        :SINGle takes exactly one, which is how a grab can come back claiming 256
+        averages while carrying one (see report_averaging). So an averaged grab
+        sets the scope running, clears the display so the count restarts from
+        zero rather than continuing an average of whatever was playing before,
+        polls the hit count in the building record, and stops only once the
+        average is full.
+
+        wait_s here is a STALL limit, not a total: it restarts every time the
+        count advances, so a deep average is allowed its many trigger periods
+        while a dead trigger is still caught within one wait. <= 0 never gives
+        up. `progress` is called with the running hit count as it climbs.
+
+        Returns the number of hits in the stopped record: `count` on success,
+        fewer if the triggers dried up mid-build, 0 if none ever came, or None
+        if cancelled. In every case but None the scope holds a stopped, valid
+        (if shallow) record.
+        """
+        self.inst.write(":RUN")
+        # Restart the average. Without this the record still holds the previous
+        # waveform's average at full count, and a poll would declare it complete
+        # before a single new trigger had landed.
+        self.inst.write(":CDISplay")
+        hits = 0
+        moved = time.time()
+        while True:
+            if cancelled is not None and cancelled():
+                self.inst.write(":STOP")
+                return None
+            got = self.try_get(WAVE_COUNT, timeout_ms=1000)
+            try:
+                now = int(float(got))
+            except (TypeError, ValueError):
+                now = hits    # +109 before the first trigger lands, most likely
+            if now > hits:
+                hits, moved = now, time.time()
+                if progress is not None:
+                    progress(hits)
+            if hits >= count:
+                self.inst.write(":STOP")
+                return count
+            if wait_s > 0 and time.time() - moved > wait_s:
+                self.inst.write(":STOP")
+                return hits
+            time.sleep(0.4)
+
     def is_running(self):
         # Bit 3 of the Operation Status Condition register is the Run bit.
         try:
@@ -977,6 +1026,18 @@ class App:
         except ValueError:
             return 10.0
 
+    def averaging_depth(self):
+        """How deep an average the scope is set to build, or None for a plain
+        grab. Asked of the instrument rather than the panel: the panel's copy is
+        whatever was last read, and the front panel may have moved since."""
+        try:
+            if not self.scope.get(":ACQuire:TYPE").upper().startswith("AVER"):
+                return None
+            n = int(float(self.scope.get(":ACQuire:COUNt")))
+            return n if n > 1 else None
+        except Exception:
+            return None
+
     def transfer_points(self):
         """None means take everything in acquisition memory."""
         text = self.trans_pts.get().strip().lower()
@@ -1005,6 +1066,7 @@ class App:
                 base = free_base(base)
 
             existing = self.use_existing.get()
+            avg_want = None if existing else self.averaging_depth()
             armed_at = time.time()
             if existing:
                 # Take what is in acquisition memory now. Put the run state back
@@ -1014,6 +1076,33 @@ class App:
                 self.log("  using the trace already on the scope"
                          + (" (it was running, so it was stopped first)" if resume
                             else " (it was already stopped)"))
+            elif avg_want:
+                # The scope is averaging, and :SINGle would take exactly one
+                # acquisition of the requested depth - the trap report_averaging
+                # warns about after the fact. Accumulate the full average
+                # instead, restarting it so the record is entirely this grab's
+                # waveform and none of whatever played before.
+                resume = True
+                wait_s = self.trigger_wait_s()
+                self.set_phase(f"averaging 0 of {avg_want}")
+                hits = self.scope.accumulate(
+                    avg_want, wait_s=wait_s, cancelled=self.stop_flag.is_set,
+                    progress=lambda k: self.set_phase(
+                        f"averaging {k} of {avg_want}"))
+                if hits is None:
+                    self.log("  cancelled while the average was building - "
+                             "nothing saved")
+                    self.scope.run()
+                    return
+                if hits == 0:
+                    self.log(f"  no trigger within {wait_s:g} s - nothing saved")
+                    self.log("    raise 'Wait for trigger', or set it to 0 to "
+                             "wait indefinitely")
+                    self.scope.run()
+                    return
+                if hits < avg_want:
+                    self.log(f"  ! triggers dried up at {hits} of {avg_want} "
+                             f"averages - saving the shallow trace they left")
             else:
                 resume = True
                 wait_s = self.trigger_wait_s()
