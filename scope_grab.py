@@ -273,75 +273,81 @@ class Scope:
 
     def accumulate(self, count, wait_s=10.0, cancelled=None, progress=None,
                    source=1):
-        """Build a full `count`-deep average, measured on 2026-08-24 hardware.
+        """Acquire a true `count`-deep average, on hardware where nothing else is.
 
-        Three facts about the MSO-X 2014A (firmware 2.65) shape this, all
-        established against the instrument rather than the manual:
+        Established against the MSO-X 2014A (firmware 2.65) on 2026-08-24:
 
-        * :SINGle takes exactly one acquisition, so an averaged single-shot
-          grab carries one hit while claiming the full depth.
-        * :DIGitize does count out the full average - but then refuses every
-          waveform query on the record it just built, RAW or otherwise.
-        * A record stopped out of RUN answers ONLY in the NORMal/MAXimum
-          points modes; ask in RAW and the scope raises +109 "No Data For
-          Operation" and serves nothing, including the hit count.
+        * :SINGle takes exactly one acquisition (an averaged single-shot grab
+          claims the full depth while carrying one hit).
+        * Under plain RUN the averager is a RUNNING average - each sweep folds
+          in with weight 1/N, so the record carries an exponential memory with
+          time constant N trigger periods of whatever played before, and a
+          full-scale change takes ~8 of those time constants to fade from the
+          trace. Nothing resets it: not :CDISplay, not rewriting the count,
+          not a stop/run cycle. Worse, :WAVeform:COUNt reports the SETTING
+          rather than the accumulated depth the moment RUN is involved, so a
+          poll declares a contaminated average complete immediately.
+        * :DIGitize is the one honest acquisition: it starts a fresh block,
+          counts out exactly `count` triggers, stops itself, and afterwards
+          the count reads true. Its record - like any record not stopped by
+          :SINGle - answers only in the NORMal/MAXimum points modes; asking in
+          RAW gets +109 "No Data For Operation" and nothing else.
 
-        So the average is built with plain RUN, in bursts: run, stop, read the
-        hit count while stopped (with a servable points mode set first), and
-        run again until the count is full. Whether RUN after STOP continues the
-        average or restarts it could not be pinned down on the bench - so if a
-        burst makes no headway while triggers are still arriving, the burst
-        doubles, and in the restart world the build completes on the first
-        burst long enough to hold all of it.
+        So: :DIGitize, with nothing in the waveform subsystem queried while it
+        builds (those queries fail, and the device-clear recovery inside
+        try_get can abort the acquisition being asked about). Completion is
+        watched on the run bit and trigger liveness on :TER?, both answerable
+        mid-acquisition. The hit count is read once at the end, in a mode the
+        scope will serve.
 
-        wait_s is a stall limit on the TRIGGER, watched via :TER? while
-        running: it resets on every trigger event, so a deep average is allowed
-        its many periods while a dead trigger is caught within one wait. <= 0
-        never gives up. `progress` is called with the hit count so far.
+        wait_s is a STALL limit on the trigger: it restarts on every trigger
+        event, so a deep average is allowed its many periods while a dead
+        trigger is caught within one wait. <= 0 never gives up. `progress` is
+        called with seconds elapsed; the full build takes count trigger
+        periods (12.8 s for 256 at 20 Hz).
 
         Returns `count` on success, fewer if the triggers dried up, 0 if none
         ever came, None if cancelled. In every case but None the scope holds a
-        stopped record readable in MAXimum mode (see waveform's points_mode).
+        stopped record readable in MAXimum mode (see the worker's read).
         """
-        w = self.inst
-        w.write(f":WAVeform:SOURce CHANnel{source}")
-        w.write(":WAVeform:POINts:MODE NORMal")
-        w.write(":STOP")
-        w.write(":CDISplay")          # a fresh average, not the last waveform's
-        self.inst.query(":TER?")      # clear stale trigger history
-        burst = 1.6
-        hits = 0
-        alive = time.time()
+        self.inst.query("*OPC?")          # settings writes land before arming
+        self.inst.query(":TER?")          # clear the event register of history
+        self.inst.write(":DIGitize")
+        started = time.time()
+        alive = started
+        bad_polls = 0
         while True:
-            w.write(":RUN")
-            t_end = time.time() + burst
-            while time.time() < t_end:
-                if cancelled is not None and cancelled():
-                    w.write(":STOP")
-                    return None
-                time.sleep(0.2)
-                try:
-                    if int(self.inst.query(":TER?")):
-                        alive = time.time()
-                except Exception:
-                    pass
-            w.write(":STOP")
-            time.sleep(0.25)
-            got = self.try_get(WAVE_COUNT, timeout_ms=2000)
+            time.sleep(0.4)
+            if cancelled is not None and cancelled():
+                self.inst.write(":STOP")
+                return None
             try:
-                now = int(float(got))
-            except (TypeError, ValueError):
-                now = 0
-            if now > hits:
-                hits = now
-                if progress is not None:
-                    progress(hits)
-            else:
-                burst = min(burst * 2, 60.0)
-            if hits >= count:
-                return count
+                # Bit 3 of the Operation Status Condition register is Run.
+                running = bool(int(self.inst.query(":OPERegister:CONDition?")) & 8)
+                if running and int(self.inst.query(":TER?")):
+                    alive = time.time()
+                bad_polls = 0
+            except Exception:
+                bad_polls += 1
+                if bad_polls < 3:
+                    continue
+                self.inst.write(":STOP")
+                running = False
+            if not running:
+                break
+            if progress is not None:
+                progress(time.time() - started)
             if wait_s > 0 and time.time() - alive > wait_s:
-                return hits
+                self.inst.write(":STOP")
+                break
+        # The count is honest after a digitize, but only in a servable mode.
+        self.inst.write(f":WAVeform:SOURce CHANnel{source}")
+        self.inst.write(":WAVeform:POINts:MODE NORMal")
+        got = self.try_get(WAVE_COUNT, timeout_ms=2000)
+        try:
+            return min(int(float(got)), count)
+        except (TypeError, ValueError):
+            return 0
 
 
     def is_running(self):
@@ -1118,11 +1124,11 @@ class App:
                 # waveform and none of whatever played before.
                 resume = True
                 wait_s = self.trigger_wait_s()
-                self.set_phase(f"averaging 0 of {avg_want}")
+                self.set_phase(f"building a {avg_want}-deep average")
                 hits = self.scope.accumulate(
                     avg_want, wait_s=wait_s, cancelled=self.stop_flag.is_set,
-                    progress=lambda k: self.set_phase(
-                        f"averaging {k} of {avg_want}"),
+                    progress=lambda sec: self.set_phase(
+                        f"building a {avg_want}-deep average - {sec:.0f} s"),
                     source=chans[0])
                 if hits is None:
                     self.log("  cancelled while the average was building - "
