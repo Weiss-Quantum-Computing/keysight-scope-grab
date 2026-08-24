@@ -19,7 +19,7 @@ import queue
 import threading
 import time
 import tkinter as tk
-from tkinter import filedialog, ttk
+from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
 import pyvisa
@@ -64,14 +64,54 @@ BAD_NAME_CHARS = r'<>:"/\|?*'
 #   num    - free-form number
 #   choice - fixed list, scope answers with the same mnemonics
 #   bool   - fixed list, but the scope answers 1/0
-GLOBAL_SETTINGS = [
+TIMEBASE_SETTINGS = [
     ("Timebase s/div", ":TIMebase:SCALe", "num", None),
     ("Position (s)", ":TIMebase:POSition", "num", None),
-    ("Trigger source", ":TRIGger:EDGE:SOURce", "choice",
-     ("CHAN1", "CHAN2", "CHAN3", "CHAN4", "EXT", "LINE", "WGEN")),
-    ("Trigger level (V)", ":TRIGger:EDGE:LEVel", "num", None),
-    ("Trigger slope", ":TRIGger:EDGE:SLOPe", "choice", ("POS", "NEG", "EITH")),
+    ("Reference", ":TIMebase:REFerence", "choice", ("LEFT", "CENT", "RIGH")),
+    ("Sweep mode", ":TIMebase:MODE", "choice", ("MAIN", "WIND", "XY", "ROLL")),
     ("Acquisition", ":ACQuire:TYPE", "choice", ("NORM", "AVER", "HRES", "PEAK")),
+    ("Averages", ":ACQuire:COUNt", "num", None),
+]
+TRIGGER_SETTINGS = [
+    ("Type", ":TRIGger:MODE", "choice",
+     ("EDGE", "GLIT", "PATT", "TV", "EBUR", "OR", "RUNT", "SHOL", "TRAN", "DEL")),
+    ("Sweep", ":TRIGger:SWEep", "choice", ("AUTO", "NORM")),
+    ("Source", ":TRIGger:EDGE:SOURce", "choice",
+     ("CHAN1", "CHAN2", "CHAN3", "CHAN4", "EXT", "LINE", "WGEN")),
+    ("Level (V)", ":TRIGger:EDGE:LEVel", "num", None),
+    ("Slope", ":TRIGger:EDGE:SLOPe", "choice", ("POS", "NEG", "EITH", "ALT")),
+    ("Reject", ":TRIGger:EDGE:REJect", "choice", ("OFF", "LFR", "HFR")),
+    ("Noise reject", ":TRIGger:NREJect", "bool", ("ON", "OFF")),
+    ("Holdoff (s)", ":TRIGger:HOLDoff", "num", None),
+]
+# Writes that have to land before others in the same Apply. The average count is
+# ignored unless the acquisition type is already AVERage, and the edge fields
+# belong to a trigger type that has to be selected first. Everything else is
+# written afterwards, in panel order.
+WRITE_FIRST = (":ACQuire:TYPE", ":TRIGger:MODE", ":TIMebase:MODE")
+# Fields the instrument only acts on in a particular mode. The panel greys the
+# others out rather than letting a value the scope is ignoring look live.
+# {field: (field that decides it, mnemonics that make it live)}
+DEPENDS_ON = {
+    ":ACQuire:COUNt": (":ACQuire:TYPE", ("AVER",)),
+    ":TRIGger:EDGE:SOURce": (":TRIGger:MODE", ("EDGE",)),
+    ":TRIGger:EDGE:LEVel": (":TRIGger:MODE", ("EDGE",)),
+    ":TRIGger:EDGE:SLOPe": (":TRIGger:MODE", ("EDGE",)),
+    ":TRIGger:EDGE:REJect": (":TRIGger:MODE", ("EDGE",)),
+}
+# One-shot commands: (button, SCPI, what to log, confirmation text or None).
+# They carry no value and there is nothing to read back, so they are not part of
+# the settings snapshot - the panel is re-read afterwards instead.
+ACTIONS = [
+    ("Run", ":RUN", "running continuously", None),
+    ("Stop", ":STOP", "stopped", None),
+    ("Single", ":SINGle", "armed for one trigger", None),
+    ("Force trig", ":TRIGger:FORCe", "trigger forced", None),
+    ("Clear", ":CDISplay",
+     "display cleared - averaging and persistence start over", None),
+    ("Autoscale", ":AUToscale", "autoscaled",
+     "Autoscale rewrites the timebase and every channel's V/div and offset "
+     "from whatever signal it finds, discarding the current setup.\n\nGo ahead?"),
 ]
 # Read-only values, refreshed on the same pass as the settings above. They are
 # per-acquisition results rather than knobs, so the panel shows them but never
@@ -80,12 +120,26 @@ INFO_SETTINGS = [
     ("Sample rate (Sa/s)", ":ACQuire:SRATe"),
     ("Points acquired", ":ACQuire:POINts"),
 ]
+# How many hits are in the trace being read out. In AVERage mode that is the
+# averaging depth the capture actually got, which is not the same thing as the
+# count that was asked for - and nothing on the scope's own screen distinguishes
+# the two. It has no field of its own; it is folded into the grab's snapshot for
+# the metadata file.
+#
+# Not part of a normal settings read: it describes a record rather than a
+# setting, and with acquisition memory empty - straight after an acquisition
+# type change, for one - the scope raises +109,"No Data For Operation" instead
+# of answering, leaving the query unterminated and the read waiting out the VISA
+# timeout. It is only ever asked where a record is known to exist.
+WAVE_COUNT = ":WAVeform:COUNt"
 CHANNEL_SETTINGS = [
     ("V/div", ":CHANnel{ch}:SCALe", "num", None),
     ("Offset", ":CHANnel{ch}:OFFSet", "num", None),
     ("Coupling", ":CHANnel{ch}:COUPling", "choice", ("AC", "DC")),
     ("Probe", ":CHANnel{ch}:PROBe", "num", None),
+    ("Units", ":CHANnel{ch}:UNITs", "choice", ("VOLT", "AMP")),
     ("BW lim", ":CHANnel{ch}:BWLimit", "bool", ("ON", "OFF")),
+    ("Invert", ":CHANnel{ch}:INVert", "bool", ("ON", "OFF")),
     ("Display", ":CHANnel{ch}:DISPlay", "bool", ("ON", "OFF")),
 ]
 
@@ -267,6 +321,31 @@ class Scope:
     def put(self, scpi, value):
         self.inst.write(f"{scpi} {value}")
 
+    def command(self, scpi):
+        """Fire a one-shot command that carries no value and returns nothing."""
+        self.inst.write(scpi)
+
+    def try_get(self, scpi, timeout_ms=2000):
+        """Ask for something the scope may decline to answer, and return None if
+        it does. A refused query is not a reply that says so - the scope pushes
+        an error and sends nothing, so the read waits out the whole timeout.
+        Hence the short one here, a device clear to drop anything that then
+        arrives late, and a drain of the error queue so what it left behind is
+        not reported against the next thing the panel does."""
+        saved = self.inst.timeout
+        self.inst.timeout = timeout_ms
+        try:
+            return self.inst.query(scpi + "?").strip()
+        except Exception:
+            try:
+                self.inst.clear()
+            except Exception:
+                pass
+            self.errors()
+            return None
+        finally:
+            self.inst.timeout = saved
+
     def errors(self):
         """Drain the scope's error queue, so a rejected setting gets reported
         instead of silently ignored."""
@@ -287,6 +366,11 @@ class Scope:
         and the file describes the same instant the panel shows. Values are the
         instrument's own strings, unrounded."""
         s = lambda scpi: settings.get(scpi, "?")
+        # An average count is only in force in AVERage mode, and the scope keeps
+        # reporting the last one whatever the mode - so say when it is idle,
+        # rather than leave a file that reads as averaged when it was not.
+        averaging = s(":ACQuire:TYPE").upper().startswith("AVER")
+        avg_note = "" if averaging else "   (not in use: acquisition type is not AVERage)"
         lines = [
             f"captured           : {datetime.datetime.now().isoformat()}",
             f"instrument         : {self.idn}",
@@ -297,11 +381,22 @@ class Scope:
             f"sample rate (Sa/s) : {s(':ACQuire:SRATe')}",
             f"points acquired    : {s(':ACQuire:POINts')}",
             f"acquisition type   : {s(':ACQuire:TYPE')}",
+            f"averages           : {s(':ACQuire:COUNt')}{avg_note}",
+        ] + ([f"averages taken     : {s(WAVE_COUNT)} of {s(':ACQuire:COUNt')}"
+              f"   (hits actually in the trace that was read out)"]
+             if averaging and WAVE_COUNT in settings else []) + [
             f"timebase s/div     : {s(':TIMebase:SCALe')}",
             f"timebase position  : {s(':TIMebase:POSition')}",
+            f"timebase reference : {s(':TIMebase:REFerence')}",
+            f"timebase mode      : {s(':TIMebase:MODE')}",
+            f"trigger type       : {s(':TRIGger:MODE')}",
+            f"trigger sweep      : {s(':TRIGger:SWEep')}",
             f"trigger source     : {s(':TRIGger:EDGE:SOURce')}",
             f"trigger level      : {s(':TRIGger:EDGE:LEVel')}",
             f"trigger slope      : {s(':TRIGger:EDGE:SLOPe')}",
+            f"trigger reject     : {s(':TRIGger:EDGE:REJect')}",
+            f"trigger noise rej  : {s(':TRIGger:NREJect')}",
+            f"trigger holdoff    : {s(':TRIGger:HOLDoff')}",
         ]
         for ch in channels:
             if names and names.get(ch):
@@ -311,7 +406,9 @@ class Scope:
                 f"CH{ch} offset        : {s(f':CHANnel{ch}:OFFSet')}",
                 f"CH{ch} coupling      : {s(f':CHANnel{ch}:COUPling')}",
                 f"CH{ch} probe atten   : {s(f':CHANnel{ch}:PROBe')}",
+                f"CH{ch} units         : {s(f':CHANnel{ch}:UNITs')}",
                 f"CH{ch} bandwidth lim : {s(f':CHANnel{ch}:BWLimit')}",
+                f"CH{ch} invert        : {s(f':CHANnel{ch}:INVert')}",
             ]
         return "\n".join(lines) + "\n"
 
@@ -349,8 +446,8 @@ class App:
         root.title("Scope Grab - MSO-X 2014A")
         # Tall enough for the screenshot preview, but never taller than the
         # screen - otherwise the log ends up behind the taskbar.
-        win_w = min(1160, root.winfo_screenwidth() - 80)
-        win_h = min(880, root.winfo_screenheight() - 120)
+        win_w = min(1200, root.winfo_screenwidth() - 80)
+        win_h = min(960, root.winfo_screenheight() - 120)
         root.geometry(f"{win_w}x{win_h}+40+20")
 
         pad = dict(padx=8, pady=4)
@@ -421,6 +518,21 @@ class App:
         self.peek_btn = ttk.Button(gf, text="Peek (saves nothing)",
                                    command=self.do_peek, state="disabled")
         self.peek_btn.pack(side="left", padx=(6, 0), ipady=8)
+
+        # The scope's own front-panel buttons, next to the one that captures:
+        # these are things it does once rather than states it holds, so there is
+        # nothing to edit and nothing to apply.
+        cf = ttk.Frame(left)
+        cf.pack(fill="x", padx=8)
+        ttk.Label(cf, text="Scope:").pack(side="left", padx=(0, 4))
+        self.action_btns = []
+        for text, scpi, note, confirm in ACTIONS:
+            btn = ttk.Button(cf, text=text, width=max(6, len(text) + 1),
+                             state="disabled",
+                             command=lambda s=scpi, n=note, k=confirm:
+                             self.do_action(s, n, k))
+            btn.pack(side="left", padx=(0, 4))
+            self.action_btns.append(btn)
 
         ef = ttk.Frame(left)
         ef.pack(fill="x", **pad)
@@ -779,7 +891,7 @@ class App:
     def set_busy(self, busy):
         self.busy = busy
         state = "disabled" if busy or self.seq_active or not self.scope.inst else "normal"
-        for btn in (self.read_btn, self.apply_btn, self.peek_btn):
+        for btn in (self.read_btn, self.apply_btn, self.peek_btn, *self.action_btns):
             btn.configure(state=state)
         # During a one-off grab the GRAB button becomes the way to call off a
         # long trigger wait. A sequence has its own Stop button instead.
@@ -936,6 +1048,13 @@ class App:
             # One settings read per grab: the panel and the metadata file are
             # built from the same snapshot.
             settings = self.read_all_settings()
+            # Asked here rather than in the settings read: the waveform transfer
+            # above has just succeeded, so there is certainly a record for the
+            # scope to describe.
+            hits = self.scope.try_get(WAVE_COUNT)
+            if hits is not None:
+                settings[WAVE_COUNT] = hits
+            self.report_averaging(settings)
             # The screenshot has to be taken before :RUN, while the captured
             # trace is still the one on screen.
             img = self.scope.screenshot() if self.save_png.get() else None
@@ -986,6 +1105,28 @@ class App:
         finally:
             self.root.after(0, self.grab_done)
 
+    def report_averaging(self, settings):
+        """Averaging is the one setting where what was asked for and what the
+        trace actually got can differ without anything on the scope saying so.
+        A capture armed with :SINGle takes one acquisition; the average builds up
+        over successive triggers, so a grab can come back with a fraction of the
+        requested depth and still look like an averaged trace."""
+        if not settings.get(":ACQuire:TYPE", "").upper().startswith("AVER"):
+            return
+        try:
+            got = int(float(settings[WAVE_COUNT]))
+            want = int(float(settings[":ACQuire:COUNt"]))
+        except (KeyError, TypeError, ValueError):
+            self.log("  averaging: the scope would not say how many hits are in "
+                     "this trace")
+            return
+        if got < want:
+            self.log(f"  ! averaging: {got} of {want} hits in this trace")
+            self.log("    the trace is less averaged than the setting says - leave "
+                     "the scope running on more triggers to build the average up")
+        else:
+            self.log(f"  averaging: {got} hits")
+
     # -- settings panel ---------------------------------------------------
 
     def build_settings(self, parent, pad):
@@ -994,25 +1135,25 @@ class App:
         self.set_marks = {}       # scpi root -> "edited" marker label
         self.set_kinds = {}       # scpi root -> num/choice/bool
         self.set_scope = {}       # scpi root -> value the scope last reported
+        self.set_live = {}        # scpi root -> state to restore when re-enabled
         self.read_stamp = ""      # when the panel last matched the instrument
 
         sf = ttk.LabelFrame(parent, text="Scope settings")
         sf.pack(fill="x", **pad)
 
-        g = ttk.Frame(sf)
-        g.pack(fill="x", padx=6, pady=(6, 2))
-        for i, (label, scpi, kind, choices) in enumerate(GLOBAL_SETTINGS):
-            row, col = divmod(i, 2)
-            ttk.Label(g, text=label + ":").grid(row=row, column=col * 2,
-                                                sticky="e", padx=(0, 4), pady=2)
-            self.setting_widget(g, scpi, kind, choices, row, col * 2 + 1, 11)
-
-        for i, (label, scpi) in enumerate(INFO_SETTINGS):
-            row = len(GLOBAL_SETTINGS) // 2 + i // 2
-            col = (i % 2) * 2
-            ttk.Label(g, text=label + ":").grid(row=row, column=col, sticky="e",
-                                                padx=(0, 4), pady=2)
-            self.setting_widget(g, scpi, "info", None, row, col + 1, 11)
+        # Timebase and trigger side by side, one setting per row: the two groups
+        # are the same height, and each label sits next to the value it names
+        # rather than sharing a row with an unrelated one.
+        cols = ttk.Frame(sf)
+        cols.pack(fill="x", padx=6, pady=(2, 2))
+        tbf = ttk.LabelFrame(cols, text="Timebase / acquisition")
+        tbf.pack(side="left", fill="both", expand=True)
+        self.setting_rows(tbf, TIMEBASE_SETTINGS
+                          + [(lbl, scpi, "info", None) for lbl, scpi in INFO_SETTINGS],
+                          11)
+        tgf = ttk.LabelFrame(cols, text="Trigger")
+        tgf.pack(side="left", fill="both", expand=True, padx=(6, 0))
+        self.setting_rows(tgf, TRIGGER_SETTINGS, 11)
 
         c = ttk.Frame(sf)
         c.pack(fill="x", padx=6, pady=(6, 2))
@@ -1024,7 +1165,7 @@ class App:
                 self.setting_widget(c, tmpl.format(ch=ch), kind, choices, i + 1, j + 1, 8)
 
         bar = ttk.Frame(sf)
-        bar.pack(fill="x", padx=6, pady=(2, 6))
+        bar.pack(fill="x", padx=6, pady=(2, 2))
         self.read_btn = ttk.Button(bar, text="Read from scope",
                                    command=self.do_read_settings, state="disabled")
         self.read_btn.pack(side="left")
@@ -1034,12 +1175,19 @@ class App:
         self.set_status = ttk.Label(bar, text="not read yet", foreground="#666")
         self.set_status.pack(side="left", padx=6)
 
-    def setting_widget(self, parent, scpi, kind, choices, row, col, width):
+    def setting_rows(self, parent, items, width):
+        """Lay a group out as label/value pairs, one per row."""
+        for row, (label, scpi, kind, choices) in enumerate(items):
+            ttk.Label(parent, text=label + ":").grid(row=row, column=0, sticky="e",
+                                                     padx=(6, 4))
+            self.setting_widget(parent, scpi, kind, choices, row, 1, width, pady=0)
+
+    def setting_widget(self, parent, scpi, kind, choices, row, col, width, pady=1):
         cell = ttk.Frame(parent)
         # A checkbox is much narrower than its column heading, so give those
         # cells more room or the headings collide.
         cell.grid(row=row, column=col, sticky="w",
-                  padx=(10 if kind == "bool" else 2), pady=1)
+                  padx=(10 if kind == "bool" else 2), pady=pady)
         var = tk.StringVar()
         if kind == "info":
             # read-only: no entry to edit, no edited-marker, never written back
@@ -1059,15 +1207,36 @@ class App:
             mark = ttk.Label(cell, text=" ", width=1, foreground="#c60")
             mark.pack(side="left")
             self.set_marks[scpi] = mark
-            var.trace_add("write", lambda *_: self.refresh_marks())
+            var.trace_add("write", lambda *_: self.setting_changed())
         self.set_vars[scpi] = var
         self.set_widgets[scpi] = w
         self.set_kinds[scpi] = kind
         self.set_scope[scpi] = ""
+        # A combobox has to go back to "readonly", not "normal", or re-enabling
+        # it would leave its text typeable.
+        self.set_live[scpi] = "readonly" if kind == "choice" else "normal"
 
     def edited(self, scpi):
         """True if the panel value differs from what the scope last reported."""
         return self.set_vars[scpi].get().strip() != self.set_scope[scpi]
+
+    def setting_changed(self):
+        """Any field changing can move the edited count and, if it is a mode,
+        change which other fields the scope is currently paying attention to."""
+        self.refresh_marks()
+        self.refresh_enabled()
+
+    def refresh_enabled(self):
+        """Grey out the fields whose mode is not selected. The scope keeps
+        answering with a stale value for those - an average count from the last
+        time averaging was on, an edge level under a pulse-width trigger - and
+        greying them is what says the number on show is not in force."""
+        for scpi, (owner, live_for) in DEPENDS_ON.items():
+            if scpi not in self.set_widgets or owner not in self.set_vars:
+                continue
+            live = self.set_vars[owner].get().strip().upper().startswith(live_for)
+            self.set_widgets[scpi].configure(
+                state=self.set_live[scpi] if live else "disabled")
 
     def refresh_marks(self):
         pending = 0
@@ -1093,6 +1262,8 @@ class App:
         after an Apply, when the scope is the authority on what took effect."""
         kept = 0
         for scpi, raw in values.items():
+            if scpi not in self.set_kinds:      # read for the metadata, not shown
+                continue
             value = fmt_setting(self.set_kinds[scpi], raw)
             was_edited = self.edited(scpi)
             self.set_scope[scpi] = value
@@ -1103,7 +1274,7 @@ class App:
         self.read_stamp = datetime.datetime.now().strftime("%H:%M:%S")
         if kept:
             self.log(f"  (panel: kept {kept} unapplied edit(s), scope value differs)")
-        self.refresh_marks()
+        self.setting_changed()
 
     def read_all_settings(self):
         """Instrument thread only. Returns the scope's own replies, unrounded, as
@@ -1137,7 +1308,13 @@ class App:
     def _settings_worker(self, changes):
         try:
             if changes:
-                for scpi, value in changes.items():
+                # A mode has to be in place before the fields it governs, or the
+                # scope takes the write and quietly does nothing with it. Sorting
+                # is stable, so everything else keeps panel order.
+                ordered = sorted(changes.items(),
+                                 key=lambda kv: WRITE_FIRST.index(kv[0])
+                                 if kv[0] in WRITE_FIRST else len(WRITE_FIRST))
+                for scpi, value in ordered:
                     if self.set_kinds[scpi] == "num":
                         try:
                             value = f"{float(value):g}"
@@ -1166,6 +1343,40 @@ class App:
             self.log(f"ERROR: {exc}")
         finally:
             # Settings I/O must not advance a sequence - only a grab does that.
+            self.root.after(0, lambda: self.set_busy(False))
+
+    def do_action(self, scpi, note, confirm=None):
+        """Run one of the scope's own buttons - run/stop/single, force trigger,
+        clear display, autoscale."""
+        if self.busy or not self.scope.inst:
+            return
+        if confirm and not messagebox.askyesno("Scope Grab", confirm, parent=self.root):
+            self.log(f"  {scpi} cancelled")
+            return
+        self.set_busy(True)
+        threading.Thread(target=self._action_worker, args=(scpi, note),
+                         daemon=True).start()
+
+    def _action_worker(self, scpi, note):
+        try:
+            self.scope.command(scpi)
+            self.log(f"{scpi} - {note}")
+            for err in self.scope.errors():
+                self.log(f"  scope rejected it: {err}")
+            values = self.read_all_settings()
+            # Autoscale is the one that rewrites the settings, so it is the one
+            # allowed to overwrite pending edits in the panel; the rest leave an
+            # unapplied edit where it is.
+            overwrite = scpi == ":AUToscale"
+            self.root.after(0, lambda v=values: self.show_settings(v, overwrite=overwrite))
+            # Same as after an Apply: show what it did, without saving anything.
+            time.sleep(0.4)
+            img = self.scope.screenshot()
+            self.root.after(0, lambda d=bytes(img): self.show_peek(d))
+        except Exception as exc:
+            self.log(f"ERROR: {exc}")
+        finally:
+            # Like settings I/O, this is not a run and must not advance a sequence.
             self.root.after(0, lambda: self.set_busy(False))
 
     # -- numbered sequence -------------------------------------------------

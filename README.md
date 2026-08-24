@@ -10,7 +10,7 @@ Press GRAB (or the space bar) and you get, in your chosen folder:
 |------|----------|
 | `<prefix>_<timestamp>.csv` | Waveform samples: `time_s` plus one column per selected channel, headed `CH<n>_V`, or `CH<n>_<name>_V` for a channel you have named |
 | `<prefix>_<timestamp>.png` | Screenshot of the scope display |
-| `<prefix>_<timestamp>.txt` | Acquisition metadata: sample rate, timebase, trigger and per-channel settings |
+| `<prefix>_<timestamp>.txt` | Acquisition metadata: sample rate, timebase, acquisition and trigger settings, and per-channel settings |
 
 The panel shows the screenshots inline and you can scroll back through them while
 a run is still going - see [Watching a run come in](#watching-a-run-come-in).
@@ -43,6 +43,8 @@ Keysight/Agilent USB instrument it finds; hit **Connect** to retry.
   acquisition.
 - **Peek (saves nothing)** - pull the scope's screen into the window and write no
   files at all, for adjusting things without accumulating data. See below.
+- **Scope:** - the instrument's own buttons: run, stop, single, force trigger, clear
+  display, autoscale. See [Scope control](#scope-control).
 - **take the trace already on the scope** - save what the scope has already
   captured instead of arming a new acquisition, see below.
 - **Wait for trigger** - how long a capture stays armed. `0` waits indefinitely,
@@ -235,23 +237,42 @@ about 6 GB.
 
 ## Scope settings
 
-The **Scope settings** panel mirrors the instrument: timebase, trigger and
-acquisition mode, plus V/div, offset, coupling, probe attenuation, bandwidth limit
-and display state for each channel.
+The **Scope settings** panel mirrors the instrument, in three blocks:
 
-Sample rate and points acquired sit alongside them, read-only - they are results
-of an acquisition rather than knobs.
+**Timebase / acquisition** - s/div, horizontal position, reference (left / centre /
+right), sweep mode (main, zoom window, XY, roll), acquisition type (normal, averaging,
+high-resolution, peak-detect) and the average count. Sample rate and points acquired
+sit underneath, read-only - they are results of an acquisition rather than knobs.
+
+**Trigger** - trigger type (edge, glitch, pattern, TV, ...), sweep (auto / normal),
+and for the edge trigger: source, level, slope, HF/LF reject, noise reject and
+holdoff.
+
+**Per channel** - V/div, offset, coupling, probe attenuation, units (volts or amps),
+bandwidth limit, invert and display state, for all four channels.
 
 It reads from the scope when it connects, on **Read from scope**, and
 automatically after every grab - so settings changed with the scope's own knobs
 show up without asking.
 
-Bandwidth limit and display are checkboxes; the rest are text boxes and drop-downs.
+Bandwidth limit, invert, display and noise reject are checkboxes; the rest are text
+boxes and drop-downs.
 
 To change a setting from the window, edit the field and press **Apply changes**:
 
 - Only edited fields are written. A `*` next to a field marks it as edited but not
   yet applied, and the status line counts them.
+- Fields the scope is currently ignoring are greyed out: the average count unless the
+  acquisition type is averaging, and the edge-trigger fields unless the trigger type
+  is edge. The scope keeps answering those queries with a stale value - an average
+  count left over from the last time averaging was on, an edge level under a
+  pulse-width trigger - and greying them is what says the number on show is not in
+  force. Change the mode in its drop-down and the fields it governs come alive at
+  once, before anything is applied.
+- Writes are ordered so a mode lands before the fields it governs. Switching to
+  averaging and setting the count in the same Apply works, because `:ACQuire:TYPE`
+  is written before `:ACQuire:COUNt` - the other way round the scope takes the count
+  and quietly does nothing with it.
 - A pull never discards an edit you have not applied yet. If a value changes on the
   scope while you have a pending edit for the same field, your edit stays in the
   box and the log notes that the scope disagrees.
@@ -268,6 +289,69 @@ To change a setting from the window, edit the field and press **Apply changes**:
 
 Settings traffic and captures share one VISA session, so they are serialised: the
 buttons grey out while a grab is running and vice versa.
+
+## Averaging
+
+Set **Acquisition** to `AVER` and put the depth in **Averages** - the scope rounds it
+to a power of two between 2 and 65536, and the panel shows you what it settled on.
+
+Averaging needs successive triggers to build up, and a grab arms a *single*
+acquisition, so a trace can come back with less averaging than the setting asks for.
+Nothing on the scope's own screen distinguishes the two, so every averaged grab is
+checked and reported:
+
+```
+  ! averaging: 3 of 8 hits in this trace
+    the trace is less averaged than the setting says - leave the scope running on
+    more triggers to build the average up
+```
+
+The depth is read straight after the waveform transfer, where the scope certainly
+has a record to describe. Asked at any other moment - with acquisition memory empty
+after a mode change, say - it answers `+109,"No Data For Operation"` and sends
+nothing at all, so the query is made with a short timeout and the line is simply left
+out if the scope will not answer it.
+
+The `.txt` file records both numbers - the count that was asked for and the hits the
+trace actually got - so a saved capture always says how deeply it was averaged:
+
+```
+acquisition type   : AVER
+averages           : 8
+averages taken     : 8 of 8   (hits actually in the trace that was read out)
+```
+
+Out of averaging mode the file says so, rather than leaving a count that reads as
+though it applied:
+
+```
+acquisition type   : NORM
+averages           : 8   (not in use: acquisition type is not AVERage)
+```
+
+To capture a fully averaged trace, let the scope free-run on the signal - **Run**,
+wait for the average to settle, **Stop** - and then grab with **take the trace
+already on the scope** ticked.
+
+## Scope control
+
+The row of buttons under GRAB drives the instrument directly. They are things the
+scope does once rather than states it holds, so there is nothing to edit and nothing
+to apply - each fires immediately, then the panel re-reads and the screen is pulled
+into the preview so you can see what it did.
+
+| Button | Does |
+|--------|------|
+| **Run** | Free-run on triggers, as the front-panel Run/Stop key |
+| **Stop** | Stop acquiring, leaving what is in memory |
+| **Single** | Arm one acquisition and wait - the same arming a grab does, without saving anything |
+| **Force trig** | Trigger now, whether or not the condition was met - the way to get a trace out of a signal that never crosses the level |
+| **Clear** | Clear the display, restarting averaging and persistence from zero |
+| **Autoscale** | Let the scope find the signal and set the timebase and every channel's V/div and offset itself. This throws the current setup away, so it asks first |
+
+Autoscale is the only one that rewrites settings, so it is the only one allowed to
+overwrite an edit you have typed but not applied; the rest leave the panel's pending
+edits where they are.
 
 ## The log
 
@@ -311,7 +395,9 @@ starting.
 ## Notes on acquisition
 
 Capture uses `:SINGle` rather than `:DIGitize`, so the trace stays on the scope display
-and the screenshot matches the CSV data. If no trigger arrives within 10 s the scope is
+and the screenshot matches the CSV data. One consequence is that an averaged capture
+gets one acquisition rather than a full set of averages - see
+[Averaging](#averaging), which reports the depth each trace actually got. If no trigger arrives within 10 s the scope is
 stopped and whatever is in acquisition memory is read out, with a note in the log.
 Waveforms are transferred as unsigned bytes in `RAW` points mode and scaled to volts
 using the preamble.
