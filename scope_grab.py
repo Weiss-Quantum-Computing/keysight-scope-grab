@@ -271,54 +271,78 @@ class Scope:
         self.inst.write(":STOP")
         return False
 
-    def accumulate(self, count, wait_s=10.0, cancelled=None, progress=None):
-        """Run until the averager has folded `count` acquisitions into the record.
+    def accumulate(self, count, wait_s=10.0, cancelled=None, progress=None,
+                   source=1):
+        """Build a full `count`-deep average, measured on 2026-08-24 hardware.
 
-        An average builds over successive triggers while the scope is running;
-        :SINGle takes exactly one, which is how a grab can come back claiming 256
-        averages while carrying one (see report_averaging). So an averaged grab
-        sets the scope running, clears the display so the count restarts from
-        zero rather than continuing an average of whatever was playing before,
-        polls the hit count in the building record, and stops only once the
-        average is full.
+        Three facts about the MSO-X 2014A (firmware 2.65) shape this, all
+        established against the instrument rather than the manual:
 
-        wait_s here is a STALL limit, not a total: it restarts every time the
-        count advances, so a deep average is allowed its many trigger periods
-        while a dead trigger is still caught within one wait. <= 0 never gives
-        up. `progress` is called with the running hit count as it climbs.
+        * :SINGle takes exactly one acquisition, so an averaged single-shot
+          grab carries one hit while claiming the full depth.
+        * :DIGitize does count out the full average - but then refuses every
+          waveform query on the record it just built, RAW or otherwise.
+        * A record stopped out of RUN answers ONLY in the NORMal/MAXimum
+          points modes; ask in RAW and the scope raises +109 "No Data For
+          Operation" and serves nothing, including the hit count.
 
-        Returns the number of hits in the stopped record: `count` on success,
-        fewer if the triggers dried up mid-build, 0 if none ever came, or None
-        if cancelled. In every case but None the scope holds a stopped, valid
-        (if shallow) record.
+        So the average is built with plain RUN, in bursts: run, stop, read the
+        hit count while stopped (with a servable points mode set first), and
+        run again until the count is full. Whether RUN after STOP continues the
+        average or restarts it could not be pinned down on the bench - so if a
+        burst makes no headway while triggers are still arriving, the burst
+        doubles, and in the restart world the build completes on the first
+        burst long enough to hold all of it.
+
+        wait_s is a stall limit on the TRIGGER, watched via :TER? while
+        running: it resets on every trigger event, so a deep average is allowed
+        its many periods while a dead trigger is caught within one wait. <= 0
+        never gives up. `progress` is called with the hit count so far.
+
+        Returns `count` on success, fewer if the triggers dried up, 0 if none
+        ever came, None if cancelled. In every case but None the scope holds a
+        stopped record readable in MAXimum mode (see waveform's points_mode).
         """
-        self.inst.write(":RUN")
-        # Restart the average. Without this the record still holds the previous
-        # waveform's average at full count, and a poll would declare it complete
-        # before a single new trigger had landed.
-        self.inst.write(":CDISplay")
+        w = self.inst
+        w.write(f":WAVeform:SOURce CHANnel{source}")
+        w.write(":WAVeform:POINts:MODE NORMal")
+        w.write(":STOP")
+        w.write(":CDISplay")          # a fresh average, not the last waveform's
+        self.inst.query(":TER?")      # clear stale trigger history
+        burst = 1.6
         hits = 0
-        moved = time.time()
+        alive = time.time()
         while True:
-            if cancelled is not None and cancelled():
-                self.inst.write(":STOP")
-                return None
-            got = self.try_get(WAVE_COUNT, timeout_ms=1000)
+            w.write(":RUN")
+            t_end = time.time() + burst
+            while time.time() < t_end:
+                if cancelled is not None and cancelled():
+                    w.write(":STOP")
+                    return None
+                time.sleep(0.2)
+                try:
+                    if int(self.inst.query(":TER?")):
+                        alive = time.time()
+                except Exception:
+                    pass
+            w.write(":STOP")
+            time.sleep(0.25)
+            got = self.try_get(WAVE_COUNT, timeout_ms=2000)
             try:
                 now = int(float(got))
             except (TypeError, ValueError):
-                now = hits    # +109 before the first trigger lands, most likely
+                now = 0
             if now > hits:
-                hits, moved = now, time.time()
+                hits = now
                 if progress is not None:
                     progress(hits)
+            else:
+                burst = min(burst * 2, 60.0)
             if hits >= count:
-                self.inst.write(":STOP")
                 return count
-            if wait_s > 0 and time.time() - moved > wait_s:
-                self.inst.write(":STOP")
+            if wait_s > 0 and time.time() - alive > wait_s:
                 return hits
-            time.sleep(0.4)
+
 
     def is_running(self):
         # Bit 3 of the Operation Status Condition register is the Run bit.
@@ -345,14 +369,21 @@ class Scope:
         # it actually gave, so the time axis stays right either way.
         if points:
             w.write(f":WAVeform:POINts {points}")
-        w.write(":WAVeform:FORMat BYTE")
+        # WORD, not BYTE. An averaged or high-res record holds finer values
+        # than the 8-bit codes on screen - measured on this scope, a 256-deep
+        # average reads back in 157 uV steps against the 40 mV display code, a
+        # full 16x of real resolution that BYTE readback silently rounds off.
+        # For NORM and PEAK the extra byte carries nothing and costs only
+        # transfer time, so one format serves every mode.
+        w.write(":WAVeform:FORMat WORD")
+        w.write(":WAVeform:BYTeorder LSBFirst")
         w.write(":WAVeform:UNSigned ON")
 
         pre = w.query(":WAVeform:PREamble?").strip().split(",")
         xinc, xorig, xref = float(pre[4]), float(pre[5]), float(pre[6])
         yinc, yorig, yref = float(pre[7]), float(pre[8]), float(pre[9])
 
-        raw = w.query_binary_values(":WAVeform:DATA?", datatype="B",
+        raw = w.query_binary_values(":WAVeform:DATA?", datatype="H",
                                     container=np.array)
         t = (np.arange(len(raw)) - xref) * xinc + xorig
         v = (raw.astype(np.float64) - yref) * yinc + yorig
@@ -1066,7 +1097,10 @@ class App:
                 base = free_base(base)
 
             existing = self.use_existing.get()
-            avg_want = None if existing else self.averaging_depth()
+            # Asked even for a use-existing grab: the read further down needs to
+            # know whether it is looking at an averaged record, because those
+            # only answer in the NORMal/MAXimum points modes.
+            avg_want = self.averaging_depth()
             armed_at = time.time()
             if existing:
                 # Take what is in acquisition memory now. Put the run state back
@@ -1088,7 +1122,8 @@ class App:
                 hits = self.scope.accumulate(
                     avg_want, wait_s=wait_s, cancelled=self.stop_flag.is_set,
                     progress=lambda k: self.set_phase(
-                        f"averaging {k} of {avg_want}"))
+                        f"averaging {k} of {avg_want}"),
+                    source=chans[0])
                 if hits is None:
                     self.log("  cancelled while the average was building - "
                              "nothing saved")
@@ -1127,9 +1162,20 @@ class App:
             read_at = time.time()
             points = self.transfer_points()
             names = {ch: self.ch_names[ch].get().strip() for ch in chans}
+            # A record stopped out of RUN - which is what an averaged build
+            # leaves - only answers in the NORMal/MAXimum points modes; RAW gets
+            # +109 "No Data For Operation". MAXimum serves everything there is
+            # (7680 points on this scope), and behaves as RAW on a record that
+            # a :SINGle left behind.
+            mode = "MAXimum" if avg_want else "RAW"
+            if avg_want:
+                # The whole averaged record is 7680 points on this scope;
+                # asking for more raises -222 "Data out of range" and a
+                # transfer-points limit is beside the point at that size.
+                points = None
             cols = {}
             for ch in chans:
-                t, v = self.scope.waveform(ch, points=points)
+                t, v = self.scope.waveform(ch, points_mode=mode, points=points)
                 if "time_s" not in cols:
                     cols["time_s"] = t
                 cols[self.column_name(ch)] = v
