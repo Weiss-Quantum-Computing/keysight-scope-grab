@@ -204,9 +204,17 @@ inside each `.txt`, which also gains a `sequence label` line.
   begins immediately and the log says so - which is how you find out the interval
   is too short to honour.
 - **Existing files are never overwritten.** If the first label is already on disk
-  the sequence advances to the first free one and notes it in the log. When a
-  sequence ends, **First label** moves past the end, so pressing Start again
-  continues the series rather than colliding with it.
+  the sequence advances to the first free one and notes it in the log. That is
+  what stacks one sequence on the next: leave **First label** at 1, run ten, press
+  Start again, and the second batch lands on 011-020.
+- **First label stays where you put it.** It is an instruction, not a counter, and
+  nothing moves it - not the end of a sequence, not Stop, not a run called off
+  before it saved. It used to wind on to the next free number, which meant the box
+  said one thing before a sequence and another after, and re-running the same
+  labels needed it set back by hand every time. Set it yourself when you want the
+  series to start somewhere else. The preview line under the button is what tells
+  you where the next run will actually land, and it says `(from 001 up already
+  exist)` when the label you asked for is taken.
 - **Stop** ends a sequence early. A run already under way finishes and is saved,
   and is included in the count.
 - Auto-grab is switched off when a sequence starts, since only one repeating
@@ -287,8 +295,60 @@ To change a setting from the window, edit the field and press **Apply changes**:
   behind - peek again to catch up. **Read from scope** does not peek, and neither
   does an Apply with nothing edited.
 
+### Putting the panel back onto the scope
+
+**Apply changes** only writes fields edited *in this window*, which is the wrong
+rule in one common case: you reach over and turn a knob on the scope itself. The
+panel still holds the setting you want, and still believes the scope has it, so
+nothing is marked and Apply refuses with `No setting changes to apply`. Getting
+back used to mean pressing **Read from scope** - which overwrites the panel with
+exactly the state you are trying to leave - then re-typing the old value from
+memory and applying it.
+
+**Send all** writes every field the panel is asserting, whether or not it thinks
+the scope already agrees. It is the button for *put it back the way I had it*.
+
+- Blank fields are skipped, so it does nothing before the first read.
+- Greyed-out fields are skipped too: their displayed value is a stale reply the
+  scope is not acting on, and writing it would assert it as a real choice.
+  Liveness is judged from the panel's own modes, not the scope's, so selecting
+  `AVER` and sending puts the count down with it.
+- Ordering, read-back, error draining and the peek afterwards are the same as
+  Apply - it is the same write path, given a bigger list.
+
+Nothing about **Apply changes** changed; it is still the right button when you
+know what you edited.
+
+### Saving and loading a setup
+
+**Save setup...** and **Load setup...** keep named configurations, the way the
+[BK4063B AWG GUI](https://github.com/Weiss-Quantum-Computing/BK4063B-AWG-GUI)
+does. Files go to `Desktop/scope_setups` as `<prefix>_<timestamp>.json` with a
+readable `.txt` beside it - the `.json` is what loads back, the `.txt` is what
+goes in the notebook.
+
+Saved is **the panel**, not the instrument. That means it works with nothing
+connected, and what you can see is what you get. If a field is an edit you have
+not applied, the file records it as one under `unapplied_edits` and the `.txt`
+says so at the top - a setup never claims to be a reading it isn't. Fields the
+scope is currently ignoring are saved anyway, because a setup that switches to
+averaging has to carry the count that goes with it.
+
+Loading never writes to the scope on its own. The values land in the panel
+first, marked `*` against whatever the scope last reported, so you can see what
+is about to change - and then it asks whether to send them. Say no and **Send
+all** does it whenever you are ready; with nothing connected it just says so.
+
+The capture-side fields travel with the setup as well: prefix, which channels
+are ticked, their names, trigger wait and transfer points. The **output folder
+does not**. That belongs to where you are working now rather than to the setup
+being recalled, and a setup from another experiment quietly redirecting where
+captures land is the one surprise here that costs you a file.
+
 Settings traffic and captures share one VISA session, so they are serialised: the
-buttons grey out while a grab is running and vice versa.
+buttons grey out while a grab is running and vice versa. **Save setup...** and
+**Load setup...** are the exception to the greying: they only touch the panel, so
+they stay live with the scope unplugged.
 
 ## Averaging
 
@@ -391,6 +451,14 @@ Delete the file to go back to defaults. A missing, truncated or malformed file i
 ignored - each value falls back to its default independently, and the log notes
 when a file could not be read, so a bad config can never stop the app from
 starting.
+
+This is not the same thing as a saved setup. This file is one implicit
+last-session state, rewritten under you and never named; a setup is a file you
+asked for, holds the scope settings as well, and is only ever read back when you
+pick it. The capture-side fields they have in common are stored under the same
+keys and restored by the same code, so a setup recalls them the way a new
+session does - except for the output folder, which a setup deliberately leaves
+alone.
 
 ## Notes on acquisition
 

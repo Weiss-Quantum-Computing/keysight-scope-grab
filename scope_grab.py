@@ -34,6 +34,10 @@ KTVISA = r"C:\Windows\System32\ktvisa32.dll"
 # Kept out of the program folder so a git pull cannot clobber it.
 CONFIG_PATH = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"),
                            "ScopeGrab", "config.json")
+# Named setups, saved and loaded by hand - the counterpart of the AWG GUI's
+# awg_setups folder, and on the Desktop for the same reason: a setup is a lab
+# record, so it lives where the data does rather than inside the program folder.
+SETUP_DIR = os.path.join(os.path.expanduser("~"), "Desktop", "scope_setups")
 NOT_MEASURED = 9.9e37
 
 # CSV number formats. Samples arrive as 8-bit codes - 256 levels - so six
@@ -181,6 +185,60 @@ def fmt_setting(kind, raw):
 # ---------------------------------------------------------------------------
 # Instrument layer
 # ---------------------------------------------------------------------------
+
+def setting_groups():
+    """(group title, [(label, scpi root)]) in panel order. What a saved setup's
+    .txt companion is laid out from."""
+    groups = [("Timebase / acquisition",
+               [(lbl, scpi) for lbl, scpi, _, _ in TIMEBASE_SETTINGS]),
+              ("Trigger",
+               [(lbl, scpi) for lbl, scpi, _, _ in TRIGGER_SETTINGS])]
+    for ch in (1, 2, 3, 4):
+        groups.append((f"CH{ch}", [(lbl, tmpl.format(ch=ch))
+                                   for lbl, tmpl, _, _ in CHANNEL_SETTINGS]))
+    return groups
+
+
+def describe_setup(cfg):
+    """The .txt written beside a saved setup: the same numbers, laid out to be
+    read in a lab notebook rather than parsed. The .json is the one that gets
+    loaded back."""
+    lines = [f"Scope Grab setup - saved {cfg.get('saved', '?')}"]
+    if cfg.get("instrument"):
+        lines.append(f"Instrument: {cfg['instrument']}")
+    if cfg.get("read_stamp"):
+        lines.append(f"Panel last read from the scope at {cfg['read_stamp']}")
+    else:
+        lines.append("Panel had never been read from a scope when this was saved")
+    pending = cfg.get("unapplied_edits") or []
+    if pending:
+        lines.append("")
+        lines.append(f"{len(pending)} field(s) were unapplied edits at save time, so "
+                     "this file records what")
+        lines.append("was on screen, not what the scope had:")
+        lines += [f"    {scpi}" for scpi in pending]
+    settings = cfg.get("settings") or {}
+    for title, items in setting_groups():
+        rows = [(lbl, settings[scpi]) for lbl, scpi in items if scpi in settings]
+        if not rows:
+            continue
+        width = max(len(lbl) for lbl, _ in rows)
+        lines.append("")
+        lines.append(title)
+        lines += [f"  {lbl:<{width}}  {val}" for lbl, val in rows]
+    grab = cfg.get("grab") or {}
+    if grab:
+        lines += ["", "Capture settings"]
+        lines.append(f"  Prefix            {grab.get('prefix', '')}")
+        lines.append(f"  Trigger wait (s)  {grab.get('trigger_wait', '')}")
+        lines.append(f"  Transfer points   {grab.get('transfer_points', '')}")
+        names = grab.get("channel_names") or {}
+        ticked = grab.get("channels") or {}
+        for ch in ("1", "2", "3", "4"):
+            lines.append(f"  CH{ch} {'on ' if ticked.get(ch) else 'off'}"
+                         f"  {names.get(ch, '')}".rstrip())
+    return "\n".join(lines) + "\n"
+
 
 class Scope:
     def __init__(self):
@@ -786,7 +844,26 @@ class App:
             self.log(f"Ignoring unreadable {CONFIG_PATH}: {exc}")
             return
 
-        for key, var in (("outdir", self.outdir), ("prefix", self.prefix),
+        outdir = cfg.get("outdir")
+        if isinstance(outdir, str) and outdir.strip():
+            self.outdir.set(outdir)
+        self.load_grab_prefs(cfg)
+
+        self.saved_cfg = self.current_cfg()
+        self.log(f"Restored last session from {CONFIG_PATH}")
+        if not os.path.isdir(self.outdir.get()):
+            self.log(f"  (that folder does not exist yet: {self.outdir.get()})")
+
+    def load_grab_prefs(self, cfg):
+        """The capture-side fields, restored from either the session config or a
+        saved setup - the two hold them under the same keys. Anything missing or
+        of the wrong type leaves what is already there.
+
+        The output folder is deliberately not one of these. It belongs to where
+        you are working now, not to the setup being recalled, and a setup from
+        another experiment silently redirecting where captures land is the one
+        surprise here that costs you a file."""
+        for key, var in (("prefix", self.prefix),
                          ("trigger_wait", self.trig_wait),
                          ("transfer_points", self.trans_pts)):
             value = cfg.get(key)
@@ -805,10 +882,112 @@ class App:
                 if isinstance(value, (bool, int)):
                     var.set(bool(value))
 
-        self.saved_cfg = self.current_cfg()
-        self.log(f"Restored last session from {CONFIG_PATH}")
-        if not os.path.isdir(self.outdir.get()):
-            self.log(f"  (that folder does not exist yet: {self.outdir.get()})")
+    def do_save_setup(self):
+        """Write the panel's settings to a named file.
+
+        The panel, not the instrument: it works with nothing connected, and what
+        you can see is what gets saved. That includes an edit not applied yet -
+        which is recorded as such rather than quietly swapped for the scope's
+        own value, so a setup never claims to be a reading it isn't."""
+        if self.busy:
+            return
+        pending = sorted(scpi for scpi in self.set_marks if self.edited(scpi))
+        settings = {scpi: var.get().strip() for scpi, var in self.set_vars.items()
+                    if self.set_kinds[scpi] != "info" and var.get().strip()}
+        if not settings:
+            self.log("Nothing to save - read from the scope first, or fill the "
+                     "panel in by hand.")
+            return
+        # Greyed-out fields are saved even though Send all will not write them:
+        # a setup that switches acquisition to AVERage has to carry the count
+        # that goes with it, and which fields are live is decided on load by the
+        # modes in the same file.
+        cfg = {
+            "app": "scope-grab",
+            "version": 1,
+            "saved": datetime.datetime.now().isoformat(timespec="seconds"),
+            "instrument": self.scope.idn,
+            "read_stamp": self.read_stamp,
+            "unapplied_edits": pending,
+            "settings": settings,
+            "grab": {
+                "prefix": self.prefix.get(),
+                "channels": {str(ch): var.get() for ch, var in self.ch_vars.items()},
+                "channel_names": {str(ch): var.get()
+                                  for ch, var in self.ch_names.items()},
+                "trigger_wait": self.trig_wait.get(),
+                "transfer_points": self.trans_pts.get(),
+            },
+        }
+        try:
+            os.makedirs(SETUP_DIR, exist_ok=True)
+            stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            base = os.path.join(SETUP_DIR, f"{self.safe_prefix()}_{stamp}")
+            with open(base + ".json", "w", encoding="utf-8") as fh:
+                json.dump(cfg, fh, indent=2)
+            with open(base + ".txt", "w", encoding="utf-8") as fh:
+                fh.write(describe_setup(cfg))
+        except Exception as exc:
+            self.log(f"ERROR saving setup: {exc}")
+            return
+        self.log(f"Saved setup: {base}.json (+ .txt)")
+        if pending:
+            self.log(f"  ({len(pending)} field(s) saved as shown here, which is not "
+                     "what the scope currently has)")
+
+    def do_load_setup(self):
+        """Fill the panel from a saved file.
+
+        Loading never writes to the instrument by itself. The values land in the
+        panel first, marked as edits against whatever the scope last reported,
+        so you can see what is about to change - and then it offers to send
+        them. Answer no and Send all does it whenever you are ready."""
+        if self.busy:
+            return
+        path = filedialog.askopenfilename(
+            title="Load setup",
+            initialdir=SETUP_DIR if os.path.isdir(SETUP_DIR) else ".",
+            filetypes=[("Setup files", "*.json"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, encoding="utf-8") as fh:
+                cfg = json.load(fh)
+            settings = cfg["settings"]
+            if not isinstance(settings, dict):
+                raise ValueError("'settings' is not a JSON object")
+        except Exception as exc:
+            messagebox.showerror("Cannot read setup", str(exc), parent=self.root)
+            self.log(f"Could not read {path}: {exc}")
+            return
+
+        loaded = skipped = 0
+        for scpi, value in settings.items():
+            if (scpi not in self.set_vars or self.set_kinds[scpi] == "info"
+                    or not isinstance(value, (str, int, float))):
+                skipped += 1
+                continue
+            self.set_vars[scpi].set(str(value).strip())
+            loaded += 1
+        grab = cfg.get("grab")
+        if isinstance(grab, dict):
+            self.load_grab_prefs(grab)
+        self.log(f"Loaded {os.path.basename(path)}: {loaded} setting(s) into the panel"
+                 + (f", {skipped} not recognised and skipped" if skipped else ""))
+        if not loaded:
+            return
+        if not self.scope.inst:
+            self.log("  Not connected - press Send all once you are.")
+            return
+        writable = len(self.panel_settings())
+        if messagebox.askyesno(
+                "Load setup",
+                f"{loaded} setting(s) are now in the panel.\n\n"
+                f"Send {writable} of them to the scope now? This overwrites "
+                "whatever the scope currently has, including anything changed "
+                "at the front panel.",
+                parent=self.root):
+            self.do_send_all()
 
     def save_config(self):
         """Called after a grab, when the folder is picked, and on close. Writes
@@ -977,8 +1156,14 @@ class App:
     def set_busy(self, busy):
         self.busy = busy
         state = "disabled" if busy or self.seq_active or not self.scope.inst else "normal"
-        for btn in (self.read_btn, self.apply_btn, self.peek_btn, *self.action_btns):
+        for btn in (self.read_btn, self.apply_btn, self.send_btn, self.peek_btn,
+                    *self.action_btns):
             btn.configure(state=state)
+        # These two only need the panel, not the instrument, so they follow the
+        # busy flag alone - a setup is worth saving whether or not the scope is
+        # plugged in, and loading one is how you fill the panel before it is.
+        for btn in (self.save_set_btn, self.load_set_btn):
+            btn.configure(state="disabled" if busy or self.seq_active else "normal")
         # During a one-off grab the GRAB button becomes the way to call off a
         # long trigger wait. A sequence has its own Stop button instead.
         if busy and not self.seq_active:
@@ -1313,6 +1498,17 @@ class App:
         self.apply_btn = ttk.Button(bar, text="Apply changes",
                                     command=self.do_apply_settings, state="disabled")
         self.apply_btn.pack(side="left", padx=6)
+        self.send_btn = ttk.Button(bar, text="Send all",
+                                   command=self.do_send_all, state="disabled")
+        self.send_btn.pack(side="left")
+        # Saving and loading are panel operations, so unlike the two beside them
+        # they stay live with nothing connected.
+        self.load_set_btn = ttk.Button(bar, text="Load setup...",
+                                       command=self.do_load_setup)
+        self.load_set_btn.pack(side="right", padx=(6, 0))
+        self.save_set_btn = ttk.Button(bar, text="Save setup...",
+                                       command=self.do_save_setup)
+        self.save_set_btn.pack(side="right")
         self.set_status = ttk.Label(bar, text="not read yet", foreground="#666")
         self.set_status.pack(side="left", padx=6)
 
@@ -1367,17 +1563,38 @@ class App:
         self.refresh_marks()
         self.refresh_enabled()
 
+    def setting_live(self, scpi):
+        """True when the panel's own mode fields say the scope is acting on this
+        one. Judged from the panel rather than the scope because that is the
+        state being written: selecting AVERage and a count in the same Apply
+        makes the count live, and WRITE_FIRST puts the mode down first."""
+        owner, live_for = DEPENDS_ON.get(scpi, (None, None))
+        if owner is None or owner not in self.set_vars:
+            return True
+        return self.set_vars[owner].get().strip().upper().startswith(live_for)
+
     def refresh_enabled(self):
         """Grey out the fields whose mode is not selected. The scope keeps
         answering with a stale value for those - an average count from the last
         time averaging was on, an edge level under a pulse-width trigger - and
         greying them is what says the number on show is not in force."""
-        for scpi, (owner, live_for) in DEPENDS_ON.items():
-            if scpi not in self.set_widgets or owner not in self.set_vars:
+        for scpi in DEPENDS_ON:
+            if scpi not in self.set_widgets:
                 continue
-            live = self.set_vars[owner].get().strip().upper().startswith(live_for)
             self.set_widgets[scpi].configure(
-                state=self.set_live[scpi] if live else "disabled")
+                state=self.set_live[scpi] if self.setting_live(scpi) else "disabled")
+
+    def panel_settings(self):
+        """Every writable field the panel is actually asserting: what it holds,
+        regardless of whether the scope is believed to already have it.
+
+        Skipped are the info rows, which are results rather than knobs; blanks,
+        which are fields never read or filled; and anything greyed out, whose
+        displayed value is a stale reply the scope is not acting on and which
+        would be written as though it were a real choice."""
+        return {scpi: var.get().strip() for scpi, var in self.set_vars.items()
+                if self.set_kinds[scpi] != "info" and var.get().strip()
+                and self.setting_live(scpi)}
 
     def refresh_marks(self):
         pending = 0
@@ -1443,6 +1660,26 @@ class App:
         if not changes:
             self.log("No setting changes to apply.")
             return
+        self.set_busy(True)
+        threading.Thread(target=self._settings_worker, args=(changes,), daemon=True).start()
+
+    def do_send_all(self):
+        """Write every field the panel is asserting, edited here or not.
+
+        Apply changes only sends what was edited in this window, which is
+        exactly wrong after someone has turned a knob on the scope itself: the
+        panel still holds the setting you want and still believes the scope has
+        it, so there is nothing marked and nothing to apply. Getting back used
+        to mean reading from the scope - which overwrites the panel with the
+        state you are trying to leave - then re-typing it. This just puts the
+        panel back on the instrument."""
+        if self.busy or not self.scope.inst:
+            return
+        changes = self.panel_settings()
+        if not changes:
+            self.log("Nothing to send - the panel has not been read or filled in yet.")
+            return
+        self.log(f"Sending all {len(changes)} panel setting(s) to the scope:")
         self.set_busy(True)
         threading.Thread(target=self._settings_worker, args=(changes,), daemon=True).start()
 
@@ -1531,7 +1768,13 @@ class App:
             self.seq_next.set("next file: (runs and first label must be whole numbers)")
             return
         width = max(3, len(str(start + count - 1)))
-        self.seq_next.set(f"next file: {self.safe_prefix()}_{start:0{width}d}.csv")
+        first = self.first_free(start, width)
+        name = f"{self.safe_prefix()}_{first:0{width}d}.csv"
+        # The First label box stays where it was put, so when a previous run has
+        # already taken those labels the preview is the only thing that says the
+        # sequence will start further along.
+        self.seq_next.set(f"next file: {name}" if first == start else
+                          f"next file: {name}  (from {start:0{width}d} up already exist)")
 
     def do_sequence(self):
         if self.seq_active:
@@ -1567,7 +1810,7 @@ class App:
             self.log("Sequence: switched auto-grab off.")
 
         self.seq_width = max(3, len(str(start + count - 1)))
-        first = self.first_free(start)
+        first = self.first_free(start, self.seq_width)
         if first != start:
             # Naming the labels rather than the whole filename keeps this on one
             # line whatever the prefix is.
@@ -1586,12 +1829,13 @@ class App:
                  f"{self.seq_gap:g} s apart")
         self.run_sequence_step()
 
-    def first_free(self, start):
+    def first_free(self, start, width):
         """First label whose CSV does not exist yet, so a repeated sequence adds
-        to the series instead of overwriting it."""
+        to the series instead of overwriting it. This, rather than winding the
+        First label box on, is what stacks one sequence on the next."""
         outdir, prefix = self.outdir.get(), self.safe_prefix()
         i = start
-        while os.path.exists(os.path.join(outdir, f"{prefix}_{i:0{self.seq_width}d}.csv")):
+        while os.path.exists(os.path.join(outdir, f"{prefix}_{i:0{width}d}.csv")):
             i += 1
         return i
 
@@ -1620,9 +1864,6 @@ class App:
                 # Stop was pressed while this run was mid-flight; it still saved.
                 self.log(f"  (run {label} was already under way and was saved)")
                 self.seq_status.configure(text=f"stopped after {self.seq_done}")
-            elif label is not None:
-                # It was called off before saving, so that label is still free.
-                self.seq_start.set(str(int(label)))
             return
         if label is not None and not self.grab_wrote:
             # No trigger, a cancel, or an error: stop rather than burn through
@@ -1658,8 +1899,14 @@ class App:
         # A run already in flight finishes and writes its files; grab_done then
         # sees an inactive sequence and stops there.
         self.set_busy(self.busy)
-        used = (not aborted) or self.busy   # a run mid-flight still writes its label
-        self.seq_start.set(str(self.seq_index + (1 if used else 0)))
+        # First label is left exactly as it was typed. It used to be wound on to
+        # the next free number so a second sequence stacked on the first, but
+        # that made the box mean two different things - what you asked for until
+        # the sequence ended, and where it got to afterwards - and there was no
+        # way to run the same labels again without setting it back by hand every
+        # time. Stacking still happens: first_free skips labels already on disk.
+        # The preview line under the button says where the next one would start.
+        self.show_next_name()
 
     def toggle_auto(self):
         if self.auto.get():
