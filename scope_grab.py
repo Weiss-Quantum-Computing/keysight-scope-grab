@@ -1093,6 +1093,11 @@ class App:
                  + (f", {skipped} not recognised and skipped" if skipped else ""))
         if not loaded:
             return
+        # Loading is the last thing this window is for, and the panel behind it
+        # is now the picture of what was loaded - marks and all. Leaving it up
+        # only puts the send-it-now question over the thing being asked about.
+        # A failed read keeps the window, since the next move is another file.
+        self._setups_close()
         if not self.scope.inst:
             self.log("  Not connected - once you are, press Apply changes and say "
                      "yes when it offers to send the lot.")

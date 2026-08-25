@@ -373,9 +373,14 @@ says so at the top - a setup never claims to be a reading it isn't. Fields the
 scope is currently ignoring are saved anyway, because a setup that switches to
 averaging has to carry the count that goes with it.
 
-Loading never writes to the scope on its own. The values land in the panel
-first, marked `*` against whatever the scope last reported, so you can see what
-is about to change - and then it asks whether to send them. Say no and they stay
+Loading closes the setups window and never writes to the scope on its own. The
+values land in the panel first, marked `*` against whatever the scope last
+reported, so you can see what is about to change - and then it asks whether to
+send them, over the panel rather than over the window that is now in the way.
+The window stays up if the load did not happen: a cancelled picker, a file that
+cannot be read, or one with nothing recognisable in it all leave it open,
+because the next move is another file. Saving leaves it up too - you may want
+to save more than one. Say no and they stay
 in the panel as ordinary edits for **Apply changes** to write later; with nothing
 connected it just says so.
 
