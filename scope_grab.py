@@ -37,6 +37,9 @@ CONFIG_PATH = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"),
 # Named setups, saved and loaded by hand - the counterpart of the AWG GUI's
 # awg_setups folder, and on the Desktop for the same reason: a setup is a lab
 # record, so it lives where the data does rather than inside the program folder.
+# Only the starting point. The folder is picked in the setups window, kept in
+# the session config, and this is what a fresh install and a blank box fall
+# back to.
 SETUP_DIR = os.path.join(os.path.expanduser("~"), "Desktop", "scope_setups")
 NOT_MEASURED = 9.9e37
 
@@ -590,6 +593,10 @@ class App:
         # exists and go back to None when it closes. set_busy checks.
         self.setup_win = None
         self.setup_save_btn = self.setup_load_btn = None
+        # Where setups are kept. A folder of its own rather than the capture
+        # folder: that one moves with the experiment, while setups accumulate
+        # in one place and are looked for there.
+        self.setup_dir = tk.StringVar(value=SETUP_DIR)
 
         root.title("Scope Grab - MSO-X 2014A")
         # Tall enough for the screenshot preview, but never taller than the
@@ -826,9 +833,19 @@ class App:
             self.load_latest_preview()
             self.save_config()
 
+    def pick_setup_dir(self):
+        d = filedialog.askdirectory(
+            title="Folder for saved setups",
+            initialdir=self.setup_dir.get() or SETUP_DIR,
+            parent=self.setup_win or self.root)
+        if d:
+            self.setup_dir.set(d)
+            self.save_config()
+
     def current_cfg(self):
         return {
             "outdir": self.outdir.get(),
+            "setup_dir": self.setup_dir.get(),
             "prefix": self.prefix.get(),
             "channel_names": {str(ch): var.get() for ch, var in self.ch_names.items()},
             "channels": {str(ch): var.get() for ch, var in self.ch_vars.items()},
@@ -850,9 +867,10 @@ class App:
             self.log(f"Ignoring unreadable {CONFIG_PATH}: {exc}")
             return
 
-        outdir = cfg.get("outdir")
-        if isinstance(outdir, str) and outdir.strip():
-            self.outdir.set(outdir)
+        for key, var in (("outdir", self.outdir), ("setup_dir", self.setup_dir)):
+            value = cfg.get(key)
+            if isinstance(value, str) and value.strip():
+                var.set(value)
         self.load_grab_prefs(cfg)
 
         self.saved_cfg = self.current_cfg()
@@ -921,7 +939,10 @@ class App:
         ff = ttk.Frame(win)
         ff.pack(fill="x", padx=8, pady=(0, 2))
         ttk.Label(ff, text="Folder:").pack(side="left", padx=(0, 4))
-        ttk.Label(ff, text=SETUP_DIR, foreground="#444").pack(side="left")
+        ttk.Entry(ff, textvariable=self.setup_dir, width=52).pack(
+            side="left", fill="x", expand=True)
+        ttk.Button(ff, text="...", width=3,
+                   command=self.pick_setup_dir).pack(side="left", padx=6)
 
         pf = ttk.Frame(win)
         pf.pack(fill="x", padx=8, pady=2)
@@ -983,10 +1004,11 @@ class App:
                 "transfer_points": self.trans_pts.get(),
             },
         }
+        outdir = self.setup_dir.get().strip() or SETUP_DIR
         try:
-            os.makedirs(SETUP_DIR, exist_ok=True)
+            os.makedirs(outdir, exist_ok=True)
             stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            base = os.path.join(SETUP_DIR, f"{self.safe_prefix()}_{stamp}")
+            base = os.path.join(outdir, f"{self.safe_prefix()}_{stamp}")
             with open(base + ".json", "w", encoding="utf-8") as fh:
                 json.dump(cfg, fh, indent=2)
             with open(base + ".txt", "w", encoding="utf-8") as fh:
@@ -1008,10 +1030,11 @@ class App:
         them. Answer no and Send all does it whenever you are ready."""
         if self.busy:
             return
+        start = self.setup_dir.get().strip() or SETUP_DIR
         path = filedialog.askopenfilename(
-            title="Load setup",
-            initialdir=SETUP_DIR if os.path.isdir(SETUP_DIR) else ".",
-            filetypes=[("Setup files", "*.json"), ("All files", "*.*")])
+            title="Load setup", initialdir=start if os.path.isdir(start) else ".",
+            filetypes=[("Setup files", "*.json"), ("All files", "*.*")],
+            parent=self.setup_win or self.root)
         if not path:
             return
         try:

@@ -347,9 +347,16 @@ settings panel because saving and loading happen once at the start and once at
 the end of a session, while the settings bar is for what gets pressed while
 working.
 
-Files go to `Desktop/scope_setups` as `<prefix>_<timestamp>.json` with a readable
-`.txt` beside it - the `.json` is what loads back, the `.txt` is what goes in the
-notebook. The prefix box in the window is the same one the captures use.
+Files are named `<prefix>_<timestamp>.json`, with a readable `.txt` beside it -
+the `.json` is what loads back, the `.txt` is what goes in the notebook. The
+prefix box in the window is the same one the captures use.
+
+The **Folder** row picks where they go, exactly like the capture folder's: type a
+path or press **...**. It starts at `Desktop/scope_setups`, is remembered between
+sessions, and is where **Load setup...** opens. It is deliberately not the capture
+folder - that one moves with the experiment, while setups accumulate in one place
+and are looked for there. Empty the box and it falls back to the default rather
+than writing wherever the app happens to be running from.
 
 Saved is **the panel**, not the instrument. That means it works with nothing
 connected, and what you can see is what you get. If a field is an edit you have
@@ -450,8 +457,8 @@ again.
 
 ## Remembered settings
 
-The output folder, filename prefix, channel names, which channels are ticked, the
-trigger wait and the transfer point count are written to
+The output folder, the setups folder, filename prefix, channel names, which
+channels are ticked, the trigger wait and the transfer point count are written to
 
 ```
 %APPDATA%\ScopeGrab\config.json
@@ -465,6 +472,7 @@ touch it.
 ```json
 {
   "outdir": "C:\\Users\\you\\Desktop\\scope_data",
+  "setup_dir": "C:\\Users\\you\\Desktop\\scope_setups",
   "prefix": "EOM run",
   "channel_names": { "1": "EOM drive", "2": "cavity refl", "3": "", "4": "" },
   "channels": { "1": true, "2": true, "3": false, "4": false },
