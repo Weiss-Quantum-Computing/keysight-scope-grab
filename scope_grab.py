@@ -1416,7 +1416,14 @@ class App:
                      f"= {t_armed + t_read + t_write:.1f} s")
             # Only a sequence can silently lose shots to this. On a one-off
             # grab a trigger already waiting is just a running signal.
-            if label is not None and t_armed < 0.5 and not existing:
+            #
+            # An interval of 0 is the same case: it asks for runs back to back
+            # as fast as the readout allows, so a trigger already pending at
+            # every re-arm is what was ordered, not a fault. Warning about it
+            # once per run only buries the timing line under advice to slow down
+            # a sequence that was deliberately set to full speed.
+            if (label is not None and t_armed < 0.5 and not existing
+                    and self.seq_gap > 0):
                 # The scope cannot be armed while it is being read out, so a
                 # trigger that is already pending the moment it re-arms means
                 # earlier ones came and went unrecorded.

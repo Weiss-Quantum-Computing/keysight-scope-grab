@@ -155,7 +155,12 @@ under way finishes rather than being thrown away.
 > sequence, a trigger already waiting the moment the scope armed - meaning earlier
 > ones came and went unrecorded - is called out with the interval you would need.
 > A one-off grab reports its timings but does not warn: a trigger already waiting
-> there just means the signal is running.
+> there just means the signal is running. Neither does a sequence with the
+> **interval set to 0** - that asks for runs back to back as fast as the readout
+> allows, so a trigger pending at every re-arm is what was ordered rather than a
+> fault, and saying so once per run would only bury the timing line under advice
+> to slow down a sequence deliberately set to full speed. The timings are still
+> printed, and they are what tells you the real cadence.
 >
 > ```
 >   run 002: 0.0 s armed, 4.3 s reading, 5.7 s writing = 10.0 s
