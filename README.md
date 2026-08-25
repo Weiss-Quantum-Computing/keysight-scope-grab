@@ -356,8 +356,13 @@ the end of a session, while the settings bar is for what gets pressed while
 working.
 
 Files are named `<prefix>_<timestamp>.json`, with a readable `.txt` beside it -
-the `.json` is what loads back, the `.txt` is what goes in the notebook. The
-prefix box in the window is the same one the captures use.
+the `.json` is what loads back, the `.txt` is what goes in the notebook.
+
+The **Prefix** box in that window is its own, separate from the capture filename
+prefix and defaulting to `setup`. They used to be one box, which meant renaming a
+run renamed the setups with it, and a setup saved while working under one
+experiment's prefix looked as though it belonged to that experiment. Setups
+outlive the runs they were made for.
 
 The **Folder** row picks where they go, exactly like the capture folder's: type a
 path or press **...**. It starts at `Desktop/scope_setups`, is remembered between
@@ -471,7 +476,8 @@ again.
 
 ## Remembered settings
 
-The output folder, the setups folder, filename prefix, channel names, which
+The output folder, the setups folder and setup prefix, filename prefix, channel
+names, which
 channels are ticked, the trigger wait, the transfer point count, the three
 sequence boxes - runs, interval and first label - the auto-grab interval and
 whether screenshots are saved are written to
@@ -489,6 +495,7 @@ touch it.
 {
   "outdir": "C:\\Users\\you\\Desktop\\scope_data",
   "setup_dir": "C:\\Users\\you\\Desktop\\scope_setups",
+  "setup_prefix": "EOM ramps",
   "prefix": "EOM run",
   "channel_names": { "1": "EOM drive", "2": "cavity refl", "3": "", "4": "" },
   "channels": { "1": true, "2": true, "3": false, "4": false },

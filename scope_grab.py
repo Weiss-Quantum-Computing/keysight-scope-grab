@@ -606,6 +606,10 @@ class App:
         # folder: that one moves with the experiment, while setups accumulate
         # in one place and are looked for there.
         self.setup_dir = tk.StringVar(value=SETUP_DIR)
+        # Setup files are named independently of the captures. The two were one
+        # box, which meant renaming a run renamed the setups too and a setup
+        # saved under one experiment's prefix looked like it belonged to it.
+        self.setup_prefix = tk.StringVar(value="setup")
 
         root.title("Scope Grab - MSO-X 2014A")
         # Tall enough for the screenshot preview, but never taller than the
@@ -855,6 +859,7 @@ class App:
         return {
             "outdir": self.outdir.get(),
             "setup_dir": self.setup_dir.get(),
+            "setup_prefix": self.setup_prefix.get(),
             "prefix": self.prefix.get(),
             "channel_names": {str(ch): var.get() for ch, var in self.ch_names.items()},
             "channels": {str(ch): var.get() for ch, var in self.ch_vars.items()},
@@ -881,7 +886,10 @@ class App:
             self.log(f"Ignoring unreadable {CONFIG_PATH}: {exc}")
             return
 
-        for key, var in (("outdir", self.outdir), ("setup_dir", self.setup_dir)):
+        # App-level, so restored here rather than in load_grab_prefs: a setup
+        # file must not be able to redirect or rename the setups themselves.
+        for key, var in (("outdir", self.outdir), ("setup_dir", self.setup_dir),
+                         ("setup_prefix", self.setup_prefix)):
             value = cfg.get(key)
             if isinstance(value, str) and value.strip():
                 var.set(value)
@@ -972,7 +980,8 @@ class App:
         pf = ttk.Frame(win)
         pf.pack(fill="x", padx=8, pady=2)
         ttk.Label(pf, text="Prefix:").pack(side="left")
-        ttk.Entry(pf, textvariable=self.prefix, width=16).pack(side="left", padx=4)
+        ttk.Entry(pf, textvariable=self.setup_prefix, width=16).pack(
+            side="left", padx=4)
         self.setup_save_btn = ttk.Button(pf, text="Save setup",
                                          command=self.do_save_setup)
         self.setup_save_btn.pack(side="left", padx=(8, 4))
@@ -1038,7 +1047,7 @@ class App:
         try:
             os.makedirs(outdir, exist_ok=True)
             stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            base = os.path.join(outdir, f"{self.safe_prefix()}_{stamp}")
+            base = os.path.join(outdir, f"{self.safe_setup_prefix()}_{stamp}")
             with open(base + ".json", "w", encoding="utf-8") as fh:
                 json.dump(cfg, fh, indent=2)
             with open(base + ".txt", "w", encoding="utf-8") as fh:
@@ -1150,6 +1159,11 @@ class App:
         p = "".join("_" if c in BAD_NAME_CHARS else c
                     for c in self.prefix.get()).strip()
         return p or "scope"
+
+    def safe_setup_prefix(self):
+        p = "".join("_" if c in BAD_NAME_CHARS else c
+                    for c in self.setup_prefix.get()).strip()
+        return p or "setup"
 
     def render_preview(self, source):
         """Put a PNG in the preview box: `source` is a file path, or PNG bytes for
