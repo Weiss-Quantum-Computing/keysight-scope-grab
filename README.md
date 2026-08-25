@@ -286,9 +286,17 @@ To change a setting from the window, edit the field and press **Apply changes**:
   averaging and setting the count in the same Apply works, because `:ACQuire:TYPE`
   is written before `:ACQuire:COUNt` - the other way round the scope takes the count
   and quietly does nothing with it.
-- A pull never discards an edit you have not applied yet. If a value changes on the
-  scope while you have a pending edit for the same field, your edit stays in the
-  box and the log notes that the scope disagrees.
+- An automatic pull - on connect, and after every grab - never discards an edit you
+  have not applied yet. Your edit stays in the box and the log notes that the scope
+  disagrees.
+- **Read from scope** asks. Pressing it with edits outstanding puts up `N field(s)
+  hold edits that have not been applied - overwrite them with what the scope
+  reports?`. **Yes** makes the panel a straight reading of the instrument and those
+  edits are gone; **No** fills every other field and leaves them alone, which is
+  what a read always used to do. Keeping them is right while you are part-way
+  through typing a change, and wrong when the edit is stale and the instrument's
+  own state is what you are after - which is usually why the button gets pressed.
+  With nothing edited it just reads, without asking anything.
 - After a write the panel re-reads the instrument, so what you see is what the
   scope actually accepted rather than what you asked for - relevant because the
   scope silently clamps values outside its range.
@@ -372,7 +380,8 @@ in the panel as ordinary edits for **Apply changes** to write later; with nothin
 connected it just says so.
 
 The capture-side fields travel with the setup as well: prefix, which channels
-are ticked, their names, trigger wait, transfer points and the sequence boxes. The **output folder
+are ticked, their names, trigger wait, transfer points, the sequence boxes, the
+auto-grab interval and whether screenshots are saved. The **output folder
 does not**. That belongs to where you are working now rather than to the setup
 being recalled, and a setup from another experiment quietly redirecting where
 captures land is the one surprise here that costs you a file.
@@ -458,8 +467,9 @@ again.
 ## Remembered settings
 
 The output folder, the setups folder, filename prefix, channel names, which
-channels are ticked, the trigger wait, the transfer point count and the three
-sequence boxes - runs, interval and first label - are written to
+channels are ticked, the trigger wait, the transfer point count, the three
+sequence boxes - runs, interval and first label - the auto-grab interval and
+whether screenshots are saved are written to
 
 ```
 %APPDATA%\ScopeGrab\config.json
@@ -481,9 +491,17 @@ touch it.
   "transfer_points": "max",
   "seq_count": "250",
   "seq_interval": "0",
-  "seq_start": "37"
+  "seq_start": "37",
+  "auto_interval": "2.5",
+  "save_png": true
 }
 ```
+
+Two switches are deliberately left out. **Auto-grab**'s interval is remembered but
+the tick is not, and neither is **take the trace already on the scope**: either one
+surviving a restart would have the app capturing, or saving a stale trace as a new
+one, before anyone had looked at what the scope was set to. Both start off every
+time.
 
 Delete the file to go back to defaults. A missing, truncated or malformed file is
 ignored - each value falls back to its default independently, and the log notes

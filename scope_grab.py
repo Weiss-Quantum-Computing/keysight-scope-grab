@@ -239,6 +239,11 @@ def describe_setup(cfg):
             lines.append(f"  Sequence          {grab.get('seq_count', '')} runs, "
                          f"{grab.get('seq_interval', '')} s apart, from label "
                          f"{grab.get('seq_start', '')}")
+        if grab.get("auto_interval"):
+            lines.append(f"  Auto-grab every   {grab.get('auto_interval', '')} s")
+        if "save_png" in grab:
+            lines.append(f"  Save screenshot   "
+                         f"{'yes' if grab.get('save_png') else 'no'}")
         names = grab.get("channel_names") or {}
         ticked = grab.get("channels") or {}
         for ch in ("1", "2", "3", "4"):
@@ -858,6 +863,8 @@ class App:
             "seq_count": self.seq_count.get(),
             "seq_interval": self.seq_interval.get(),
             "seq_start": self.seq_start.get(),
+            "auto_interval": self.interval.get(),
+            "save_png": self.save_png.get(),
         }
 
     def load_config(self):
@@ -899,10 +906,18 @@ class App:
                          ("transfer_points", self.trans_pts),
                          ("seq_count", self.seq_count),
                          ("seq_interval", self.seq_interval),
-                         ("seq_start", self.seq_start)):
+                         ("seq_start", self.seq_start),
+                         ("auto_interval", self.interval)):
             value = cfg.get(key)
             if isinstance(value, str) and value.strip():
                 var.set(value)
+        # Auto-grab's interval comes back but auto-grab itself does not: a tick
+        # that survived a restart would have the app capturing before anyone had
+        # looked at what the scope was set to. Same reasoning as 'take the trace
+        # already on the scope', which is also always off at launch.
+        save_png = cfg.get("save_png")
+        if isinstance(save_png, (bool, int)):
+            self.save_png.set(bool(save_png))
         names = cfg.get("channel_names")
         if isinstance(names, dict):
             for ch, var in self.ch_names.items():
@@ -1015,6 +1030,8 @@ class App:
                 "seq_count": self.seq_count.get(),
                 "seq_interval": self.seq_interval.get(),
                 "seq_start": self.seq_start.get(),
+                "auto_interval": self.interval.get(),
+                "save_png": self.save_png.get(),
             },
         }
         outdir = self.setup_dir.get().strip() or SETUP_DIR
@@ -1748,10 +1765,31 @@ class App:
         return values
 
     def do_read_settings(self):
+        """Pull the scope's settings into the panel.
+
+        A read used to be unable to clear an unapplied edit - it landed in every
+        other field and left yours alone. That is right while you are part-way
+        through typing a change, and wrong when the edit is stale and what you
+        want is the instrument's own state, which is the usual reason for
+        pressing this. So it asks, rather than picking one for you."""
         if self.busy or not self.scope.inst:
             return
+        pending = [scpi for scpi in self.set_marks if self.edited(scpi)]
+        overwrite = False
+        if pending:
+            overwrite = messagebox.askyesno(
+                "Read from scope",
+                f"{len(pending)} field(s) hold edits that have not been applied.\n\n"
+                "Overwrite them with what the scope reports?\n\n"
+                "Yes - the panel becomes a straight reading of the instrument and "
+                "those edits are gone.\n"
+                "No - the reading fills every other field and the edits stay put.",
+                parent=self.root)
+            if not overwrite:
+                self.log(f"Read from scope: keeping {len(pending)} unapplied edit(s).")
         self.set_busy(True)
-        threading.Thread(target=self._settings_worker, args=(None,), daemon=True).start()
+        threading.Thread(target=self._settings_worker, args=(None, overwrite),
+                         daemon=True).start()
 
     def do_apply_settings(self):
         """Write the fields edited in this window.
@@ -1811,7 +1849,7 @@ class App:
         self.set_busy(True)
         threading.Thread(target=self._settings_worker, args=(changes,), daemon=True).start()
 
-    def _settings_worker(self, changes):
+    def _settings_worker(self, changes, overwrite=False):
         try:
             if changes:
                 # A mode has to be in place before the fields it governs, or the
@@ -1834,8 +1872,11 @@ class App:
             # Read back either way: after a write the scope is the authority on
             # what it actually accepted, since it clamps values it dislikes.
             values = self.read_all_settings()
+            # After a write the scope is the authority on what it accepted, so
+            # that always overwrites. A plain read only does when asked to.
+            wins = overwrite or bool(changes)
             self.root.after(0,
-                            lambda v=values: self.show_settings(v, overwrite=bool(changes)))
+                            lambda v=values: self.show_settings(v, overwrite=wins))
             if changes:
                 # Show what the change did. The display needs a sweep to redraw
                 # after something like a timebase change, so give it a moment.
