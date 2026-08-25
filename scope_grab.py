@@ -586,6 +586,10 @@ class App:
         self.stop_flag = threading.Event()   # asks a waiting capture to give up
         self.grab_wrote = False              # did the last run produce files?
         self.seq_done = 0
+        # The setups window is built when asked for, so these are None until it
+        # exists and go back to None when it closes. set_busy checks.
+        self.setup_win = None
+        self.setup_save_btn = self.setup_load_btn = None
 
         root.title("Scope Grab - MSO-X 2014A")
         # Tall enough for the screenshot preview, but never taller than the
@@ -611,6 +615,8 @@ class App:
         self.status = ttk.Label(top, text="Not connected", foreground="#a00")
         self.status.pack(side="left")
         ttk.Button(top, text="Connect", command=self.do_connect).pack(side="right")
+        ttk.Button(top, text="Load/save setups...",
+                   command=self.do_setups).pack(side="right", padx=(0, 6))
 
         # --- channels
         chf = ttk.LabelFrame(left, text="Channels")
@@ -882,6 +888,64 @@ class App:
                 if isinstance(value, (bool, int)):
                     var.set(bool(value))
 
+    def do_setups(self):
+        """The Load/save setups window, off the connection row.
+
+        A window rather than two more buttons in the settings panel: saving and
+        loading happen once at the start and once at the end of a session, and
+        the settings bar is for the things pressed while working. Same button in
+        the same corner as the AWG GUI, so the two panels are one habit.
+
+        Not modal. Loading offers to send the setup straight to the scope, and
+        that goes off on a thread whose progress is reported to the log behind
+        this window.
+        """
+        if self.setup_win is not None and self.setup_win.winfo_exists():
+            self.setup_win.lift()
+            self.setup_win.focus_force()
+            return
+        win = self.setup_win = tk.Toplevel(self.root)
+        win.title("Load / save setups")
+        win.transient(self.root)
+        win.protocol("WM_DELETE_WINDOW", self._setups_close)
+
+        ttk.Label(win, justify="left", foreground="#444", text=(
+            "Save setup writes the settings panel to a timestamped JSON, with a "
+            "readable .txt beside it.\n"
+            "Load setup puts one back in the panel and offers to send it to the "
+            "scope.\n"
+            "Both work with nothing connected - a setup is the panel, not a "
+            "reading.")
+        ).pack(anchor="w", padx=8, pady=(8, 4))
+
+        ff = ttk.Frame(win)
+        ff.pack(fill="x", padx=8, pady=(0, 2))
+        ttk.Label(ff, text="Folder:").pack(side="left", padx=(0, 4))
+        ttk.Label(ff, text=SETUP_DIR, foreground="#444").pack(side="left")
+
+        pf = ttk.Frame(win)
+        pf.pack(fill="x", padx=8, pady=2)
+        ttk.Label(pf, text="Prefix:").pack(side="left")
+        ttk.Entry(pf, textvariable=self.prefix, width=16).pack(side="left", padx=4)
+        self.setup_save_btn = ttk.Button(pf, text="Save setup",
+                                         command=self.do_save_setup)
+        self.setup_save_btn.pack(side="left", padx=(8, 4))
+        self.setup_load_btn = ttk.Button(pf, text="Load setup...",
+                                         command=self.do_load_setup)
+        self.setup_load_btn.pack(side="left")
+
+        ttk.Button(win, text="Close", command=self._setups_close).pack(
+            anchor="w", padx=8, pady=(6, 8))
+        # The window may have been opened mid-grab, when both buttons should be
+        # dead until it finishes.
+        self.set_busy(self.busy)
+
+    def _setups_close(self):
+        if self.setup_win is not None:
+            self.setup_win.destroy()
+        self.setup_win = None
+        self.setup_save_btn = self.setup_load_btn = None
+
     def do_save_setup(self):
         """Write the panel's settings to a named file.
 
@@ -977,7 +1041,8 @@ class App:
         if not loaded:
             return
         if not self.scope.inst:
-            self.log("  Not connected - press Send all once you are.")
+            self.log("  Not connected - once you are, press Apply changes and say "
+                     "yes when it offers to send the lot.")
             return
         writable = len(self.panel_settings())
         if messagebox.askyesno(
@@ -985,7 +1050,9 @@ class App:
                 f"{loaded} setting(s) are now in the panel.\n\n"
                 f"Send {writable} of them to the scope now? This overwrites "
                 "whatever the scope currently has, including anything changed "
-                "at the front panel.",
+                "at the front panel.\n\n"
+                "Say no and they stay in the panel, marked as edits, for Apply "
+                "changes to send later.",
                 parent=self.root):
             self.do_send_all()
 
@@ -1156,14 +1223,16 @@ class App:
     def set_busy(self, busy):
         self.busy = busy
         state = "disabled" if busy or self.seq_active or not self.scope.inst else "normal"
-        for btn in (self.read_btn, self.apply_btn, self.send_btn, self.peek_btn,
-                    *self.action_btns):
+        for btn in (self.read_btn, self.apply_btn, self.peek_btn, *self.action_btns):
             btn.configure(state=state)
-        # These two only need the panel, not the instrument, so they follow the
-        # busy flag alone - a setup is worth saving whether or not the scope is
-        # plugged in, and loading one is how you fill the panel before it is.
-        for btn in (self.save_set_btn, self.load_set_btn):
-            btn.configure(state="disabled" if busy or self.seq_active else "normal")
+        # Save and Load live in a window that is usually not open, and they only
+        # need the panel rather than the instrument - a setup is worth saving
+        # whether or not the scope is plugged in, and loading one is how you
+        # fill the panel before it is. So they follow the busy flag alone.
+        for btn in (self.setup_save_btn, self.setup_load_btn):
+            if btn is not None and btn.winfo_exists():
+                btn.configure(state="disabled" if busy or self.seq_active
+                              else "normal")
         # During a one-off grab the GRAB button becomes the way to call off a
         # long trigger wait. A sequence has its own Stop button instead.
         if busy and not self.seq_active:
@@ -1505,17 +1574,6 @@ class App:
         self.apply_btn = ttk.Button(bar, text="Apply changes",
                                     command=self.do_apply_settings, state="disabled")
         self.apply_btn.pack(side="left", padx=6)
-        self.send_btn = ttk.Button(bar, text="Send all",
-                                   command=self.do_send_all, state="disabled")
-        self.send_btn.pack(side="left")
-        # Saving and loading are panel operations, so unlike the two beside them
-        # they stay live with nothing connected.
-        self.load_set_btn = ttk.Button(bar, text="Load setup...",
-                                       command=self.do_load_setup)
-        self.load_set_btn.pack(side="right", padx=(6, 0))
-        self.save_set_btn = ttk.Button(bar, text="Save setup...",
-                                       command=self.do_save_setup)
-        self.save_set_btn.pack(side="right")
         self.set_status = ttk.Label(bar, text="not read yet", foreground="#666")
         self.set_status.pack(side="left", padx=6)
 
@@ -1660,26 +1718,53 @@ class App:
         threading.Thread(target=self._settings_worker, args=(None,), daemon=True).start()
 
     def do_apply_settings(self):
+        """Write the fields edited in this window.
+
+        Nothing marked does not mean nothing to do. The marks compare the panel
+        against what the scope last *reported*, so after a knob is turned on the
+        instrument itself the panel still holds the setting you want and still
+        believes the scope has it: nothing is marked, and the one button you
+        would reach for does nothing. Rather than a second button for the case,
+        an empty Apply asks whether to send the panel as it stands - which is
+        almost always why it was pressed with nothing marked."""
         if self.busy or not self.scope.inst:
             return
         changes = {scpi: var.get().strip() for scpi, var in self.set_vars.items()
                    if self.edited(scpi)}
         if not changes:
-            self.log("No setting changes to apply.")
+            self.offer_send_all()
             return
         self.set_busy(True)
         threading.Thread(target=self._settings_worker, args=(changes,), daemon=True).start()
 
+    def offer_send_all(self):
+        """Apply found nothing marked. Offer to write the whole panel instead."""
+        live = self.panel_settings()
+        if not live:
+            self.log("No setting changes to apply - the panel has not been read "
+                     "or filled in yet.")
+            return
+        if messagebox.askyesno(
+                "Apply changes",
+                "There are no apparent changes to be made - every field matches "
+                "what the scope last reported.\n\n"
+                "If a setting was changed on the scope itself, this window would "
+                "not know, and nothing here is marked as edited.\n\n"
+                f"Send all {len(live)} settings anyway? This puts the panel back "
+                "onto the scope, overwriting anything changed at the front panel.",
+                parent=self.root):
+            self.do_send_all()
+        else:
+            self.log("No setting changes to apply.")
+
     def do_send_all(self):
         """Write every field the panel is asserting, edited here or not.
 
-        Apply changes only sends what was edited in this window, which is
-        exactly wrong after someone has turned a knob on the scope itself: the
-        panel still holds the setting you want and still believes the scope has
-        it, so there is nothing marked and nothing to apply. Getting back used
-        to mean reading from the scope - which overwrites the panel with the
-        state you are trying to leave - then re-typing it. This just puts the
-        panel back on the instrument."""
+        Not a button of its own: it is what an empty Apply offers, and what a
+        freshly loaded setup offers. Getting the panel back onto a scope whose
+        knobs have been turned used to mean Read from scope - which overwrites
+        the panel with the state you are trying to leave - then re-typing the
+        old value from memory."""
         if self.busy or not self.scope.inst:
             return
         changes = self.panel_settings()

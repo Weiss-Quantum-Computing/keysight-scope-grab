@@ -302,35 +302,54 @@ To change a setting from the window, edit the field and press **Apply changes**:
 
 ### Putting the panel back onto the scope
 
-**Apply changes** only writes fields edited *in this window*, which is the wrong
-rule in one common case: you reach over and turn a knob on the scope itself. The
-panel still holds the setting you want, and still believes the scope has it, so
-nothing is marked and Apply refuses with `No setting changes to apply`. Getting
-back used to mean pressing **Read from scope** - which overwrites the panel with
-exactly the state you are trying to leave - then re-typing the old value from
-memory and applying it.
+**Apply changes** writes the fields edited *in this window*. Nothing marked does
+not mean nothing to do, though, and the case where those come apart is a common
+one: you reach over and turn a knob on the scope itself. The panel still holds
+the setting you want and still believes the scope has it, so nothing is marked.
+Getting back used to mean pressing **Read from scope** - which overwrites the
+panel with exactly the state you are trying to leave - then re-typing the old
+value from memory.
 
-**Send all** writes every field the panel is asserting, whether or not it thinks
-the scope already agrees. It is the button for *put it back the way I had it*.
+So an Apply that finds nothing marked asks instead of refusing:
 
-- Blank fields are skipped, so it does nothing before the first read.
+```
+There are no apparent changes to be made - every field matches what the
+scope last reported.
+
+If a setting was changed on the scope itself, this window would not know,
+and nothing here is marked as edited.
+
+Send all 45 settings anyway? This puts the panel back onto the scope,
+overwriting anything changed at the front panel.
+```
+
+Say yes and the whole panel goes to the instrument, edited or not - which is
+almost always why Apply was pressed with nothing marked. Say no and you get the
+old `No setting changes to apply` in the log and nothing is written. There is no
+separate button for it: the one you would reach for now covers both.
+
+- Blank fields are skipped, so an Apply before the first read just says the panel
+  has not been filled in, without offering anything.
 - Greyed-out fields are skipped too: their displayed value is a stale reply the
   scope is not acting on, and writing it would assert it as a real choice.
   Liveness is judged from the panel's own modes, not the scope's, so selecting
   `AVER` and sending puts the count down with it.
-- Ordering, read-back, error draining and the peek afterwards are the same as
-  Apply - it is the same write path, given a bigger list.
-
-Nothing about **Apply changes** changed; it is still the right button when you
-know what you edited.
+- Ordering, read-back, error draining and the peek afterwards are unchanged - it
+  is the same write path, given a longer list.
 
 ### Saving and loading a setup
 
-**Save setup...** and **Load setup...** keep named configurations, the way the
-[BK4063B AWG GUI](https://github.com/Weiss-Quantum-Computing/BK4063B-AWG-GUI)
-does. Files go to `Desktop/scope_setups` as `<prefix>_<timestamp>.json` with a
-readable `.txt` beside it - the `.json` is what loads back, the `.txt` is what
-goes in the notebook.
+**Load/save setups...**, beside **Connect** at the top, opens a small window with
+**Save setup** and **Load setup...** in it - the same button in the same corner as
+the [BK4063B AWG GUI](https://github.com/Weiss-Quantum-Computing/BK4063B-AWG-GUI),
+so the two panels are one habit. A window rather than two more buttons in the
+settings panel because saving and loading happen once at the start and once at
+the end of a session, while the settings bar is for what gets pressed while
+working.
+
+Files go to `Desktop/scope_setups` as `<prefix>_<timestamp>.json` with a readable
+`.txt` beside it - the `.json` is what loads back, the `.txt` is what goes in the
+notebook. The prefix box in the window is the same one the captures use.
 
 Saved is **the panel**, not the instrument. That means it works with nothing
 connected, and what you can see is what you get. If a field is an edit you have
@@ -341,8 +360,9 @@ averaging has to carry the count that goes with it.
 
 Loading never writes to the scope on its own. The values land in the panel
 first, marked `*` against whatever the scope last reported, so you can see what
-is about to change - and then it asks whether to send them. Say no and **Send
-all** does it whenever you are ready; with nothing connected it just says so.
+is about to change - and then it asks whether to send them. Say no and they stay
+in the panel as ordinary edits for **Apply changes** to write later; with nothing
+connected it just says so.
 
 The capture-side fields travel with the setup as well: prefix, which channels
 are ticked, their names, trigger wait and transfer points. The **output folder
@@ -351,9 +371,10 @@ being recalled, and a setup from another experiment quietly redirecting where
 captures land is the one surprise here that costs you a file.
 
 Settings traffic and captures share one VISA session, so they are serialised: the
-buttons grey out while a grab is running and vice versa. **Save setup...** and
-**Load setup...** are the exception to the greying: they only touch the panel, so
-they stay live with the scope unplugged.
+buttons grey out while a grab is running and vice versa. The setups window is the
+exception to half of that - its two buttons only touch the panel, so they stay
+live with the scope unplugged, and grey out only while a grab or sequence is
+running.
 
 ## Averaging
 
