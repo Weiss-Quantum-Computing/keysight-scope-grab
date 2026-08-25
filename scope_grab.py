@@ -235,6 +235,10 @@ def describe_setup(cfg):
         lines.append(f"  Prefix            {grab.get('prefix', '')}")
         lines.append(f"  Trigger wait (s)  {grab.get('trigger_wait', '')}")
         lines.append(f"  Transfer points   {grab.get('transfer_points', '')}")
+        if grab.get("seq_count"):
+            lines.append(f"  Sequence          {grab.get('seq_count', '')} runs, "
+                         f"{grab.get('seq_interval', '')} s apart, from label "
+                         f"{grab.get('seq_start', '')}")
         names = grab.get("channel_names") or {}
         ticked = grab.get("channels") or {}
         for ch in ("1", "2", "3", "4"):
@@ -851,6 +855,9 @@ class App:
             "channels": {str(ch): var.get() for ch, var in self.ch_vars.items()},
             "trigger_wait": self.trig_wait.get(),
             "transfer_points": self.trans_pts.get(),
+            "seq_count": self.seq_count.get(),
+            "seq_interval": self.seq_interval.get(),
+            "seq_start": self.seq_start.get(),
         }
 
     def load_config(self):
@@ -889,7 +896,10 @@ class App:
         surprise here that costs you a file."""
         for key, var in (("prefix", self.prefix),
                          ("trigger_wait", self.trig_wait),
-                         ("transfer_points", self.trans_pts)):
+                         ("transfer_points", self.trans_pts),
+                         ("seq_count", self.seq_count),
+                         ("seq_interval", self.seq_interval),
+                         ("seq_start", self.seq_start)):
             value = cfg.get(key)
             if isinstance(value, str) and value.strip():
                 var.set(value)
@@ -1002,6 +1012,9 @@ class App:
                                   for ch, var in self.ch_names.items()},
                 "trigger_wait": self.trig_wait.get(),
                 "transfer_points": self.trans_pts.get(),
+                "seq_count": self.seq_count.get(),
+                "seq_interval": self.seq_interval.get(),
+                "seq_start": self.seq_start.get(),
             },
         }
         outdir = self.setup_dir.get().strip() or SETUP_DIR

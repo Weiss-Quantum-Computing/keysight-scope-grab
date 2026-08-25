@@ -372,7 +372,7 @@ in the panel as ordinary edits for **Apply changes** to write later; with nothin
 connected it just says so.
 
 The capture-side fields travel with the setup as well: prefix, which channels
-are ticked, their names, trigger wait and transfer points. The **output folder
+are ticked, their names, trigger wait, transfer points and the sequence boxes. The **output folder
 does not**. That belongs to where you are working now rather than to the setup
 being recalled, and a setup from another experiment quietly redirecting where
 captures land is the one surprise here that costs you a file.
@@ -458,7 +458,8 @@ again.
 ## Remembered settings
 
 The output folder, the setups folder, filename prefix, channel names, which
-channels are ticked, the trigger wait and the transfer point count are written to
+channels are ticked, the trigger wait, the transfer point count and the three
+sequence boxes - runs, interval and first label - are written to
 
 ```
 %APPDATA%\ScopeGrab\config.json
@@ -477,7 +478,10 @@ touch it.
   "channel_names": { "1": "EOM drive", "2": "cavity refl", "3": "", "4": "" },
   "channels": { "1": true, "2": true, "3": false, "4": false },
   "trigger_wait": "0",
-  "transfer_points": "max"
+  "transfer_points": "max",
+  "seq_count": "250",
+  "seq_interval": "0",
+  "seq_start": "37"
 }
 ```
 
