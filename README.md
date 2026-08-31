@@ -208,18 +208,21 @@ inside each `.txt`, which also gains a `sequence label` line.
   0.3 s run gives a 1 s cadence. If a run takes longer than the interval the next
   begins immediately and the log says so - which is how you find out the interval
   is too short to honour.
-- **Existing files are never overwritten.** If the first label is already on disk
-  the sequence advances to the first free one and notes it in the log. That is
-  what stacks one sequence on the next: leave **First label** at 1, run ten, press
-  Start again, and the second batch lands on 011-020.
+- **Existing files are never overwritten.** If the labels you asked for are on disk
+  the sequence advances to the first stretch long enough to hold the whole run, and
+  notes it in the log. That is what stacks one sequence on the next: leave **First
+  label** at 1, run ten, press Start again, and the second batch lands on 011-020.
+  It is the whole run that has to be clear, not just its first label - a series with
+  a hole in it, one bad run deleted, would otherwise start in the hole and write
+  straight over everything after it.
 - **First label stays where you put it.** It is an instruction, not a counter, and
   nothing moves it - not the end of a sequence, not Stop, not a run called off
   before it saved. It used to wind on to the next free number, which meant the box
   said one thing before a sequence and another after, and re-running the same
   labels needed it set back by hand every time. Set it yourself when you want the
   series to start somewhere else. The preview line under the button is what tells
-  you where the next run will actually land, and it says `(from 001 up already
-  exist)` when the label you asked for is taken.
+  you where the next run will actually land, and it says `(10 runs from 001 would
+  land on files already there)` when the labels you asked for are taken.
 - **Stop** ends a sequence early. A run already under way finishes and is saved,
   and is included in the count.
 - Auto-grab is switched off when a sequence starts, since only one repeating
@@ -407,15 +410,25 @@ running.
 Set **Acquisition** to `AVER` and put the depth in **Averages** - the scope rounds it
 to a power of two between 2 and 65536, and the panel shows you what it settled on.
 
-Averaging needs successive triggers to build up, and a grab arms a *single*
-acquisition, so a trace can come back with less averaging than the setting asks for.
-Nothing on the scope's own screen distinguishes the two, so every averaged grab is
-checked and reported:
+Averaging needs successive triggers to build up, so an averaged grab does not arm a
+single acquisition the way a plain one does - it runs a `:DIGitize`, which counts out
+exactly the requested number of triggers, stops itself, and leaves a record whose hit
+count reads true afterwards. **Wait for trigger** becomes a *stall* limit for the
+duration: it restarts on every trigger event, so a deep average is allowed all the
+trigger periods it needs while a trigger that has died is still caught within one
+wait. Nothing on the scope's own screen distinguishes a full average from a partial
+one, so every averaged grab is checked and reported:
 
 ```
-  ! averaging: 3 of 8 hits in this trace
-    the trace is less averaged than the setting says - leave the scope running on
-    more triggers to build the average up
+  averaging: 256 hits
+```
+
+If the triggers dry up part-way the shallow trace is still saved, and the log says
+how far it got:
+
+```
+  ! triggers dried up at 97 of 256 averages - saving the shallow trace they left
+  averaging: 97 of 256 hits in this trace
 ```
 
 The depth is read straight after the waveform transfer, where the scope certainly
@@ -441,9 +454,16 @@ acquisition type   : NORM
 averages           : 8   (not in use: acquisition type is not AVERage)
 ```
 
-To capture a fully averaged trace, let the scope free-run on the signal - **Run**,
-wait for the average to settle, **Stop** - and then grab with **take the trace
-already on the scope** ticked.
+**Do not build the average by leaving the scope running.** Under `RUN` the averager
+is a *running* average: every sweep folds in with weight 1/N, so the record carries
+an exponential memory of whatever played before it and a full-scale change takes
+about eight time constants to fade out of the trace. Nothing resets that - not
+**Clear**, not rewriting the count, not a stop/run cycle. Worse, the moment `RUN` is
+involved `:WAVeform:COUNt` reports the count that was *set* rather than the depth
+actually accumulated, so a contaminated average reads as finished the instant you ask.
+That is why an averaged grab digitizes instead, and why grabbing an averaged trace
+with **take the trace already on the scope** ticked is the one case where the
+reported depth means nothing - the log says so when you do it.
 
 ## Scope control
 
@@ -530,17 +550,30 @@ alone.
 
 ## Notes on acquisition
 
-Capture uses `:SINGle` rather than `:DIGitize`, so the trace stays on the scope display
-and the screenshot matches the CSV data. One consequence is that an averaged capture
-gets one acquisition rather than a full set of averages - see
-[Averaging](#averaging), which reports the depth each trace actually got. If no trigger arrives within 10 s the scope is
-stopped and whatever is in acquisition memory is read out, with a note in the log.
-Waveforms are transferred as unsigned bytes in `RAW` points mode and scaled to volts
-using the preamble.
+A plain capture uses `:SINGle` rather than `:DIGitize`, so the trace stays on the
+scope display and the screenshot matches the CSV data. An averaged capture is the
+exception and digitizes - see [Averaging](#averaging) - because `:SINGle` takes one
+acquisition however deep the average is set to go. If no trigger arrives within the
+wait, nothing is saved and the log says so; and if the scope stops answering the poll
+while a capture is armed, that is reported as the error it is rather than treated as
+a trigger, so a stale trace can never be written out as a fresh capture.
 
-A timestamped capture never overwrites one that is already there. The timestamp
-only resolves to a second, so a second capture inside the same second is saved with
-a `_2` suffix rather than replacing the first. Sequence labels have their own check.
+Waveforms are transferred as unsigned 16-bit words, LSB first, and scaled to volts
+using the preamble. `WORD` rather than `BYTE` because an averaged or high-res record
+holds finer values than the 8-bit codes on screen - a 256-deep average reads back in
+157 uV steps against the 40 mV display code, a full 16x of real resolution that
+`BYTE` readback silently rounds off. Points mode is `RAW` for the record a `:SINGle`
+leaves and `MAXimum` for the one a `:DIGitize` leaves, which is the only mode the
+latter will answer in.
+
+A channel that is ticked here but switched off on the scope has no record to hand
+over, so that is checked before anything is armed: the grab stops with the channel
+named, rather than waiting out a VISA timeout on a query the scope will never answer.
+
+No capture ever overwrites one that is already there. A timestamp only resolves to a
+second, so a second capture inside the same second is saved with a `_2` suffix rather
+than replacing the first; a sequence's labels are checked ahead of the run as well,
+and still go through the same suffix check on the way out.
 
 Each grab reads the instrument's settings exactly once, and both the panel and the
 `.txt` file are rendered from that single snapshot - so the two can never disagree

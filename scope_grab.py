@@ -41,7 +41,6 @@ CONFIG_PATH = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"),
 # the session config, and this is what a fresh install and a blank box fall
 # back to.
 SETUP_DIR = os.path.join(os.path.expanduser("~"), "Desktop", "scope_setups")
-NOT_MEASURED = 9.9e37
 
 # CSV number formats. Samples arrive as 8-bit codes - 256 levels - so six
 # significant digits already record far more than the scope resolves, and the
@@ -176,7 +175,10 @@ def fmt_setting(kind, raw):
     """Normalise a scope reply into what the panel displays."""
     raw = raw.strip()
     if kind == "bool":
-        return "OFF" if raw in ("0", "OFF", "off") else "ON"
+        # The scope answers 1/0 for these; the panel writes ON/OFF. Anything
+        # else is not a yes - an unrecognised reply reads as OFF rather than
+        # ticking a box to say a setting is on when nothing said it was.
+        return "ON" if raw.upper() in ("1", "+1", "ON") else "OFF"
     if kind in ("num", "info"):
         try:
             return f"{float(raw):g}"
@@ -279,6 +281,7 @@ class Scope:
         else:
             candidates = [r for r in self.rm.list_resources() if r.startswith("USB")]
         for res in candidates:
+            dev = None
             try:
                 dev = self.rm.open_resource(res)
                 dev.timeout = 5000
@@ -286,6 +289,15 @@ class Scope:
                 dev.write_termination = "\n"
                 idn = dev.query("*IDN?").strip()
             except Exception:
+                # Close it even when the open half-succeeded and only *IDN?
+                # failed. A session left open holds the resource, so every
+                # Connect retry past a device that will not answer strands
+                # another handle and the scope behind it stays unreachable.
+                if dev is not None:
+                    try:
+                        dev.close()
+                    except Exception:
+                        pass
                 continue
             if "KEYSIGHT" in idn.upper() or "AGILENT" in idn.upper():
                 dev.timeout = 30000
@@ -304,6 +316,10 @@ class Scope:
             except Exception:
                 pass
         self.inst = self.rm = None
+        # Cleared with the session: a saved setup stamps itself with scope.idn,
+        # and holding the last instrument's name after it has gone would put it
+        # on a setup saved with nothing plugged in.
+        self.idn = self.addr = ""
 
     # -- acquisition ------------------------------------------------------
 
@@ -318,11 +334,13 @@ class Scope:
         an experiment running elsewhere starts sending triggers. `cancelled` is
         polled so a long wait can be called off from the panel.
 
-        Returns True if it triggered, False on timeout, None if cancelled.
+        Returns True if it triggered, False on timeout, None if cancelled, and
+        raises if the scope stops answering the poll.
         """
         self.inst.write(":SINGle")
         started = time.time()
         deadline = None if wait_s <= 0 else started + wait_s
+        bad_polls = 0
         while deadline is None or time.time() < deadline:
             if cancelled is not None and cancelled():
                 self.inst.write(":STOP")
@@ -330,9 +348,23 @@ class Scope:
             try:
                 # Bit 3 of the Operation Status Condition register is the Run bit.
                 cond = int(self.inst.query(":OPERegister:CONDition?"))
+                bad_polls = 0
             except Exception:
-                time.sleep(1.0 if wait_s <= 0 else min(wait_s, 1.0))
-                return True
+                # A poll that failed is not a trigger that arrived. Give the
+                # link a couple more tries the way accumulate does, and if it
+                # still will not answer, let the error out: reporting this as a
+                # trigger would have the caller read out whatever happens to be
+                # in acquisition memory - a trace from before, most likely - and
+                # write it as a fresh capture with nothing saying otherwise.
+                bad_polls += 1
+                if bad_polls < 3:
+                    time.sleep(0.25)
+                    continue
+                try:
+                    self.inst.write(":STOP")
+                except Exception:
+                    pass
+                raise
             if not (cond & 8):
                 return True
             # Poll hard at first for a quick handoff, then back off: a wait of
@@ -377,7 +409,8 @@ class Scope:
         periods (12.8 s for 256 at 20 Hz).
 
         Returns `count` on success, fewer if the triggers dried up, 0 if none
-        ever came, None if cancelled. In every case but None the scope holds a
+        ever came, -1 if a record was built but the scope would not say how deep
+        it is, None if cancelled. In every case but None the scope holds a
         stopped record readable in MAXimum mode (see the worker's read).
         """
         self.inst.query("*OPC?")          # settings writes land before arming
@@ -386,6 +419,7 @@ class Scope:
         started = time.time()
         alive = started
         bad_polls = 0
+        completed = False     # the run bit cleared on its own = the full count
         while True:
             time.sleep(0.4)
             if cancelled is not None and cancelled():
@@ -404,6 +438,9 @@ class Scope:
                 self.inst.write(":STOP")
                 running = False
             if not running:
+                # Only a real reply says the digitize counted itself out. The
+                # give-up path above puts the same False there without asking.
+                completed = bad_polls == 0
                 break
             if progress is not None:
                 progress(time.time() - started)
@@ -417,7 +454,12 @@ class Scope:
         try:
             return min(int(float(got)), count)
         except (TypeError, ValueError):
-            return 0
+            # No answer is not the same as no hits. The record is there either
+            # way - the transfer that follows reads it fine - so a digitize that
+            # stopped itself gets its full count, and one that was stopped early
+            # says the depth is unknown rather than being thrown away as a run
+            # that never triggered.
+            return count if completed else -1
 
 
     def is_running(self):
@@ -586,6 +628,7 @@ class App:
         self.msgs = queue.Queue()
         self.busy = False
         self.auto_job = None
+        self.prefix_job = None    # debounce for re-pointing the shot browser
         self.seq_active = False   # a numbered sequence is running
         self.seq_job = None       # pending after() for the next run
         self.seq_index = 0
@@ -824,6 +867,9 @@ class App:
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(100, self.pump)
         self.root.after(300, self.do_connect)
+        # Added here rather than beside the other prefix trace, because it drives
+        # the preview widgets and they are only built further up this method.
+        self.prefix.trace_add("write", lambda *_: self.prefix_changed())
         self.saved_cfg = None
         self.load_config()
         self.load_latest_preview()
@@ -1273,6 +1319,21 @@ class App:
     def load_latest_preview(self):
         self.refresh_shots(newest=True)
 
+    def prefix_changed(self):
+        """Re-point the screenshot browser at the new prefix, once the typing has
+        stopped. It browses the files of one prefix, so renaming the run - typed
+        in the box or restored by a loaded setup - otherwise leaves it showing
+        the previous one's pictures until the next capture lands. Debounced: this
+        fires on every keystroke, and a refresh lists the folder and decodes and
+        rescales a PNG."""
+        if self.prefix_job is not None:
+            self.root.after_cancel(self.prefix_job)
+        self.prefix_job = self.root.after(400, self._prefix_settled)
+
+    def _prefix_settled(self):
+        self.prefix_job = None
+        self.refresh_shots(newest=True)
+
     def open_preview(self, _event=None):
         if not self.preview_path:
             self.log("That screenshot was not saved, so there is no file to open.")
@@ -1341,7 +1402,7 @@ class App:
         """Show the scope's screen without writing a file. Deliberately does not
         arm, stop or run the scope: it only asks for the rendered display, so a
         test in progress is left exactly as it was."""
-        if self.busy or not self.scope.inst:
+        if self.busy or self.seq_active or not self.scope.inst:
             return
         self.set_busy(True)
         threading.Thread(target=self._peek_worker, daemon=True).start()
@@ -1359,7 +1420,13 @@ class App:
             self.root.after(0, lambda: self.set_busy(False))
 
     def do_grab(self):
-        if self.busy or not self.scope.inst:
+        # seq_active as well as busy: between a sequence's runs nothing is busy,
+        # but the next run is already scheduled. GRAB is greyed out then and
+        # Space is not - it calls this directly, bypassing the button - so
+        # without the guard a space bar puts a second capture thread on the same
+        # VISA session as the run that is about to start, and the two of them
+        # interleave their SCPI and fight over seq_inflight and grab_wrote.
+        if self.busy or self.seq_active or not self.scope.inst:
             return
         chans = self.channels()
         if not chans:
@@ -1422,13 +1489,39 @@ class App:
             # Either way the wall-clock time is recorded inside the .txt file.
             tag = label or datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             base = os.path.join(outdir, f"{self.safe_prefix()}_{tag}")
-            if label is None:
-                # The timestamp only resolves to a second, so two grabs inside
-                # the same second would otherwise overwrite each other. Sequence
-                # labels have their own collision check in first_free().
-                base = free_base(base)
+            # Never write over a capture that is already there. A one-off's
+            # timestamp only resolves to a second, so two grabs inside the same
+            # second would collide; a sequence's labels are checked ahead of the
+            # run by first_free(), but the folder and the prefix can both be
+            # changed while one is going, so both paths come through here.
+            wanted, base = base, free_base(base)
+            if base != wanted:
+                self.log(f"  {os.path.basename(wanted)}.csv is already there - "
+                         f"writing {os.path.basename(base)}.csv instead")
 
             existing = self.use_existing.get()
+            # A channel the scope is not displaying has no record to hand over:
+            # :WAVeform:DATA? answers +109 "No Data For Operation" and the read
+            # then waits out the whole VISA timeout before failing with nothing
+            # in it that names the channel. Asked of the instrument rather than
+            # the panel, so a channel switched on at the front panel since the
+            # last read does not get a grab refused over a stale copy.
+            dark = []
+            for ch in chans:
+                try:
+                    if self.scope.get(f":CHANnel{ch}:DISPlay") in ("0", "OFF"):
+                        dark.append(ch)
+                except Exception:
+                    pass          # unanswerable is not the same as switched off
+            if dark:
+                one = len(dark) == 1
+                self.log(f"  {', '.join(f'CH{ch}' for ch in dark)} "
+                         f"{'is' if one else 'are'} switched off on the scope, so "
+                         f"there is nothing to read from {'it' if one else 'them'}"
+                         f" - nothing saved")
+                self.log("    turn the channel on under Display in the settings "
+                         "panel, or untick it under Channels")
+                return
             # Asked even for a use-existing grab: the read further down needs to
             # know whether it is looking at an averaged record, because those
             # only answer in the NORMal/MAXimum points modes.
@@ -1467,7 +1560,10 @@ class App:
                              "wait indefinitely")
                     self.scope.run()
                     return
-                if hits < avg_want:
+                if hits < 0:
+                    self.log("  ! the scope would not say how deep the average "
+                             "got - saving the trace it built anyway")
+                elif hits < avg_want:
                     self.log(f"  ! triggers dried up at {hits} of {avg_want} "
                              f"averages - saving the shallow trace they left")
             else:
@@ -1521,7 +1617,7 @@ class App:
             hits = self.scope.try_get(WAVE_COUNT)
             if hits is not None:
                 settings[WAVE_COUNT] = hits
-            self.report_averaging(settings)
+            self.report_averaging(settings, existing=existing)
             # The screenshot has to be taken before :RUN, while the captured
             # trace is still the one on screen.
             img = self.scope.screenshot() if self.save_png.get() else None
@@ -1539,7 +1635,12 @@ class App:
             self.log(f"{os.path.basename(csv_path)}  "
                      f"({data.shape[0]} pts x {data.shape[1]} cols)")
 
-            with open(base + ".txt", "w") as fh:
+            # utf-8 explicitly: the file records channel names exactly as typed,
+            # and the machine default here is cp1252, which cannot encode half
+            # of what a name in this lab has in it. Failing on one would abort
+            # the grab with the CSV already written and the run reported as
+            # having saved nothing.
+            with open(base + ".txt", "w", encoding="utf-8") as fh:
                 fh.write(self.scope.metadata(chans, settings, names, label, existing))
             self.grab_wrote = True
 
@@ -1579,12 +1680,22 @@ class App:
         finally:
             self.root.after(0, self.grab_done)
 
-    def report_averaging(self, settings):
-        """Averaging is the one setting where what was asked for and what the
-        trace actually got can differ without anything on the scope saying so.
-        A capture armed with :SINGle takes one acquisition; the average builds up
-        over successive triggers, so a grab can come back with a fraction of the
-        requested depth and still look like an averaged trace."""
+    def report_averaging(self, settings, existing=False):
+        """Record how deep the average in this trace actually is.
+
+        Averaging is the one setting where what was asked for and what the trace
+        got can differ with nothing on the scope saying so, and which of the two
+        the count describes depends on where the trace came from.
+
+        A trace this grab built is the honest case: Scope.accumulate counts the
+        triggers out with :DIGitize and the count reads true afterwards, and a
+        build that fell short has already been reported by the caller - so there
+        is nothing to warn about here and the depth is simply recorded.
+
+        A trace that was already on the scope is the other one. Under RUN the
+        averager is a running average and :WAVeform:COUNt reports the SETTING
+        rather than the accumulated depth, so neither a short count nor a full
+        one describes what is in the record."""
         if not settings.get(":ACQuire:TYPE", "").upper().startswith("AVER"):
             return
         try:
@@ -1594,12 +1705,17 @@ class App:
             self.log("  averaging: the scope would not say how many hits are in "
                      "this trace")
             return
-        if got < want:
-            self.log(f"  ! averaging: {got} of {want} hits in this trace")
-            self.log("    the trace is less averaged than the setting says - leave "
-                     "the scope running on more triggers to build the average up")
-        else:
-            self.log(f"  averaging: {got} hits")
+        if not existing:
+            self.log(f"  averaging: {got} hits" if got >= want
+                     else f"  averaging: {got} of {want} hits in this trace")
+            return
+        self.log(f"  ! averaging: the scope reports {got} of {want} hits")
+        self.log("    this trace was not built by this grab, so that count is "
+                 "not to be trusted: if the scope was running, it is the "
+                 "setting rather than the depth, and the record carries an "
+                 "exponential average of whatever played before")
+        self.log("    untick 'take the trace already on the scope' to have the "
+                 "average built and counted out instead")
 
     # -- settings panel ---------------------------------------------------
 
@@ -1791,7 +1907,7 @@ class App:
         through typing a change, and wrong when the edit is stale and what you
         want is the instrument's own state, which is the usual reason for
         pressing this. So it asks, rather than picking one for you."""
-        if self.busy or not self.scope.inst:
+        if self.busy or self.seq_active or not self.scope.inst:
             return
         pending = [scpi for scpi in self.set_marks if self.edited(scpi)]
         overwrite = False
@@ -1820,10 +1936,13 @@ class App:
         would reach for does nothing. Rather than a second button for the case,
         an empty Apply asks whether to send the panel as it stands - which is
         almost always why it was pressed with nothing marked."""
-        if self.busy or not self.scope.inst:
+        if self.busy or self.seq_active or not self.scope.inst:
             return
+        # Info rows are excluded the way panel_settings() and a saved setup
+        # exclude them: they are results rather than knobs, and writing one back
+        # would be a command at a read-only node.
         changes = {scpi: var.get().strip() for scpi, var in self.set_vars.items()
-                   if self.edited(scpi)}
+                   if self.set_kinds[scpi] != "info" and self.edited(scpi)}
         if not changes:
             self.offer_send_all()
             return
@@ -1858,7 +1977,7 @@ class App:
         knobs have been turned used to mean Read from scope - which overwrites
         the panel with the state you are trying to leave - then re-typing the
         old value from memory."""
-        if self.busy or not self.scope.inst:
+        if self.busy or self.seq_active or not self.scope.inst:
             return
         changes = self.panel_settings()
         if not changes:
@@ -1914,7 +2033,7 @@ class App:
     def do_action(self, scpi, note, confirm=None):
         """Run one of the scope's own buttons - run/stop/single, force trigger,
         clear display, autoscale."""
-        if self.busy or not self.scope.inst:
+        if self.busy or self.seq_active or not self.scope.inst:
             return
         if confirm and not messagebox.askyesno("Scope Grab", confirm, parent=self.root):
             self.log(f"  {scpi} cancelled")
@@ -1956,13 +2075,14 @@ class App:
             self.seq_next.set("next file: (runs and first label must be whole numbers)")
             return
         width = max(3, len(str(start + count - 1)))
-        first = self.first_free(start, width)
+        first = self.first_free(start, width, count)
         name = f"{self.safe_prefix()}_{first:0{width}d}.csv"
         # The First label box stays where it was put, so when a previous run has
         # already taken those labels the preview is the only thing that says the
         # sequence will start further along.
         self.seq_next.set(f"next file: {name}" if first == start else
-                          f"next file: {name}  (from {start:0{width}d} up already exist)")
+                          f"next file: {name}  ({count} runs from "
+                          f"{start:0{width}d} would land on files already there)")
 
     def do_sequence(self):
         if self.seq_active:
@@ -1998,12 +2118,13 @@ class App:
             self.log("Sequence: switched auto-grab off.")
 
         self.seq_width = max(3, len(str(start + count - 1)))
-        first = self.first_free(start, self.seq_width)
+        first = self.first_free(start, self.seq_width, count)
         if first != start:
             # Naming the labels rather than the whole filename keeps this on one
             # line whatever the prefix is.
-            self.log(f"Sequence: {start:0{self.seq_width}d}-{first - 1:0{self.seq_width}d} "
-                     f"already exist, starting at {first:0{self.seq_width}d}")
+            self.log(f"Sequence: {count} runs from {start:0{self.seq_width}d} would "
+                     f"land on files already there - starting at "
+                     f"{first:0{self.seq_width}d}, the first clear stretch")
         self.seq_index = first
         self.seq_last = first + count - 1
         self.seq_gap = max(0.0, gap)
@@ -2017,15 +2138,25 @@ class App:
                  f"{self.seq_gap:g} s apart")
         self.run_sequence_step()
 
-    def first_free(self, start, width):
-        """First label whose CSV does not exist yet, so a repeated sequence adds
-        to the series instead of overwriting it. This, rather than winding the
-        First label box on, is what stacks one sequence on the next."""
+    def first_free(self, start, width, count=1):
+        """First label from which `count` consecutive CSVs are all free, so a
+        repeated sequence adds to the series instead of overwriting it. This,
+        rather than winding the First label box on, is what stacks one sequence
+        on the next.
+
+        The whole run has to be clear, not just its first label. Stopping at the
+        first gap is what this used to do, and a series with a hole in it - one
+        bad run deleted - then started in the hole and wrote straight over
+        everything after it."""
         outdir, prefix = self.outdir.get(), self.safe_prefix()
+        taken = lambda i: os.path.exists(
+            os.path.join(outdir, f"{prefix}_{i:0{width}d}.csv"))
         i = start
-        while os.path.exists(os.path.join(outdir, f"{prefix}_{i:0{width}d}.csv")):
-            i += 1
-        return i
+        while True:
+            clash = next((j for j in range(i, i + max(1, count)) if taken(j)), None)
+            if clash is None:
+                return i
+            i = clash + 1
 
     def run_sequence_step(self):
         self.seq_job = None
@@ -2097,6 +2228,15 @@ class App:
         self.show_next_name()
 
     def toggle_auto(self):
+        if self.auto.get() and self.seq_active:
+            # Two repeating mechanisms at once would have both of them firing
+            # captures at one instrument. do_sequence switches auto off for the
+            # same reason when a sequence starts on top of it; this is the other
+            # order round. The checkbox is not one set_busy greys out, because
+            # it has to stay usable for switching auto-grab off mid-run.
+            self.auto.set(False)
+            self.log("Auto-grab: a sequence is running - stop that first.")
+            return
         if self.auto.get():
             self.schedule_auto()
         elif self.auto_job is not None:
@@ -2108,7 +2248,17 @@ class App:
             ms = max(1000, int(float(self.interval.get()) * 1000))
         except ValueError:
             ms = 10000
-        self.do_grab()
+        # A tick that cannot fire says so. do_grab returns silently when it is
+        # not in a position to run, so an interval shorter than a capture takes
+        # was dropping most of the ticks with nothing but the gaps in the series
+        # to show for it.
+        if not self.scope.inst:
+            self.log("Auto-grab: not connected, so this tick captured nothing.")
+        elif self.busy or self.seq_active:
+            self.log(f"Auto-grab: the last grab is still going, so this tick is "
+                     f"skipped - it needs more than {ms / 1000:g} s.")
+        else:
+            self.do_grab()
         self.auto_job = self.root.after(ms, self.schedule_auto)
 
     def on_close(self):
