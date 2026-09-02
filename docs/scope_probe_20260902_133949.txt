@@ -1,0 +1,187 @@
+scope probe - 2026-09-02T13:38:05
+
+========================================================================
+0. What is on the bus
+========================================================================
+  USB0::0x0957::0x1798::MY63080029::INSTR
+      AGILENT TECHNOLOGIES,MSO-X 2014A,MY63080029,02.65.2021030741
+  USB0::0xF4EC::0xEE38::574D22116::INSTR
+      BK,4063B,574D22116,2.01.01.35R3B2
+  USB0::0x1AB1::0x04CE::DS1ZA184752794::INSTR
+      RIGOL TECHNOLOGIES,DS1054Z,DS1ZA184752794,00.04.04.SP1
+
+  probing USB0::0x1AB1::0x04CE::DS1ZA184752794::INSTR
+
+  saved for restore: {':ACQuire:TYPE': 'NORM', ':ACQuire:AVERages': '1024', ':ACQuire:MDEPth': 'AUTO', ':TRIGger:SWEep': 'SING', ':TRIGger:MODE': 'EDGE', ':TRIGger:EDGe:SOURce': 'CHAN2', ':TRIGger:EDGe:LEVel': '0.000000e+00'}, running=True
+
+========================================================================
+1. Identity
+========================================================================
+  *IDN?  RIGOL TECHNOLOGIES,DS1054Z,DS1ZA184752794,00.04.04.SP1
+  error queue at start: empty
+
+========================================================================
+2. Settings the panel wants - which answer, and with what
+========================================================================
+Anything marked NO ANSWER cannot go in the profile as written.
+
+ timebase / acquisition
+  :TIMebase:MAIN:SCALe?   2.0000000e-05
+  :TIMebase:SCALe?        2.0000000e-05
+  :TIMebase:MAIN:OFFSet?  2.0000000e-05
+  :TIMebase:OFFSet?       2.0000000e-05
+  :TIMebase:MODE?         MAIN
+  :TIMebase:REFerence?    -- NO ANSWER (unsupported?)
+  :ACQuire:TYPE?          NORM
+  :ACQuire:AVERages?      1024
+  :ACQuire:COUNt?         -- NO ANSWER (unsupported?)
+  :ACQuire:SRATe?         5.000000e+08
+  :ACQuire:MDEPth?        AUTO
+  :ACQuire:POINts?        -- NO ANSWER (unsupported?)
+
+ trigger
+  :TRIGger:MODE?         EDGE
+  :TRIGger:SWEep?        SING
+  :TRIGger:COUPling?     DC
+  :TRIGger:HOLDoff?      8.500000e-08
+  :TRIGger:NREJect?      1
+  :TRIGger:STATus?       WAIT
+  :TRIGger:POSition?     -2
+  :TRIGger:EDGe:SOURce?  CHAN2
+  :TRIGger:EDGe:SLOPe?   POS
+  :TRIGger:EDGe:LEVel?   0.000000e+00
+  :TRIGger:EDGE:SOURce?  CHAN2
+  :TRIGger:EDGE:REJect?  -- NO ANSWER (unsupported?)
+
+ channel 2
+  :CHANnel2:SCALe?     2.000000e+00
+  :CHANnel2:OFFSet?    6.400000e-01
+  :CHANnel2:COUPling?  DC
+  :CHANnel2:PROBe?     1.000000e+00
+  :CHANnel2:UNITs?     VOLT
+  :CHANnel2:BWLimit?   OFF
+  :CHANnel2:INVert?    0
+  :CHANnel2:DISPlay?   1
+  :CHANnel2:VERNier?   0
+
+ memory depth: which values this scope will take with the current
+ channel count (the guide makes the list depend on channels on)
+  set AUTO     -> reads AUTO       
+  set 3000     -> reads AUTO       
+  set 6000     -> reads 6000       
+  set 12000    -> reads 6000       
+  set 30000    -> reads 6000       
+  set 120000   -> reads 6000       
+
+========================================================================
+2.5 Is anything triggering?
+========================================================================
+  sweep=SING  source=CHAN2  level=0.000000e+00  probing CHANnel2
+
+  channels the scope is showing:
+    CH1  on   2.000000e+00 V/div, offset -2.480000e+00
+    CH2  on   2.000000e+00 V/div, offset 6.400000e-01
+    CH3  off
+    CH4  off
+
+  --fix-trigger: pointing the trigger at the probed channel and
+  putting the sweep in AUTO, so a sweep arrives whatever the
+  signal does. Both are restored at the end.
+
+  watching :TRIGger:STATus? for 6 s:
+    AUTO
+    a NORMal read returns 1200 points, preamble points=1200
+    noise ruler on that trace: 0.0596334 V
+    trigger level set to the trace midpoint, 0.04 V, so a single shot can actually fire
+  -> triggering, and the trace has noise to measure. Good.
+
+========================================================================
+3. Waveform readout - which modes serve a record, and how big
+========================================================================
+Run state first, then after a :SINGle, because on the MSO-X those
+two records answer in different modes and that cost a release.
+
+ running: :TRIGger:STATus? = AUTO
+  NORMal   BYTE      1200 pts   preamble points=1200 count=1 yinc=8.000000e-02
+  NORMal   WORD      1200 pts   preamble points=1200 count=1 yinc=8.000000e-02
+  MAXimum  BYTE      1200 pts   preamble points=1200 count=1 yinc=8.000000e-02
+  MAXimum  WORD      1200 pts   preamble points=1200 count=1 yinc=8.000000e-02
+  RAW      BYTE      1200 pts   preamble points=1200 count=1 yinc=8.000000e-02
+  RAW      WORD      1200 pts   preamble points=1200 count=1 yinc=8.000000e-02
+  (no trigger within 10 s; sweep put back to AUTO)
+
+ after :SINGle: :TRIGger:STATus? = WAIT
+  NORMal   BYTE      1200 pts   preamble points=1200 count=1 yinc=8.000000e-02
+  NORMal   WORD      1200 pts   preamble points=1200 count=1 yinc=8.000000e-02
+  MAXimum  BYTE      1200 pts   preamble points=1200 count=1 yinc=8.000000e-02
+  MAXimum  WORD      1200 pts   preamble points=1200 count=1 yinc=8.000000e-02
+  RAW      BYTE      1200 pts   preamble points=1200 count=1 yinc=8.000000e-02
+  RAW      WORD      1200 pts   preamble points=1200 count=1 yinc=8.000000e-02
+
+ Does WORD carry more resolution than BYTE, or is it 8 bits padded?
+ The guide says the high byte is always 0; this is that claim tested.
+  BYTE: 2 distinct levels, smallest step 0.08 V
+  WORD: 2 distinct levels, smallest step 0.08 V
+  (same step in both = WORD buys nothing and BYTE halves the transfer)
+
+========================================================================
+4. Screenshot
+========================================================================
+  :DISPlay:DATA? ON,0,PNG       39119 bytes, PNG, 800x480
+  ^ this is the one for the profile
+
+========================================================================
+5. Averaging - the 64-deep behaviour, measured
+========================================================================
+Noise here is the std of the second difference of the trace, which
+ignores signal shape and falls as sqrt(N) with averaging depth. That
+is the ruler; the questions are what the scope does to it.
+
+  unaveraged noise ruler: 0.0591387 V
+  :ACQuire:AVERages 64 -> reads 64
+  :ACQuire:TYPE? -> AVER
+
+  Q1  Under RUN, does noise settle at sqrt(N) and the count stop?
+      (MSO-X: exponential running average, count reports the SETTING)
+      t=  1.1s  noise=0.0127996  ratio=  4.62  preamble count=64
+      t=  2.3s  noise=0.0125182  ratio=  4.72  preamble count=64
+      t=  3.4s  noise=0.0116334  ratio=  5.08  preamble count=64
+      t=  4.5s  noise=0.0116334  ratio=  5.08  preamble count=64
+      t=  5.7s  noise=0.0112442  ratio=  5.26  preamble count=64
+      t=  6.8s  noise=0.0121574  ratio=  4.86  preamble count=64
+      t=  8.0s  noise=0.0126597  ratio=  4.67  preamble count=64
+      t=  9.1s  noise=0.0126597  ratio=  4.67  preamble count=64
+      t= 10.3s  noise=0.0120839  ratio=  4.89  preamble count=64
+      t= 11.4s  noise=0.0119356  ratio=  4.95  preamble count=64
+      expected ratio at a true 64-deep average: 8.00
+
+  Q2  Does :CLEar restart the average, or does it survive?
+      (MSO-X: nothing reset it - not :CDISplay, not a stop/run cycle)
+      before :CLEar  noise=0.0129379
+      after  :CLEar  noise=0.0118608  count=64
+      -> survived (no reset)
+
+      and a stop/run cycle?
+      after stop/run noise=0.0118608  -> survived (no reset)
+
+  Q3  In averaging mode, does :SINGle build the full average or take
+      one hit? (MSO-X: one hit, while claiming the full depth)
+      after :SINGle  noise=0.0117097  ratio=5.05  count=64
+      ratio near 1.00 = one hit; near 8.00 = a real 64-deep average
+
+  Q4  Does :DIGitize exist here? (the MSO-X answer to all of the above)
+      :DIGitize -> -113,"Undefined header; keyword cannot be found"
+      :TRIGger:STATus? after it: AUTO
+
+========================================================================
+Restoring
+========================================================================
+  :ACQuire:TYPE <- NORM
+  :ACQuire:AVERages <- 1024
+  :ACQuire:MDEPth <- AUTO
+  :TRIGger:SWEep <- SING
+  :TRIGger:MODE <- EDGE
+  :TRIGger:EDGe:SOURce <- CHAN2
+  :TRIGger:EDGe:LEVel <- 0.000000e+00
+  :RUN
+  error queue at end: empty

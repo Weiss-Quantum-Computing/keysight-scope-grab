@@ -278,6 +278,40 @@ def phase_settings(p, say, chan):
         p.errors()
 
 
+def single_shot(p, say, wait_s=10.0):
+    """Arm one acquisition and wait, leaving the sweep mode as it was found.
+
+    MEASURED on a DS1054Z, 00.04.04.SP1: :SINGle here is not a one-shot arm the
+    way it is on an MSO-X. The guide says it plainly once you look for it - it
+    is "equivalent to ... sending the :TRIGger:SWEep SINGle command" - so it
+    changes a setting the front panel shows and leaves it changed. An earlier
+    version of this script sent it in two different phases and put it back in
+    neither, which parked the scope in single-sweep mode and made every phase
+    after it wait forever for a trigger that a stopped scope was never going to
+    produce.
+
+    Any profile built for this scope has to do the same save and restore around
+    its single(), or a capture will quietly rewrite the trigger setup.
+
+    Returns True if it triggered.
+    """
+    sweep = p.ask(":TRIGger:SWEep?")
+    p.send(":SINGle")
+    deadline = time.time() + wait_s
+    triggered = False
+    while time.time() < deadline:
+        if p.ask(":TRIGger:STATus?", 2000) == "STOP":
+            triggered = True
+            break
+        time.sleep(0.2)
+    if sweep:
+        p.send(f":TRIGger:SWEep {sweep}")
+        p.errors()
+    if not triggered:
+        say(f"  (no trigger within {wait_s:g} s; sweep put back to {sweep})")
+    return triggered
+
+
 def phase_trigger(p, say, chan, fix):
     """Is anything actually triggering? Returns True if the rest can proceed.
 
@@ -338,6 +372,15 @@ def phase_trigger(p, say, chan, fix):
         rough = p.roughness(v)
         say(f"    noise ruler on that trace: {rough:.6g} V")
         if np.isfinite(rough) and rough > 0:
+            if fix:
+                # A level the signal actually crosses, or :SINGle never fires
+                # and phase 3 learns nothing about a stopped record. The
+                # midpoint of what is on screen is the safe choice.
+                mid = float(np.median(v))
+                p.send(f":TRIGger:EDGe:LEVel {mid:.6e}")
+                p.errors()
+                say(f"    trigger level set to the trace midpoint, {mid:.4g} V,"
+                    f" so a single shot can actually fire")
             say("  -> triggering, and the trace has noise to measure. Good.")
             return True
         say("  !! a trace, but it is perfectly flat - nothing to measure.")
@@ -370,14 +413,7 @@ def phase_readout(p, say, chan):
             setup()
             time.sleep(1.0)
         else:
-            p.send(":SINGle")
-            deadline = time.time() + 10
-            while time.time() < deadline:
-                if p.ask(":TRIGger:STATus?", 2000) == "STOP":
-                    break
-                time.sleep(0.2)
-            else:
-                say("  (no trigger within 10 s - is a signal connected?)")
+            single_shot(p, say)
         say("")
         say(f" {state}: :TRIGger:STATus? = {p.ask(':TRIGger:STATus?')}")
         for mode in ("NORMal", "MAXimum", "RAW"):
@@ -514,12 +550,7 @@ def phase_averaging(p, say, chan, depth):
     p.send(":STOP")
     time.sleep(0.3)
     p.send(":CLEar")
-    p.send(":SINGle")
-    deadline = time.time() + 15
-    while time.time() < deadline:
-        if p.ask(":TRIGger:STATus?", 2000) == "STOP":
-            break
-        time.sleep(0.2)
+    single_shot(p, say, wait_s=15.0)
     time.sleep(0.5)
     _, v, pre = p.read_trace(chan, "NORMal")
     single = p.roughness(v)
@@ -606,9 +637,15 @@ def main():
     # Read back what we are about to disturb, so it can be put back. The
     # trigger settings are only in here when --fix-trigger will write them,
     # so a plain run cannot restore something it never touched.
-    wanted = [":ACQuire:TYPE", ":ACQuire:AVERages", ":ACQuire:MDEPth"]
+    # :TRIGger:SWEep is always in here, --fix-trigger or not: on a Rigol
+    # :SINGle *is* a sweep-mode write, so any run that arms a single shot has
+    # already changed it whether it meant to or not. single_shot() puts it back
+    # each time; this is the belt to that braces.
+    wanted = [":ACQuire:TYPE", ":ACQuire:AVERages", ":ACQuire:MDEPth",
+              ":TRIGger:SWEep"]
     if args.fix_trigger:
-        wanted += [":TRIGger:MODE", ":TRIGger:EDGe:SOURce", ":TRIGger:SWEep"]
+        wanted += [":TRIGger:MODE", ":TRIGger:EDGe:SOURce",
+                   ":TRIGger:EDGe:LEVel"]
     restore = {}
     for scpi in wanted:
         restore[scpi] = p.ask(scpi + "?")

@@ -1,0 +1,153 @@
+scope probe - 2026-09-02T13:34:35
+
+========================================================================
+0. What is on the bus
+========================================================================
+  USB0::0x0957::0x1798::MY63080029::INSTR
+      AGILENT TECHNOLOGIES,MSO-X 2014A,MY63080029,02.65.2021030741
+  USB0::0xF4EC::0xEE38::574D22116::INSTR
+      BK,4063B,574D22116,2.01.01.35R3B2
+  USB0::0x1AB1::0x04CE::DS1ZA184752794::INSTR
+      RIGOL TECHNOLOGIES,DS1054Z,DS1ZA184752794,00.04.04.SP1
+
+  probing USB0::0x1AB1::0x04CE::DS1ZA184752794::INSTR
+
+  saved for restore: {':ACQuire:TYPE': 'NORM', ':ACQuire:AVERages': '1024', ':ACQuire:MDEPth': 'AUTO', ':TRIGger:MODE': 'EDGE', ':TRIGger:EDGe:SOURce': 'CHAN2', ':TRIGger:SWEep': 'SING'}, running=True
+
+========================================================================
+1. Identity
+========================================================================
+  *IDN?  RIGOL TECHNOLOGIES,DS1054Z,DS1ZA184752794,00.04.04.SP1
+  error queue at start: empty
+
+========================================================================
+2. Settings the panel wants - which answer, and with what
+========================================================================
+Anything marked NO ANSWER cannot go in the profile as written.
+
+ timebase / acquisition
+  :TIMebase:MAIN:SCALe?   2.0000000e-05
+  :TIMebase:SCALe?        2.0000000e-05
+  :TIMebase:MAIN:OFFSet?  2.0000000e-05
+  :TIMebase:OFFSet?       2.0000000e-05
+  :TIMebase:MODE?         MAIN
+  :TIMebase:REFerence?    -- NO ANSWER (unsupported?)
+  :ACQuire:TYPE?          NORM
+  :ACQuire:AVERages?      1024
+  :ACQuire:COUNt?         -- NO ANSWER (unsupported?)
+  :ACQuire:SRATe?         5.000000e+08
+  :ACQuire:MDEPth?        AUTO
+  :ACQuire:POINts?        -- NO ANSWER (unsupported?)
+
+ trigger
+  :TRIGger:MODE?         EDGE
+  :TRIGger:SWEep?        SING
+  :TRIGger:COUPling?     DC
+  :TRIGger:HOLDoff?      8.500000e-08
+  :TRIGger:NREJect?      1
+  :TRIGger:STATus?       WAIT
+  :TRIGger:POSition?     -2
+  :TRIGger:EDGe:SOURce?  CHAN2
+  :TRIGger:EDGe:SLOPe?   POS
+  :TRIGger:EDGe:LEVel?   0.000000e+00
+  :TRIGger:EDGE:SOURce?  CHAN2
+  :TRIGger:EDGE:REJect?  -- NO ANSWER (unsupported?)
+
+ channel 2
+  :CHANnel2:SCALe?     2.000000e+00
+  :CHANnel2:OFFSet?    6.400000e-01
+  :CHANnel2:COUPling?  DC
+  :CHANnel2:PROBe?     1.000000e+00
+  :CHANnel2:UNITs?     VOLT
+  :CHANnel2:BWLimit?   OFF
+  :CHANnel2:INVert?    0
+  :CHANnel2:DISPlay?   1
+  :CHANnel2:VERNier?   0
+
+ memory depth: which values this scope will take with the current
+ channel count (the guide makes the list depend on channels on)
+  set AUTO     -> reads AUTO       
+  set 3000     -> reads AUTO       
+  set 6000     -> reads 6000       
+  set 12000    -> reads 6000       
+  set 30000    -> reads 6000       
+  set 120000   -> reads 6000       
+
+========================================================================
+2.5 Is anything triggering?
+========================================================================
+  sweep=SING  source=CHAN2  level=0.000000e+00  probing CHANnel2
+
+  channels the scope is showing:
+    CH1  on   2.000000e+00 V/div, offset -2.480000e+00
+    CH2  on   2.000000e+00 V/div, offset 6.400000e-01
+    CH3  off
+    CH4  off
+
+  --fix-trigger: pointing the trigger at the probed channel and
+  putting the sweep in AUTO, so a sweep arrives whatever the
+  signal does. Both are restored at the end.
+
+  watching :TRIGger:STATus? for 6 s:
+    AUTO
+    a NORMal read returns 1200 points, preamble points=1200
+    noise ruler on that trace: 0.0591838 V
+  -> triggering, and the trace has noise to measure. Good.
+
+========================================================================
+3. Waveform readout - which modes serve a record, and how big
+========================================================================
+Run state first, then after a :SINGle, because on the MSO-X those
+two records answer in different modes and that cost a release.
+
+ running: :TRIGger:STATus? = AUTO
+  NORMal   BYTE      1200 pts   preamble points=1200 count=1 yinc=8.000000e-02
+  NORMal   WORD      1200 pts   preamble points=1200 count=1 yinc=8.000000e-02
+  MAXimum  BYTE      1200 pts   preamble points=1200 count=1 yinc=8.000000e-02
+  MAXimum  WORD      1200 pts   preamble points=1200 count=1 yinc=8.000000e-02
+  RAW      BYTE      1200 pts   preamble points=1200 count=1 yinc=8.000000e-02
+  RAW      WORD      1200 pts   preamble points=1200 count=1 yinc=8.000000e-02
+  (no trigger within 10 s - is a signal connected?)
+
+ after :SINGle: :TRIGger:STATus? = WAIT
+  NORMal   BYTE         0 pts   preamble points=0 count=1 yinc=0.000000
+  NORMal   WORD         0 pts   preamble points=0 count=1 yinc=0.000000
+  MAXimum  BYTE         0 pts   preamble points=0 count=1 yinc=0.000000
+  MAXimum  WORD         0 pts   preamble points=0 count=1 yinc=0.000000
+  RAW      BYTE         0 pts   preamble points=0 count=1 yinc=0.000000
+  RAW      WORD         0 pts   preamble points=0 count=1 yinc=0.000000
+
+ Does WORD carry more resolution than BYTE, or is it 8 bits padded?
+ The guide says the high byte is always 0; this is that claim tested.
+  BYTE: 0 distinct levels, smallest step nan V
+  WORD: 0 distinct levels, smallest step nan V
+  (same step in both = WORD buys nothing and BYTE halves the transfer)
+
+========================================================================
+4. Screenshot
+========================================================================
+  :DISPlay:DATA? ON,0,PNG       35914 bytes, PNG, 800x480
+  ^ this is the one for the profile
+
+========================================================================
+5. Averaging - the 64-deep behaviour, measured
+========================================================================
+Noise here is the std of the second difference of the trace, which
+ignores signal shape and falls as sqrt(N) with averaging depth. That
+is the ruler; the questions are what the scope does to it.
+
+  unaveraged noise ruler: nan V
+  !! cannot measure noise - is there a live, triggering signal?
+     Every test below needs one. Stopping this phase.
+
+========================================================================
+Restoring
+========================================================================
+  :ACQuire:TYPE <- NORM
+  :ACQuire:AVERages <- 1024
+  :ACQuire:MDEPth <- AUTO
+  :TRIGger:MODE <- EDGE
+  :TRIGger:EDGe:SOURce <- CHAN2
+  :TRIGger:SWEep <- SING
+  :RUN
+  error queue at end: empty

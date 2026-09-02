@@ -105,6 +105,86 @@ useful about any of them.
    installed** — the MDEPth list depends on it.
 8. **PNG size**, for the preview box.
 
+## Measured on the bench, 2 Sep 2026
+
+DS1054Z, `DS1ZA184752794`, firmware **00.04.04.SP1**, over USB
+(`USB0::0x1AB1::0x04CE::DS1ZA184752794::INSTR`). Three runs of
+`tools/probe_scope.py`; reports on the Desktop as `scope_probe_2026*.txt`.
+
+### Settled
+
+1. **There is no `:DIGitize`.** It answers `-113,"Undefined header; keyword
+   cannot be found"`. The MSO-X `accumulate` is built entirely on it, so it
+   does not port - a Rigol `accumulate` is a different design, not a
+   translation.
+2. **`:SINGle` is a sweep-mode write, not a one-shot arm.** The guide says it
+   in passing (2-3): it is "equivalent to ... sending the `:TRIGger:SWEep
+   SINGle` command", and it leaves the sweep there afterwards. A capture that
+   arms a single shot therefore rewrites a trigger setting the front panel
+   shows as yours. **The profile must save and restore `:TRIGger:SWEep` around
+   `single()`.** Found the hard way: the probe did not, and parked the scope in
+   single-sweep mode, which made every phase after it wait forever.
+3. **All three readout modes serve, in both states.** `NORMal`, `MAXimum` and
+   `RAW` each returned 1200 points while running *and* after a stop, in BYTE
+   and WORD. Nothing like the MSO-X rule where a record stopped out of RUN
+   refuses RAW. So `transfer_plan` collapses to one mode for everything.
+4. **WORD buys nothing.** Same two distinct levels and the same 0.08 V step in
+   both formats, exactly as the guide claims (2-218). The profile reads BYTE
+   and halves the transfer.
+5. **`:CLEar` does not restart the average.** Noise did not jump back up after
+   it, and the preamble count stayed at the setting. The same trap as the
+   MSO-X, where `:CDISplay` did not reset either.
+6. **Screenshot:** `:DISPlay:DATA? ON,0,PNG` returns a 800x480 PNG, ~36-39 kB.
+7. **Memory-depth rejections are silent.** Of `AUTO/3000/6000/12000/30000/
+   120000`, only `AUTO` and `6000` took, and the rest left the value alone with
+   an **empty error queue** - no `-222`, nothing. The MSO-X would have
+   complained. `errors()` cannot be relied on to catch a bad depth here.
+8. **`:TRIGger:EDGE:...` - the Keysight capitalisation - is accepted**, since
+   SCPI header matching is case-insensitive and `EDGE` is the long form of the
+   Rigol's `EDGe`. So that root can be spelled the same in both profiles.
+   `:TRIGger:EDGE:REJect` still does not exist; it is `:TRIGger:COUPling`.
+
+### Not settled, because the signal was inadequate
+
+CH2 carried a DC level with about one LSB of dither - **two distinct ADC codes
+across the whole 1200-point trace** - and no edges. That is enough to prove a
+scope is alive and nowhere near enough to measure an averager.
+
+- **Does the averager run or block under RUN?** The noise ratio sat at 4.6-5.3
+  against an expected sqrt(64) = 8 and never climbed over 11 s. That is
+  consistent with a running average that had already converged before the first
+  read, and equally consistent with the ruler hitting the 8-bit readback floor.
+  Cannot separate the two on this signal.
+- **Does the preamble count report the setting or the accumulated depth?** It
+  read 64 from the first sample and never moved, including immediately after a
+  `:CLEar`. Suggestive of the setting, as on the MSO-X, but a fast free-running
+  AUTO sweep could have reached 64 hits inside the first second.
+- **What does `:SINGle` give in averaging mode?** Nothing measured: with no
+  edges the single shot never fired, so every "after `:SINGle`" reading is the
+  *previous* record being served again.
+- **Does a stop/run cycle reset it?** The reading afterwards was byte-identical
+  to the one before, so it was a stale record rather than a fresh sweep.
+
+### The one worth chasing
+
+The Rigol hands back 8-bit codes whatever the format. The MSO-X does not - its
+WORD readback carries a genuine 16x on an averaged record, which is why
+`read_waveform` uses WORD there. So an averaged Rigol record is **re-quantised
+to 8 bits on transfer**, and averaging may improve what is on the screen more
+than it improves what lands in the CSV.
+
+If that is right it matters for how this scope gets used, not just for the
+profile. It is inference from a two-level trace so far, and the next run should
+measure it directly: average depth against the number of distinct codes in the
+transferred record.
+
+### What the next run needs
+
+A real signal - edges to trigger on, and amplitude across a good part of the
+screen. The DS1054Z has one on its own front panel: the probe-compensation
+terminal, a 1 kHz square wave of about 3 Vpp. Clip the probed channel to it and
+every question above becomes answerable.
+
 ## Running the probe
 
 ```

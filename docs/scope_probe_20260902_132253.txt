@@ -1,0 +1,129 @@
+scope probe - 2026-09-02T13:21:29
+
+========================================================================
+0. What is on the bus
+========================================================================
+  USB0::0x0957::0x1798::MY63080029::INSTR
+      AGILENT TECHNOLOGIES,MSO-X 2014A,MY63080029,02.65.2021030741
+  USB0::0xF4EC::0xEE38::574D22116::INSTR
+      BK,4063B,574D22116,2.01.01.35R3B2
+  USB0::0x1AB1::0x04CE::DS1ZA184752794::INSTR
+      RIGOL TECHNOLOGIES,DS1054Z,DS1ZA184752794,00.04.04.SP1
+
+  probing USB0::0x1AB1::0x04CE::DS1ZA184752794::INSTR
+
+  saved for restore: {':ACQuire:TYPE': 'NORM', ':ACQuire:AVERages': '1024', ':ACQuire:MDEPth': 'AUTO'}, running=True
+
+========================================================================
+1. Identity
+========================================================================
+  *IDN?  RIGOL TECHNOLOGIES,DS1054Z,DS1ZA184752794,00.04.04.SP1
+  error queue at start: empty
+
+========================================================================
+2. Settings the panel wants - which answer, and with what
+========================================================================
+Anything marked NO ANSWER cannot go in the profile as written.
+
+ timebase / acquisition
+  :TIMebase:MAIN:SCALe?   2.0000000e-05
+  :TIMebase:SCALe?        2.0000000e-05
+  :TIMebase:MAIN:OFFSet?  2.0000000e-05
+  :TIMebase:OFFSet?       2.0000000e-05
+  :TIMebase:MODE?         MAIN
+  :TIMebase:REFerence?    -- NO ANSWER (unsupported?)
+  :ACQuire:TYPE?          NORM
+  :ACQuire:AVERages?      1024
+  :ACQuire:COUNt?         -- NO ANSWER (unsupported?)
+  :ACQuire:SRATe?         5.000000e+08
+  :ACQuire:MDEPth?        AUTO
+  :ACQuire:POINts?        -- NO ANSWER (unsupported?)
+
+ trigger
+  :TRIGger:MODE?         EDGE
+  :TRIGger:SWEep?        NORM
+  :TRIGger:COUPling?     DC
+  :TRIGger:HOLDoff?      8.500000e-08
+  :TRIGger:NREJect?      1
+  :TRIGger:STATus?       WAIT
+  :TRIGger:POSition?     -2
+  :TRIGger:EDGe:SOURce?  CHAN2
+  :TRIGger:EDGe:SLOPe?   POS
+  :TRIGger:EDGe:LEVel?   0.000000e+00
+  :TRIGger:EDGE:SOURce?  CHAN2
+  :TRIGger:EDGE:REJect?  -- NO ANSWER (unsupported?)
+
+ channel 1
+  :CHANnel1:SCALe?     2.000000e+00
+  :CHANnel1:OFFSet?    -2.480000e+00
+  :CHANnel1:COUPling?  DC
+  :CHANnel1:PROBe?     1.000000e+00
+  :CHANnel1:UNITs?     VOLT
+  :CHANnel1:BWLimit?   OFF
+  :CHANnel1:INVert?    0
+  :CHANnel1:DISPlay?   1
+  :CHANnel1:VERNier?   0
+
+ memory depth: which values this scope will take with the current
+ channel count (the guide makes the list depend on channels on)
+  set AUTO     -> reads AUTO       
+  set 3000     -> reads AUTO       
+  set 6000     -> reads 6000       
+  set 12000    -> reads 6000       
+  set 30000    -> reads 6000       
+  set 120000   -> reads 6000       
+
+========================================================================
+3. Waveform readout - which modes serve a record, and how big
+========================================================================
+Run state first, then after a :SINGle, because on the MSO-X those
+two records answer in different modes and that cost a release.
+
+ running: :TRIGger:STATus? = WAIT
+  NORMal   BYTE         0 pts   preamble points=0 count=1 yinc=0.000000
+  NORMal   WORD         0 pts   preamble points=0 count=1 yinc=0.000000
+  MAXimum  BYTE         0 pts   preamble points=0 count=1 yinc=0.000000
+  MAXimum  WORD         0 pts   preamble points=0 count=1 yinc=0.000000
+  RAW      BYTE         0 pts   preamble points=0 count=1 yinc=0.000000
+  RAW      WORD         0 pts   preamble points=0 count=1 yinc=0.000000
+  (no trigger within 10 s - is a signal connected?)
+
+ after :SINGle: :TRIGger:STATus? = WAIT
+  NORMal   BYTE         0 pts   preamble points=0 count=1 yinc=0.000000
+  NORMal   WORD         0 pts   preamble points=0 count=1 yinc=0.000000
+  MAXimum  BYTE         0 pts   preamble points=0 count=1 yinc=0.000000
+  MAXimum  WORD         0 pts   preamble points=0 count=1 yinc=0.000000
+  RAW      BYTE         0 pts   preamble points=0 count=1 yinc=0.000000
+  RAW      WORD         0 pts   preamble points=0 count=1 yinc=0.000000
+
+ Does WORD carry more resolution than BYTE, or is it 8 bits padded?
+ The guide says the high byte is always 0; this is that claim tested.
+  BYTE: 0 distinct levels, smallest step nan V
+  WORD: 0 distinct levels, smallest step nan V
+  (same step in both = WORD buys nothing and BYTE halves the transfer)
+
+========================================================================
+4. Screenshot
+========================================================================
+  :DISPlay:DATA? ON,0,PNG       35914 bytes, PNG, 800x480
+  ^ this is the one for the profile
+
+========================================================================
+5. Averaging - the 64-deep behaviour, measured
+========================================================================
+Noise here is the std of the second difference of the trace, which
+ignores signal shape and falls as sqrt(N) with averaging depth. That
+is the ruler; the questions are what the scope does to it.
+
+  unaveraged noise ruler: nan V
+  !! cannot measure noise - is there a live, triggering signal?
+     Every test below needs one. Stopping this phase.
+
+========================================================================
+Restoring
+========================================================================
+  :ACQuire:TYPE <- NORM
+  :ACQuire:AVERages <- 1024
+  :ACQuire:MDEPth <- AUTO
+  :RUN
+  error queue at end: empty

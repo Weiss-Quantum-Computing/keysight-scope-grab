@@ -5,6 +5,10 @@ scope_data/
 *.txt
 # ...except the test goldens, which are expected output rather than captured data
 !tests/golden/*.txt
+# ...and the probe reports, which are the evidence the profile notes rest on.
+# A claim about what an instrument does is worth what the transcript behind it
+# is worth, so the transcripts live next to the claims.
+!docs/*.txt
 
 # Python
 __pycache__/
