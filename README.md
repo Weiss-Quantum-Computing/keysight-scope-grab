@@ -1,8 +1,11 @@
 # Scope Grab
 
-One-click waveform capture from a Keysight InfiniiVision MSO-X 2014A oscilloscope.
-No BenchVue, no instrument-control licences - just PyVISA over the rear-panel USB-B
-port.
+One-click waveform capture from a bench oscilloscope. No BenchVue, no
+instrument-control licences - just PyVISA over the rear-panel USB-B port.
+
+Which scope it drives is set by a **profile**. One is written today, for the
+Keysight InfiniiVision MSO-X 2014A; see [Instrument
+profiles](#instrument-profiles) for what a second one has to supply.
 
 Press GRAB (or the space bar) and you get, in your chosen folder:
 
@@ -17,7 +20,9 @@ a run is still going - see [Watching a run come in](#watching-a-run-come-in).
 
 ## Requirements
 
-- [Keysight IO Libraries Suite](https://www.keysight.com/find/iosuite) (provides the VISA layer)
+- A VISA layer. The MSO-X profile asks for
+  [Keysight IO Libraries Suite](https://www.keysight.com/find/iosuite) by name and
+  falls back to whatever PyVISA finds.
 - Python 3.9+
 - `pip install pyvisa numpy pillow`
 
@@ -30,8 +35,14 @@ it the preview falls back to Tk's integer subsample.
 pythonw scope_grab.py
 ```
 
-`pythonw` keeps the console window from appearing. The app auto-connects to the first
-Keysight/Agilent USB instrument it finds; hit **Connect** to retry.
+`pythonw` keeps the console window from appearing. `scope_profiles.py` has to sit
+beside it - the two files travel together.
+
+The app auto-connects to the first instrument matching the current profile; hit
+**Connect** to retry. A device that answers but is not the profile's is reported
+rather than passed over in silence, and if it turns out to be a scope another
+profile would have handled, the error says which - having the wrong model
+selected otherwise looks exactly like an unplugged cable.
 
 - **Channels** - tick the channels to capture and optionally name each one. Each
   ticked channel becomes a column in the CSV.
@@ -361,6 +372,12 @@ working.
 Files are named `<prefix>_<timestamp>.json`, with a readable `.txt` beside it -
 the `.json` is what loads back, the `.txt` is what goes in the notebook.
 
+A setup records the scope model it was saved for. Its settings are that model's
+SCPI roots, so loading one onto a different scope is refused outright rather than
+half-applied - the panel would otherwise fill with fields the instrument in front
+of you does not have, counted as loaded, marked as edits, and unsendable. Setups
+written before profiles existed carry no model and load as they always did.
+
 The **Prefix** box in that window is its own, separate from the capture filename
 prefix and defaulting to `setup`. They used to be one box, which meant renaming a
 run renamed the setups with it, and a setup saved while working under one
@@ -496,8 +513,8 @@ again.
 
 ## Remembered settings
 
-The output folder, the setups folder and setup prefix, filename prefix, channel
-names, which
+The scope model, the output folder, the setups folder and setup prefix, filename
+prefix, channel names, which
 channels are ticked, the trigger wait, the transfer point count, the three
 sequence boxes - runs, interval and first label - the auto-grab interval and
 whether screenshots are saved are written to
@@ -513,6 +530,7 @@ touch it.
 
 ```json
 {
+  "model": "msox2014a",
   "outdir": "C:\\Users\\you\\Desktop\\scope_data",
   "setup_dir": "C:\\Users\\you\\Desktop\\scope_setups",
   "setup_prefix": "EOM ramps",
@@ -535,6 +553,10 @@ surviving a restart would have the app capturing, or saving a stale trace as a n
 one, before anyone had looked at what the scope was set to. Both start off every
 time.
 
+`model` is read before the window is built, because the settings panel is laid
+out from the profile it names. A model this version does not have falls back to
+the default one and says so in the log, rather than refusing to start.
+
 Delete the file to go back to defaults. A missing, truncated or malformed file is
 ignored - each value falls back to its default independently, and the log notes
 when a file could not be read, so a bad config can never stop the app from
@@ -547,6 +569,45 @@ pick it. The capture-side fields they have in common are stored under the same
 keys and restored by the same code, so a setup recalls them the way a new
 session does - except for the output folder, which a setup deliberately leaves
 alone.
+
+## Instrument profiles
+
+`scope_profiles.py` holds one profile per scope family. `scope_grab.py` holds
+the window, the capture and sequence logic and the files that come out, and
+never names a SCPI command - the single exception is `:SYSTem:ERRor?`, which
+SCPI itself mandates rather than a manufacturer choosing it.
+
+A profile supplies:
+
+| | |
+|---|---|
+| **Identity** | `*IDN?` substrings to match, which VISA resource prefixes to scan, a VISA implementation to prefer, the channel list, the screenshot size |
+| **Settings tables** | timebase, trigger and per-channel rows - the panel is laid out from these, and so are the setup `.txt` and the metadata file |
+| **Named roots** | acquisition type, average count, per-channel display flag, hit count; the few things the capture path has to ask for by name rather than find in a table |
+| **Metadata layout** | which rows the `.txt` carries, in file order |
+| **Behaviour** | `running`, `accumulate`, `read_waveform`, `screenshot`, `transfer_plan` - the operations two scopes *do* differently rather than merely spell differently |
+
+The base class deliberately holds almost no defaults. With one profile written,
+anything put there would be a guess about what a second scope shares; what turns
+out to be common can move up when there is a second one to compare against.
+
+The same rule applies to the notes. Everything a profile records about an
+instrument was established against that instrument, so it stays with the code it
+describes - the running-averager and `:DIGitize` findings under
+[Averaging](#averaging) are facts about an MSO-X, not about oscilloscopes.
+
+### Adding a scope
+
+Adding one means writing a subclass and registering it in `PROFILES`. The tables
+are mechanical - a programming guide gets you those. The five behaviour methods
+are not, and are where the work is: what the averager does under RUN, whether
+anything resets it, whether the hit count reports the setting or the depth, and
+which points modes will serve a record stopped one way rather than another are
+all things this program got wrong until they were measured on the bench.
+
+Selecting a model is a config key today (`"model"` above), because with one
+profile there is nothing to choose between. It becomes a control in the window
+when there is a second one.
 
 ## Notes on acquisition
 

@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """
-Scope Grab - one-click capture from a Keysight InfiniiVision MSO-X 2014A.
+Scope Grab - one-click capture from a bench oscilloscope.
 
 Click a button, get a timestamped CSV of the waveform, a PNG of the screen,
 and a metadata text file in your chosen folder. No licenses, no BenchVue.
 
-Requires: Keysight IO Libraries Suite + `pip install pyvisa numpy pillow`
+Which scope it is talking to lives in scope_profiles.py, one profile per
+instrument family. This file holds everything that does not depend on that:
+the window, the capture and sequence logic, and the files that come out.
+
+Requires: a VISA runtime + `pip install pyvisa numpy pillow`
+          (Keysight IO Libraries Suite for the MSO-X; see the profile)
           (pillow only sharpens the screenshot preview - the rest works without it)
 Run with:  pythonw scope_grab.py      (pythonw = no console window)
 """
@@ -24,12 +29,13 @@ from tkinter import filedialog, messagebox, ttk
 import numpy as np
 import pyvisa
 
+import scope_profiles
+
 try:
     from PIL import Image, ImageTk        # smooth (Lanczos) preview rescale
 except ImportError:                       # without pillow: Tk's integer subsample
     Image = ImageTk = None
 
-KTVISA = r"C:\Windows\System32\ktvisa32.dll"
 # Remembered between sessions: output folder, filename prefix, channel names.
 # Kept out of the program folder so a git pull cannot clobber it.
 CONFIG_PATH = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"),
@@ -49,10 +55,6 @@ SETUP_DIR = os.path.join(os.path.expanduser("~"), "Desktop", "scope_setups")
 TIME_FMT = "%.9e"
 VOLT_FMT = "%.6e"
 
-# Screenshot preview box, sized to fill the panel width. The scope sends
-# 800x503 PNGs, which fit this at ~72%.
-PREVIEW_W, PREVIEW_H = 576, 362
-
 # Widgets that already use Space themselves. Space is only the GRAB shortcut
 # when the focus is not sitting on one of these - otherwise typing a space in
 # the prefix box (or toggling a focused checkbox) would fire an acquisition.
@@ -64,90 +66,11 @@ SPACE_OWNERS = {
 
 BAD_NAME_CHARS = r'<>:"/\|?*'
 
-# Settings the panel shows and can push back. Each entry is
-# (label, SCPI root, kind, choices); the root is queried as "<root>?" and
-# written as "<root> <value>", and doubles as the dict key.
-#   num    - free-form number
-#   choice - fixed list, scope answers with the same mnemonics
-#   bool   - fixed list, but the scope answers 1/0
-TIMEBASE_SETTINGS = [
-    ("Timebase s/div", ":TIMebase:SCALe", "num", None),
-    ("Position (s)", ":TIMebase:POSition", "num", None),
-    ("Reference", ":TIMebase:REFerence", "choice", ("LEFT", "CENT", "RIGH")),
-    ("Sweep mode", ":TIMebase:MODE", "choice", ("MAIN", "WIND", "XY", "ROLL")),
-    ("Acquisition", ":ACQuire:TYPE", "choice", ("NORM", "AVER", "HRES", "PEAK")),
-    ("Averages", ":ACQuire:COUNt", "num", None),
-]
-TRIGGER_SETTINGS = [
-    ("Type", ":TRIGger:MODE", "choice",
-     ("EDGE", "GLIT", "PATT", "TV", "EBUR", "OR", "RUNT", "SHOL", "TRAN", "DEL")),
-    ("Sweep", ":TRIGger:SWEep", "choice", ("AUTO", "NORM")),
-    ("Source", ":TRIGger:EDGE:SOURce", "choice",
-     ("CHAN1", "CHAN2", "CHAN3", "CHAN4", "EXT", "LINE", "WGEN")),
-    ("Level (V)", ":TRIGger:EDGE:LEVel", "num", None),
-    ("Slope", ":TRIGger:EDGE:SLOPe", "choice", ("POS", "NEG", "EITH", "ALT")),
-    ("Reject", ":TRIGger:EDGE:REJect", "choice", ("OFF", "LFR", "HFR")),
-    ("Noise reject", ":TRIGger:NREJect", "bool", ("ON", "OFF")),
-    ("Holdoff (s)", ":TRIGger:HOLDoff", "num", None),
-]
-# Writes that have to land before others in the same Apply. The average count is
-# ignored unless the acquisition type is already AVERage, and the edge fields
-# belong to a trigger type that has to be selected first. Everything else is
-# written afterwards, in panel order.
-WRITE_FIRST = (":ACQuire:TYPE", ":TRIGger:MODE", ":TIMebase:MODE")
-# Fields the instrument only acts on in a particular mode. The panel greys the
-# others out rather than letting a value the scope is ignoring look live.
-# {field: (field that decides it, mnemonics that make it live)}
-DEPENDS_ON = {
-    ":ACQuire:COUNt": (":ACQuire:TYPE", ("AVER",)),
-    ":TRIGger:EDGE:SOURce": (":TRIGger:MODE", ("EDGE",)),
-    ":TRIGger:EDGE:LEVel": (":TRIGger:MODE", ("EDGE",)),
-    ":TRIGger:EDGE:SLOPe": (":TRIGger:MODE", ("EDGE",)),
-    ":TRIGger:EDGE:REJect": (":TRIGger:MODE", ("EDGE",)),
-}
-# One-shot commands: (button, SCPI, what to log, confirmation text or None).
-# They carry no value and there is nothing to read back, so they are not part of
-# the settings snapshot - the panel is re-read afterwards instead.
-ACTIONS = [
-    ("Run", ":RUN", "running continuously", None),
-    ("Stop", ":STOP", "stopped", None),
-    ("Single", ":SINGle", "armed for one trigger", None),
-    ("Force trig", ":TRIGger:FORCe", "trigger forced", None),
-    ("Clear", ":CDISplay",
-     "display cleared - averaging and persistence start over", None),
-    ("Autoscale", ":AUToscale", "autoscaled",
-     "Autoscale rewrites the timebase and every channel's V/div and offset "
-     "from whatever signal it finds, discarding the current setup.\n\nGo ahead?"),
-]
-# Read-only values, refreshed on the same pass as the settings above. They are
-# per-acquisition results rather than knobs, so the panel shows them but never
-# writes them.
-INFO_SETTINGS = [
-    ("Sample rate (Sa/s)", ":ACQuire:SRATe"),
-    ("Points acquired", ":ACQuire:POINts"),
-]
-# How many hits are in the trace being read out. In AVERage mode that is the
-# averaging depth the capture actually got, which is not the same thing as the
-# count that was asked for - and nothing on the scope's own screen distinguishes
-# the two. It has no field of its own; it is folded into the grab's snapshot for
-# the metadata file.
-#
-# Not part of a normal settings read: it describes a record rather than a
-# setting, and with acquisition memory empty - straight after an acquisition
-# type change, for one - the scope raises +109,"No Data For Operation" instead
-# of answering, leaving the query unterminated and the read waiting out the VISA
-# timeout. It is only ever asked where a record is known to exist.
-WAVE_COUNT = ":WAVeform:COUNt"
-CHANNEL_SETTINGS = [
-    ("V/div", ":CHANnel{ch}:SCALe", "num", None),
-    ("Offset", ":CHANnel{ch}:OFFSet", "num", None),
-    ("Coupling", ":CHANnel{ch}:COUPling", "choice", ("AC", "DC")),
-    ("Probe", ":CHANnel{ch}:PROBe", "num", None),
-    ("Units", ":CHANnel{ch}:UNITs", "choice", ("VOLT", "AMP")),
-    ("BW lim", ":CHANnel{ch}:BWLimit", "bool", ("ON", "OFF")),
-    ("Invert", ":CHANnel{ch}:INVert", "bool", ("ON", "OFF")),
-    ("Display", ":CHANnel{ch}:DISPlay", "bool", ("ON", "OFF")),
-]
+# The settings tables, the SCPI roots the capture path asks for by name, and
+# the operations that differ from one instrument to the next all live in
+# scope_profiles.py - one profile per scope family. The panel is laid out from
+# whichever profile is in force, so a second instrument is a second profile
+# rather than a second copy of this file.
 
 
 def safe_column(name):
@@ -171,6 +94,21 @@ def free_base(base):
     return f"{base}_{n}"
 
 
+def read_config():
+    """The session config as a plain dict, or {} when there is not one to read.
+
+    Called once before the window is built, because the scope model decides how
+    the panel is laid out and so has to be known first. load_config does its own
+    read afterwards for everything else - it reports what it could not use, and
+    this one stays quiet because there is nowhere to report to yet."""
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as fh:
+            cfg = json.load(fh)
+        return cfg if isinstance(cfg, dict) else {}
+    except Exception:
+        return {}
+
+
 def fmt_setting(kind, raw):
     """Normalise a scope reply into what the panel displays."""
     raw = raw.strip()
@@ -191,24 +129,14 @@ def fmt_setting(kind, raw):
 # Instrument layer
 # ---------------------------------------------------------------------------
 
-def setting_groups():
-    """(group title, [(label, scpi root)]) in panel order. What a saved setup's
-    .txt companion is laid out from."""
-    groups = [("Timebase / acquisition",
-               [(lbl, scpi) for lbl, scpi, _, _ in TIMEBASE_SETTINGS]),
-              ("Trigger",
-               [(lbl, scpi) for lbl, scpi, _, _ in TRIGGER_SETTINGS])]
-    for ch in (1, 2, 3, 4):
-        groups.append((f"CH{ch}", [(lbl, tmpl.format(ch=ch))
-                                   for lbl, tmpl, _, _ in CHANNEL_SETTINGS]))
-    return groups
-
-
-def describe_setup(cfg):
+def describe_setup(cfg, prof):
     """The .txt written beside a saved setup: the same numbers, laid out to be
     read in a lab notebook rather than parsed. The .json is the one that gets
-    loaded back."""
+    loaded back. `prof` supplies the group order and the labels, so the file
+    names what the scope it was saved from actually has."""
     lines = [f"Scope Grab setup - saved {cfg.get('saved', '?')}"]
+    if cfg.get("model"):
+        lines.append(f"Scope model: {cfg['model']}")
     if cfg.get("instrument"):
         lines.append(f"Instrument: {cfg['instrument']}")
     if cfg.get("read_stamp"):
@@ -223,7 +151,7 @@ def describe_setup(cfg):
         lines.append("was on screen, not what the scope had:")
         lines += [f"    {scpi}" for scpi in pending]
     settings = cfg.get("settings") or {}
-    for title, items in setting_groups():
+    for title, items in prof.setting_groups():
         rows = [(lbl, settings[scpi]) for lbl, scpi in items if scpi in settings]
         if not rows:
             continue
@@ -248,25 +176,33 @@ def describe_setup(cfg):
                          f"{'yes' if grab.get('save_png') else 'no'}")
         names = grab.get("channel_names") or {}
         ticked = grab.get("channels") or {}
-        for ch in ("1", "2", "3", "4"):
-            lines.append(f"  CH{ch} {'on ' if ticked.get(ch) else 'off'}"
-                         f"  {names.get(ch, '')}".rstrip())
+        for ch in prof.channels:
+            lines.append(f"  CH{ch} {'on ' if ticked.get(str(ch)) else 'off'}"
+                         f"  {names.get(str(ch), '')}".rstrip())
     return "\n".join(lines) + "\n"
 
 
 class Scope:
-    def __init__(self):
+    """The instrument, as the panel sees it.
+
+    Everything that differs between scopes is asked of the profile; what is left
+    here is the same whichever one is plugged in. Nothing above this class knows
+    a SCPI string."""
+
+    def __init__(self, prof):
+        self.prof = prof
         self.rm = None
         self.inst = None
         self.idn = ""
         self.addr = ""
 
     def _make_rm(self):
-        # Prefer Keysight VISA explicitly so a primary/secondary VISA mixup
-        # with NI-VISA can't break us.
-        if os.path.exists(KTVISA):
+        # A profile may name a VISA implementation to prefer, so a
+        # primary/secondary mixup between two of them cannot break us.
+        dll = self.prof.visa_dll
+        if dll and os.path.exists(dll):
             try:
-                rm = pyvisa.ResourceManager(KTVISA)
+                rm = pyvisa.ResourceManager(dll)
                 rm.list_resources()
                 return rm
             except Exception:
@@ -274,12 +210,20 @@ class Scope:
         return pyvisa.ResourceManager()
 
     def connect(self, addr=None):
+        """Find and open the instrument this profile describes.
+
+        A device that answers but is not this profile's is not silently passed
+        over: its *IDN? is kept, and if it turns out to be a scope one of the
+        other profiles would have handled, the error says so. Having the wrong
+        model selected otherwise looks exactly like an unplugged cable."""
         self.close()
         self.rm = self._make_rm()
         if addr:
             candidates = [addr]
         else:
-            candidates = [r for r in self.rm.list_resources() if r.startswith("USB")]
+            candidates = [r for r in self.rm.list_resources()
+                          if r.startswith(tuple(self.prof.resource_hints))]
+        seen = []
         for res in candidates:
             dev = None
             try:
@@ -299,14 +243,28 @@ class Scope:
                     except Exception:
                         pass
                 continue
-            if "KEYSIGHT" in idn.upper() or "AGILENT" in idn.upper():
-                dev.timeout = 30000
-                dev.chunk_size = 1024 * 1024
+            if self.prof.matches(idn):
+                self.prof.open(dev)
                 self.inst, self.idn, self.addr = dev, idn, res
                 return idn
+            seen.append(idn)
             dev.close()
-        raise RuntimeError("No Keysight USB instrument found. Check the rear-panel "
-                           "USB-B cable and that Connection Expert sees the scope.")
+        raise RuntimeError(self._nothing_found(seen))
+
+    def _nothing_found(self, seen):
+        """What to say when no instrument matched, including what did answer."""
+        msg = (f"No {self.prof.name} found. Check the rear-panel USB-B cable and "
+               f"that Connection Expert sees the scope.")
+        for idn in seen:
+            other = next((p for p in scope_profiles.PROFILES.values()
+                          if p is not self.prof and p.matches(idn)), None)
+            if other is not None:
+                return (f"{msg}\n\nA {other.name} answered instead:\n{idn}\n\n"
+                        f"That is a scope this program handles - it is the panel "
+                        f"that is set to {self.prof.name}.")
+        if seen:
+            return f"{msg}\n\nWhat did answer: " + "; ".join(seen)
+        return msg
 
     def close(self):
         for obj in (self.inst, self.rm):
@@ -326,9 +284,9 @@ class Scope:
     def single(self, wait_s=10.0, cancelled=None):
         """Arm a single acquisition and wait for it to complete.
 
-        Uses :SINGle rather than :DIGitize so the captured trace stays on the
-        scope display - which matters if you also want the screenshot to match
-        the data.
+        Arms rather than digitizes, so the captured trace stays on the scope
+        display - which matters if you also want the screenshot to match the
+        data.
 
         wait_s <= 0 waits indefinitely, which is how a capture is primed before
         an experiment running elsewhere starts sending triggers. `cancelled` is
@@ -337,17 +295,16 @@ class Scope:
         Returns True if it triggered, False on timeout, None if cancelled, and
         raises if the scope stops answering the poll.
         """
-        self.inst.write(":SINGle")
+        self.inst.write(self.prof.cmd_single)
         started = time.time()
         deadline = None if wait_s <= 0 else started + wait_s
         bad_polls = 0
         while deadline is None or time.time() < deadline:
             if cancelled is not None and cancelled():
-                self.inst.write(":STOP")
+                self.inst.write(self.prof.cmd_stop)
                 return None
             try:
-                # Bit 3 of the Operation Status Condition register is the Run bit.
-                cond = int(self.inst.query(":OPERegister:CONDition?"))
+                running = self.prof.running(self)
                 bad_polls = 0
             except Exception:
                 # A poll that failed is not a trigger that arrived. Give the
@@ -361,46 +318,27 @@ class Scope:
                     time.sleep(0.25)
                     continue
                 try:
-                    self.inst.write(":STOP")
+                    self.inst.write(self.prof.cmd_stop)
                 except Exception:
                     pass
                 raise
-            if not (cond & 8):
+            if not running:
                 return True
             # Poll hard at first for a quick handoff, then back off: a wait of
             # minutes should not hammer the USB link 20 times a second.
             time.sleep(0.05 if time.time() - started < 2.0 else 0.25)
-        self.inst.write(":STOP")
+        self.inst.write(self.prof.cmd_stop)
         return False
 
     def accumulate(self, count, wait_s=10.0, cancelled=None, progress=None,
                    source=1):
-        """Acquire a true `count`-deep average, on hardware where nothing else is.
+        """Acquire a true `count`-deep average and report how deep it got.
 
-        Established against the MSO-X 2014A (firmware 2.65) on 2026-08-24:
-
-        * :SINGle takes exactly one acquisition (an averaged single-shot grab
-          claims the full depth while carrying one hit).
-        * Under plain RUN the averager is a RUNNING average - each sweep folds
-          in with weight 1/N, so the record carries an exponential memory with
-          time constant N trigger periods of whatever played before, and a
-          full-scale change takes ~8 of those time constants to fade from the
-          trace. Nothing resets it: not :CDISplay, not rewriting the count,
-          not a stop/run cycle. Worse, :WAVeform:COUNt reports the SETTING
-          rather than the accumulated depth the moment RUN is involved, so a
-          poll declares a contaminated average complete immediately.
-        * :DIGitize is the one honest acquisition: it starts a fresh block,
-          counts out exactly `count` triggers, stops itself, and afterwards
-          the count reads true. Its record - like any record not stopped by
-          :SINGle - answers only in the NORMal/MAXimum points modes; asking in
-          RAW gets +109 "No Data For Operation" and nothing else.
-
-        So: :DIGitize, with nothing in the waveform subsystem queried while it
-        builds (those queries fail, and the device-clear recovery inside
-        try_get can abort the acquisition being asked about). Completion is
-        watched on the run bit and trigger liveness on :TER?, both answerable
-        mid-acquisition. The hit count is read once at the end, in a mode the
-        scope will serve.
+        How that is done is the profile's business. What the averager does under
+        RUN, whether anything resets it, which command builds a block that can
+        be counted afterwards and whether the resulting count can be trusted are
+        all per-instrument, and were established by measurement rather than from
+        a programming guide - the MSO-X notes are on KeysightInfiniiVision.
 
         wait_s is a STALL limit on the trigger: it restarts on every trigger
         event, so a deep average is allowed its many periods while a dead
@@ -410,62 +348,19 @@ class Scope:
 
         Returns `count` on success, fewer if the triggers dried up, 0 if none
         ever came, -1 if a record was built but the scope would not say how deep
-        it is, None if cancelled. In every case but None the scope holds a
-        stopped record readable in MAXimum mode (see the worker's read).
+        it is, None if cancelled. In every case but None the scope is left
+        holding a stopped record that the transfer which follows can read.
         """
-        self.inst.query("*OPC?")          # settings writes land before arming
-        self.inst.query(":TER?")          # clear the event register of history
-        self.inst.write(":DIGitize")
-        started = time.time()
-        alive = started
-        bad_polls = 0
-        completed = False     # the run bit cleared on its own = the full count
-        while True:
-            time.sleep(0.4)
-            if cancelled is not None and cancelled():
-                self.inst.write(":STOP")
-                return None
-            try:
-                # Bit 3 of the Operation Status Condition register is Run.
-                running = bool(int(self.inst.query(":OPERegister:CONDition?")) & 8)
-                if running and int(self.inst.query(":TER?")):
-                    alive = time.time()
-                bad_polls = 0
-            except Exception:
-                bad_polls += 1
-                if bad_polls < 3:
-                    continue
-                self.inst.write(":STOP")
-                running = False
-            if not running:
-                # Only a real reply says the digitize counted itself out. The
-                # give-up path above puts the same False there without asking.
-                completed = bad_polls == 0
-                break
-            if progress is not None:
-                progress(time.time() - started)
-            if wait_s > 0 and time.time() - alive > wait_s:
-                self.inst.write(":STOP")
-                break
-        # The count is honest after a digitize, but only in a servable mode.
-        self.inst.write(f":WAVeform:SOURce CHANnel{source}")
-        self.inst.write(":WAVeform:POINts:MODE NORMal")
-        got = self.try_get(WAVE_COUNT, timeout_ms=2000)
-        try:
-            return min(int(float(got)), count)
-        except (TypeError, ValueError):
-            # No answer is not the same as no hits. The record is there either
-            # way - the transfer that follows reads it fine - so a digitize that
-            # stopped itself gets its full count, and one that was stopped early
-            # says the depth is unknown rather than being thrown away as a run
-            # that never triggered.
-            return count if completed else -1
-
+        return self.prof.accumulate(self, count, wait_s, cancelled, progress,
+                                    source)
 
     def is_running(self):
-        # Bit 3 of the Operation Status Condition register is the Run bit.
+        """Whether an acquisition is in progress, with an unanswerable scope
+        counted as stopped. Only for deciding whether to put the run state back
+        afterwards - the paths where the difference between 'not running' and
+        'would not say' matters call the profile directly, and let it raise."""
         try:
-            return bool(int(self.inst.query(":OPERegister:CONDition?")) & 8)
+            return self.prof.running(self)
         except Exception:
             return False
 
@@ -475,41 +370,20 @@ class Scope:
         still acquiring returns a record torn between two acquisitions. Returns
         whether it had been running, so its state can be put back."""
         was_running = self.is_running()
-        self.inst.write(":STOP")
+        self.inst.write(self.prof.cmd_stop)
         return was_running
 
     def waveform(self, channel, points_mode="RAW", points=None):
-        w = self.inst
-        w.write(f":WAVeform:SOURce CHANnel{channel}")
-        w.write(f":WAVeform:POINts:MODE {points_mode}")
-        # Setting the mode resets the point count, so ask for it afterwards. The
-        # scope rounds to a value it likes; the preamble read below reports what
-        # it actually gave, so the time axis stays right either way.
-        if points:
-            w.write(f":WAVeform:POINts {points}")
-        # WORD, not BYTE. An averaged or high-res record holds finer values
-        # than the 8-bit codes on screen - measured on this scope, a 256-deep
-        # average reads back in 157 uV steps against the 40 mV display code, a
-        # full 16x of real resolution that BYTE readback silently rounds off.
-        # For NORM and PEAK the extra byte carries nothing and costs only
-        # transfer time, so one format serves every mode.
-        w.write(":WAVeform:FORMat WORD")
-        w.write(":WAVeform:BYTeorder LSBFirst")
-        w.write(":WAVeform:UNSigned ON")
+        return self.prof.read_waveform(self, channel, points_mode, points)
 
-        pre = w.query(":WAVeform:PREamble?").strip().split(",")
-        xinc, xorig, xref = float(pre[4]), float(pre[5]), float(pre[6])
-        yinc, yorig, yref = float(pre[7]), float(pre[8]), float(pre[9])
-
-        raw = w.query_binary_values(":WAVeform:DATA?", datatype="H",
-                                    container=np.array)
-        t = (np.arange(len(raw)) - xref) * xinc + xorig
-        v = (raw.astype(np.float64) - yref) * yinc + yorig
-        return t, v
+    def transfer_plan(self, averaged, points):
+        """The points mode to read a record in, and the point count to ask for.
+        Which modes will serve a record depends on how it was stopped, which is
+        per-instrument."""
+        return self.prof.transfer_plan(averaged, points)
 
     def screenshot(self):
-        return self.inst.query_binary_values(":DISPlay:DATA? PNG,COLor",
-                                             datatype="B", container=bytearray)
+        return self.prof.screenshot(self)
 
     # -- settings ---------------------------------------------------------
 
@@ -546,7 +420,11 @@ class Scope:
 
     def errors(self):
         """Drain the scope's error queue, so a rejected setting gets reported
-        instead of silently ignored."""
+        instead of silently ignored.
+
+        The one SCPI string left in this file. It is mandated by SCPI itself
+        rather than chosen by a maker, so it does not belong to a profile the
+        way the rest do."""
         found = []
         for _ in range(10):
             try:
@@ -558,61 +436,77 @@ class Scope:
             found.append(resp)
         return found
 
+    # -- what the capture path asks by name -------------------------------
+
+    def averaging(self, acq_type):
+        """Whether an acquisition-type reply says the scope is averaging."""
+        return acq_type.strip().upper().startswith(self.prof.avg_prefix)
+
+    def averaging_depth(self):
+        """How deep an average the scope is set to build, or None for a plain
+        grab. Asked of the instrument rather than the panel: the panel's copy is
+        whatever was last read, and the front panel may have moved since."""
+        try:
+            if not self.averaging(self.get(self.prof.acq_type)):
+                return None
+            n = int(float(self.get(self.prof.acq_count)))
+            return n if n > 1 else None
+        except Exception:
+            return None
+
+    def is_displayed(self, ch):
+        """Whether the scope is showing a channel - one it is not has no record
+        to hand over. None when it would not say, which is not the same as a no.
+        """
+        try:
+            return self.get(self.prof.ch_display.format(ch=ch)) not in ("0", "OFF")
+        except Exception:
+            return None
+
     def metadata(self, channels, settings, names=None, label=None, existing=False):
         """Format the metadata file. `settings` is the raw {scpi root: reply}
         snapshot already read for the panel, so a grab only asks the scope once
         and the file describes the same instant the panel shows. Values are the
-        instrument's own strings, unrounded."""
+        instrument's own strings, unrounded.
+
+        The rows come from the profile, so the file names what the scope in
+        front of you actually has rather than a fixed list that would be part
+        wrong on anything else."""
+        prof = self.prof
         s = lambda scpi: settings.get(scpi, "?")
-        # An average count is only in force in AVERage mode, and the scope keeps
-        # reporting the last one whatever the mode - so say when it is idle,
-        # rather than leave a file that reads as averaged when it was not.
-        averaging = s(":ACQuire:TYPE").upper().startswith("AVER")
-        avg_note = "" if averaging else "   (not in use: acquisition type is not AVERage)"
+        row = lambda lbl, val: f"{lbl:<19}: {val}"
+        chrow = lambda lbl, val: f"{lbl:<18}: {val}"
+        # An average count is only in force in averaging mode, and the scope
+        # keeps reporting the last one whatever the mode - so say when it is
+        # idle, rather than leave a file that reads as averaged when it was not.
+        averaging = self.averaging(s(prof.acq_type))
+        avg_note = ("" if averaging else
+                    f"   (not in use: acquisition type is not {prof.avg_name})")
         lines = [
-            f"captured           : {datetime.datetime.now().isoformat()}",
-            f"instrument         : {self.idn}",
-            f"visa address       : {self.addr}",
-        ] + ([f"sequence label     : {label}"] if label else []) + (
-            ["capture mode       : existing trace on the scope, not a new trigger"]
-            if existing else []) + [
-            f"sample rate (Sa/s) : {s(':ACQuire:SRATe')}",
-            f"points acquired    : {s(':ACQuire:POINts')}",
-            f"acquisition type   : {s(':ACQuire:TYPE')}",
-            f"averages           : {s(':ACQuire:COUNt')}{avg_note}",
-        ] + ([f"averages taken     : {s(WAVE_COUNT)} of {s(':ACQuire:COUNt')}"
-              f"   (hits actually in the trace that was read out)"]
-             if averaging and WAVE_COUNT in settings else []) + [
-            f"timebase s/div     : {s(':TIMebase:SCALe')}",
-            f"timebase position  : {s(':TIMebase:POSition')}",
-            f"timebase reference : {s(':TIMebase:REFerence')}",
-            f"timebase mode      : {s(':TIMebase:MODE')}",
-            f"trigger type       : {s(':TRIGger:MODE')}",
-            f"trigger sweep      : {s(':TRIGger:SWEep')}",
-            f"trigger source     : {s(':TRIGger:EDGE:SOURce')}",
-            f"trigger level      : {s(':TRIGger:EDGE:LEVel')}",
-            f"trigger slope      : {s(':TRIGger:EDGE:SLOPe')}",
-            f"trigger reject     : {s(':TRIGger:EDGE:REJect')}",
-            f"trigger noise rej  : {s(':TRIGger:NREJect')}",
-            f"trigger holdoff    : {s(':TRIGger:HOLDoff')}",
-        ]
+            row("captured", datetime.datetime.now().isoformat()),
+            row("instrument", self.idn),
+            row("visa address", self.addr),
+        ] + ([row("sequence label", label)] if label else []) + (
+            [row("capture mode",
+                 "existing trace on the scope, not a new trigger")]
+            if existing else [])
+        lines += [row(lbl, s(scpi)) for lbl, scpi in prof.meta_head]
+        lines.append(row("averages", f"{s(prof.acq_count)}{avg_note}"))
+        if averaging and prof.wave_count in settings:
+            lines.append(row("averages taken",
+                             f"{s(prof.wave_count)} of {s(prof.acq_count)}"
+                             f"   (hits actually in the trace that was read out)"))
+        lines += [row(lbl, s(scpi)) for lbl, scpi in prof.meta_tail]
         for ch in channels:
             if names and names.get(ch):
-                lines.append(f"CH{ch} name          : {names[ch]}")
-            lines += [
-                f"CH{ch} V/div         : {s(f':CHANnel{ch}:SCALe')}",
-                f"CH{ch} offset        : {s(f':CHANnel{ch}:OFFSet')}",
-                f"CH{ch} coupling      : {s(f':CHANnel{ch}:COUPling')}",
-                f"CH{ch} probe atten   : {s(f':CHANnel{ch}:PROBe')}",
-                f"CH{ch} units         : {s(f':CHANnel{ch}:UNITs')}",
-                f"CH{ch} bandwidth lim : {s(f':CHANnel{ch}:BWLimit')}",
-                f"CH{ch} invert        : {s(f':CHANnel{ch}:INVert')}",
-            ]
+                lines.append(chrow(f"CH{ch} name", names[ch]))
+            lines += [chrow(f"CH{ch} {lbl}", s(scpi.format(ch=ch)))
+                      for lbl, scpi in prof.meta_channel]
         return "\n".join(lines) + "\n"
 
     def run(self):
         try:
-            self.inst.write(":RUN")
+            self.inst.write(self.prof.cmd_run)
         except Exception:
             pass
 
@@ -624,8 +518,19 @@ class Scope:
 class App:
     def __init__(self, root):
         self.root = root
-        self.scope = Scope()
         self.msgs = queue.Queue()
+        # The profile has to be settled before anything else is built: the
+        # settings panel, the metadata layout and the screenshot box are all
+        # laid out from it. Remembered between sessions like the rest of the
+        # config, and read here directly rather than in load_config, which runs
+        # at the end of this method - long after the panel exists.
+        saved = read_config().get("model")
+        self.prof = scope_profiles.get_profile(saved)
+        if saved and saved != self.prof.key:
+            self.log(f"Config asks for a scope this version does not have "
+                     f"({saved}) - starting on {self.prof.name}.")
+        self.scope = Scope(self.prof)
+        self.preview_w, self.preview_h = self.prof.preview_size
         self.busy = False
         self.auto_job = None
         self.prefix_job = None    # debounce for re-pointing the shot browser
@@ -654,7 +559,7 @@ class App:
         # saved under one experiment's prefix looked like it belonged to it.
         self.setup_prefix = tk.StringVar(value="setup")
 
-        root.title("Scope Grab - MSO-X 2014A")
+        root.title(f"Scope Grab - {self.prof.name}")
         # Tall enough for the screenshot preview, but never taller than the
         # screen - otherwise the log ends up behind the taskbar.
         win_w = min(1200, root.winfo_screenwidth() - 80)
@@ -689,8 +594,8 @@ class App:
         ttk.Label(chf, text="capture").grid(row=0, column=0, padx=(8, 4))
         ttk.Label(chf, text="name").grid(row=0, column=1, sticky="w", padx=4)
         ttk.Label(chf, text="CSV column").grid(row=0, column=2, sticky="w", padx=4)
-        for i, ch in enumerate((1, 2, 3, 4)):
-            v = tk.BooleanVar(value=(ch == 1))
+        for i, ch in enumerate(self.prof.channels):
+            v = tk.BooleanVar(value=(ch == self.prof.channels[0]))
             ttk.Checkbutton(chf, text=f"CH{ch}", variable=v).grid(
                 row=i + 1, column=0, sticky="w", padx=(8, 4), pady=1)
             self.ch_vars[ch] = v
@@ -739,11 +644,11 @@ class App:
         cf.pack(fill="x", padx=8)
         ttk.Label(cf, text="Scope:").pack(side="left", padx=(0, 4))
         self.action_btns = []
-        for text, scpi, note, confirm in ACTIONS:
+        for text, scpi, note, confirm, rewrites in self.prof.actions:
             btn = ttk.Button(cf, text=text, width=max(6, len(text) + 1),
                              state="disabled",
-                             command=lambda s=scpi, n=note, k=confirm:
-                             self.do_action(s, n, k))
+                             command=lambda s=scpi, n=note, k=confirm, w=rewrites:
+                             self.do_action(s, n, k, w))
             btn.pack(side="left", padx=(0, 4))
             self.action_btns.append(btn)
 
@@ -821,7 +726,8 @@ class App:
         # --- last screenshot
         self.shot_frame = ttk.LabelFrame(right, text="Last screenshot")
         self.shot_frame.pack(fill="x", **pad)
-        box = tk.Frame(self.shot_frame, width=PREVIEW_W, height=PREVIEW_H)
+        box = tk.Frame(self.shot_frame, width=self.preview_w,
+                       height=self.preview_h)
         box.pack(padx=4, pady=4)
         box.pack_propagate(False)          # keep the box from shrinking to the label
         self.preview = ttk.Label(box, text="(no screenshot yet)", anchor="center")
@@ -903,6 +809,7 @@ class App:
 
     def current_cfg(self):
         return {
+            "model": self.prof.key,
             "outdir": self.outdir.get(),
             "setup_dir": self.setup_dir.get(),
             "setup_prefix": self.setup_prefix.get(),
@@ -1071,6 +978,10 @@ class App:
             "app": "scope-grab",
             "version": 1,
             "saved": datetime.datetime.now().isoformat(timespec="seconds"),
+            # Which scope this is for, as opposed to which one was plugged in
+            # when it was saved. The settings are that model's SCPI roots, so a
+            # load onto another one is refused rather than half-applied.
+            "model": self.prof.key,
             "instrument": self.scope.idn,
             "read_stamp": self.read_stamp,
             "unapplied_edits": pending,
@@ -1097,7 +1008,7 @@ class App:
             with open(base + ".json", "w", encoding="utf-8") as fh:
                 json.dump(cfg, fh, indent=2)
             with open(base + ".txt", "w", encoding="utf-8") as fh:
-                fh.write(describe_setup(cfg))
+                fh.write(describe_setup(cfg, self.prof))
         except Exception as exc:
             self.log(f"ERROR saving setup: {exc}")
             return
@@ -1131,6 +1042,26 @@ class App:
         except Exception as exc:
             messagebox.showerror("Cannot read setup", str(exc), parent=self.root)
             self.log(f"Could not read {path}: {exc}")
+            return
+
+        # A setup is a set of SCPI roots, so one saved from another scope would
+        # land as a panel full of fields this one does not have - counted as
+        # loaded, marked as edits, and unsendable. Refuse it instead. Setups
+        # written before profiles existed carry no model and are all MSO-X, so
+        # a missing key loads as it always did.
+        model = cfg.get("model")
+        if model and model != self.prof.key:
+            other = scope_profiles.PROFILES.get(model)
+            named = other.name if other is not None else model
+            messagebox.showerror(
+                "Setup is for another scope",
+                f"That setup was saved for {named}, and this panel is set up "
+                f"for {self.prof.name}.\n\nIts settings name commands that "
+                "scope has and this one may not, so loading it would fill the "
+                "panel with values that cannot be sent.",
+                parent=self.root)
+            self.log(f"Not loading {os.path.basename(path)}: it was saved for "
+                     f"{named}, and this panel is {self.prof.name}")
             return
 
         loaded = skipped = 0
@@ -1220,7 +1151,8 @@ class App:
                 im = Image.open(source if isinstance(source, str)
                                 else io.BytesIO(source))
                 im.load()
-                k = min(PREVIEW_W / im.width, PREVIEW_H / im.height, 1.0)
+                k = min(self.preview_w / im.width,
+                        self.preview_h / im.height, 1.0)
                 if k < 1.0:
                     im = im.resize((max(1, round(im.width * k)),
                                     max(1, round(im.height * k))),
@@ -1231,7 +1163,8 @@ class App:
                 img = (tk.PhotoImage(file=source) if isinstance(source, str)
                        else tk.PhotoImage(data=base64.b64encode(source)))
                 k = 1
-                while img.width() // k > PREVIEW_W or img.height() // k > PREVIEW_H:
+                while (img.width() // k > self.preview_w
+                       or img.height() // k > self.preview_h):
                     k += 1
                 if k > 1:
                     img = img.subsample(k)         # integer factors only
@@ -1456,17 +1389,6 @@ class App:
         except ValueError:
             return 10.0
 
-    def averaging_depth(self):
-        """How deep an average the scope is set to build, or None for a plain
-        grab. Asked of the instrument rather than the panel: the panel's copy is
-        whatever was last read, and the front panel may have moved since."""
-        try:
-            if not self.scope.get(":ACQuire:TYPE").upper().startswith("AVER"):
-                return None
-            n = int(float(self.scope.get(":ACQuire:COUNt")))
-            return n if n > 1 else None
-        except Exception:
-            return None
 
     def transfer_points(self):
         """None means take everything in acquisition memory."""
@@ -1506,13 +1428,7 @@ class App:
             # in it that names the channel. Asked of the instrument rather than
             # the panel, so a channel switched on at the front panel since the
             # last read does not get a grab refused over a stale copy.
-            dark = []
-            for ch in chans:
-                try:
-                    if self.scope.get(f":CHANnel{ch}:DISPlay") in ("0", "OFF"):
-                        dark.append(ch)
-                except Exception:
-                    pass          # unanswerable is not the same as switched off
+            dark = [ch for ch in chans if self.scope.is_displayed(ch) is False]
             if dark:
                 one = len(dark) == 1
                 self.log(f"  {', '.join(f'CH{ch}' for ch in dark)} "
@@ -1523,9 +1439,9 @@ class App:
                          "panel, or untick it under Channels")
                 return
             # Asked even for a use-existing grab: the read further down needs to
-            # know whether it is looking at an averaged record, because those
-            # only answer in the NORMal/MAXimum points modes.
-            avg_want = self.averaging_depth()
+            # know whether it is looking at an averaged record, because which
+            # points modes will serve one is not the same as for a plain trace.
+            avg_want = self.scope.averaging_depth()
             armed_at = time.time()
             if existing:
                 # Take what is in acquisition memory now. Put the run state back
@@ -1536,11 +1452,11 @@ class App:
                          + (" (it was running, so it was stopped first)" if resume
                             else " (it was already stopped)"))
             elif avg_want:
-                # The scope is averaging, and :SINGle would take exactly one
-                # acquisition of the requested depth - the trap report_averaging
-                # warns about after the fact. Accumulate the full average
-                # instead, restarting it so the record is entirely this grab's
-                # waveform and none of whatever played before.
+                # The scope is averaging, and arming a single acquisition can
+                # take exactly one hit while claiming the full depth - the trap
+                # report_averaging warns about after the fact. Accumulate the
+                # full average instead, restarting it so the record is entirely
+                # this grab's waveform and none of whatever played before.
                 resume = True
                 wait_s = self.trigger_wait_s()
                 self.set_phase(f"building a {avg_want}-deep average")
@@ -1590,17 +1506,11 @@ class App:
             read_at = time.time()
             points = self.transfer_points()
             names = {ch: self.ch_names[ch].get().strip() for ch in chans}
-            # A record stopped out of RUN - which is what an averaged build
-            # leaves - only answers in the NORMal/MAXimum points modes; RAW gets
-            # +109 "No Data For Operation". MAXimum serves everything there is
-            # (7680 points on this scope), and behaves as RAW on a record that
-            # a :SINGle left behind.
-            mode = "MAXimum" if avg_want else "RAW"
-            if avg_want:
-                # The whole averaged record is 7680 points on this scope;
-                # asking for more raises -222 "Data out of range" and a
-                # transfer-points limit is beside the point at that size.
-                points = None
+            # Which points mode will serve the record, and whether a
+            # transfer limit still means anything at the size an averaged one
+            # comes in at, are both per-instrument - see transfer_plan on the
+            # profile for why this scope answers the way it does.
+            mode, points = self.scope.transfer_plan(bool(avg_want), points)
             cols = {}
             for ch in chans:
                 t, v = self.scope.waveform(ch, points_mode=mode, points=points)
@@ -1614,9 +1524,9 @@ class App:
             # Asked here rather than in the settings read: the waveform transfer
             # above has just succeeded, so there is certainly a record for the
             # scope to describe.
-            hits = self.scope.try_get(WAVE_COUNT)
+            hits = self.scope.try_get(self.prof.wave_count)
             if hits is not None:
-                settings[WAVE_COUNT] = hits
+                settings[self.prof.wave_count] = hits
             self.report_averaging(settings, existing=existing)
             # The screenshot has to be taken before :RUN, while the captured
             # trace is still the one on screen.
@@ -1688,19 +1598,23 @@ class App:
         the count describes depends on where the trace came from.
 
         A trace this grab built is the honest case: Scope.accumulate counts the
-        triggers out with :DIGitize and the count reads true afterwards, and a
-        build that fell short has already been reported by the caller - so there
-        is nothing to warn about here and the depth is simply recorded.
+        triggers out and the count reads true afterwards, and a build that fell
+        short has already been reported by the caller - so there is nothing to
+        warn about here and the depth is simply recorded.
 
-        A trace that was already on the scope is the other one. Under RUN the
-        averager is a running average and :WAVeform:COUNt reports the SETTING
-        rather than the accumulated depth, so neither a short count nor a full
-        one describes what is in the record."""
-        if not settings.get(":ACQuire:TYPE", "").upper().startswith("AVER"):
+        A trace that was already on the scope is the other one. On the MSO-X the
+        averager is a running average under RUN, and the hit count reports the
+        SETTING rather than the accumulated depth, so neither a short count nor
+        a full one describes what is in the record.
+
+        The warning below states that as fact. It was measured on the MSO-X and
+        is exactly the sort of thing a second scope may do differently, so it
+        moves onto the profile once there is one to compare against."""
+        if not self.scope.averaging(settings.get(self.prof.acq_type, "")):
             return
         try:
-            got = int(float(settings[WAVE_COUNT]))
-            want = int(float(settings[":ACQuire:COUNt"]))
+            got = int(float(settings[self.prof.wave_count]))
+            want = int(float(settings[self.prof.acq_count]))
         except (KeyError, TypeError, ValueError):
             self.log("  averaging: the scope would not say how many hits are in "
                      "this trace")
@@ -1738,20 +1652,20 @@ class App:
         cols.pack(fill="x", padx=6, pady=(2, 2))
         tbf = ttk.LabelFrame(cols, text="Timebase / acquisition")
         tbf.pack(side="left", fill="both", expand=True)
-        self.setting_rows(tbf, TIMEBASE_SETTINGS
-                          + [(lbl, scpi, "info", None) for lbl, scpi in INFO_SETTINGS],
+        self.setting_rows(tbf, list(self.prof.timebase)
+                          + [(lbl, scpi, "info", None) for lbl, scpi in self.prof.info],
                           11)
         tgf = ttk.LabelFrame(cols, text="Trigger")
         tgf.pack(side="left", fill="both", expand=True, padx=(6, 0))
-        self.setting_rows(tgf, TRIGGER_SETTINGS, 11)
+        self.setting_rows(tgf, self.prof.trigger, 11)
 
         c = ttk.Frame(sf)
         c.pack(fill="x", padx=6, pady=(6, 2))
-        for j, (label, _, _, _) in enumerate(CHANNEL_SETTINGS):
+        for j, (label, _, _, _) in enumerate(self.prof.channel):
             ttk.Label(c, text=label).grid(row=0, column=j + 1, pady=(0, 2))
-        for i, ch in enumerate((1, 2, 3, 4)):
+        for i, ch in enumerate(self.prof.channels):
             ttk.Label(c, text=f"CH{ch}").grid(row=i + 1, column=0, sticky="e", padx=(0, 4))
-            for j, (_, tmpl, kind, choices) in enumerate(CHANNEL_SETTINGS):
+            for j, (_, tmpl, kind, choices) in enumerate(self.prof.channel):
                 self.setting_widget(c, tmpl.format(ch=ch), kind, choices, i + 1, j + 1, 8)
 
         bar = ttk.Frame(sf)
@@ -1820,8 +1734,9 @@ class App:
         """True when the panel's own mode fields say the scope is acting on this
         one. Judged from the panel rather than the scope because that is the
         state being written: selecting AVERage and a count in the same Apply
-        makes the count live, and WRITE_FIRST puts the mode down first."""
-        owner, live_for = DEPENDS_ON.get(scpi, (None, None))
+        makes the count live, and the profile's write_first puts the mode down
+        first."""
+        owner, live_for = self.prof.depends_on.get(scpi, (None, None))
         if owner is None or owner not in self.set_vars:
             return True
         return self.set_vars[owner].get().strip().upper().startswith(live_for)
@@ -1831,7 +1746,7 @@ class App:
         answering with a stale value for those - an average count from the last
         time averaging was on, an edge level under a pulse-width trigger - and
         greying them is what says the number on show is not in force."""
-        for scpi in DEPENDS_ON:
+        for scpi in self.prof.depends_on:
             if scpi not in self.set_widgets:
                 continue
             self.set_widgets[scpi].configure(
@@ -1993,9 +1908,10 @@ class App:
                 # A mode has to be in place before the fields it governs, or the
                 # scope takes the write and quietly does nothing with it. Sorting
                 # is stable, so everything else keeps panel order.
+                first = self.prof.write_first
                 ordered = sorted(changes.items(),
-                                 key=lambda kv: WRITE_FIRST.index(kv[0])
-                                 if kv[0] in WRITE_FIRST else len(WRITE_FIRST))
+                                 key=lambda kv: first.index(kv[0])
+                                 if kv[0] in first else len(first))
                 for scpi, value in ordered:
                     if self.set_kinds[scpi] == "num":
                         try:
@@ -2030,30 +1946,31 @@ class App:
             # Settings I/O must not advance a sequence - only a grab does that.
             self.root.after(0, lambda: self.set_busy(False))
 
-    def do_action(self, scpi, note, confirm=None):
+    def do_action(self, scpi, note, confirm=None, rewrites=False):
         """Run one of the scope's own buttons - run/stop/single, force trigger,
-        clear display, autoscale."""
+        clear display, autoscale. `rewrites` says the command changes the
+        settings rather than just the run state, which decides whether the
+        re-read afterwards may overwrite an unapplied edit."""
         if self.busy or self.seq_active or not self.scope.inst:
             return
         if confirm and not messagebox.askyesno("Scope Grab", confirm, parent=self.root):
             self.log(f"  {scpi} cancelled")
             return
         self.set_busy(True)
-        threading.Thread(target=self._action_worker, args=(scpi, note),
+        threading.Thread(target=self._action_worker, args=(scpi, note, rewrites),
                          daemon=True).start()
 
-    def _action_worker(self, scpi, note):
+    def _action_worker(self, scpi, note, rewrites=False):
         try:
             self.scope.command(scpi)
             self.log(f"{scpi} - {note}")
             for err in self.scope.errors():
                 self.log(f"  scope rejected it: {err}")
             values = self.read_all_settings()
-            # Autoscale is the one that rewrites the settings, so it is the one
+            # Autoscale and its like rewrite the settings, so they are the ones
             # allowed to overwrite pending edits in the panel; the rest leave an
             # unapplied edit where it is.
-            overwrite = scpi == ":AUToscale"
-            self.root.after(0, lambda v=values: self.show_settings(v, overwrite=overwrite))
+            self.root.after(0, lambda v=values: self.show_settings(v, overwrite=rewrites))
             # Same as after an Apply: show what it did, without saving anything.
             time.sleep(0.4)
             img = self.scope.screenshot()
