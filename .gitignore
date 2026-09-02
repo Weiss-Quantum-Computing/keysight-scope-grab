@@ -3,6 +3,8 @@ scope_data/
 *.csv
 *.png
 *.txt
+# ...except the test goldens, which are expected output rather than captured data
+!tests/golden/*.txt
 
 # Python
 __pycache__/

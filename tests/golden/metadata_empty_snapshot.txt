@@ -1,0 +1,26 @@
+captured           : 2026-09-02T14:30:15.123456
+instrument         : KEYSIGHT TECHNOLOGIES,MSO-X 2014A,MY12345678,02.65.2021012345
+visa address       : USB0::0x2A8D::0x1797::MY12345678::INSTR
+sample rate (Sa/s) : ?
+points acquired    : ?
+acquisition type   : ?
+averages           : ?   (not in use: acquisition type is not AVERage)
+timebase s/div     : ?
+timebase position  : ?
+timebase reference : ?
+timebase mode      : ?
+trigger type       : ?
+trigger sweep      : ?
+trigger source     : ?
+trigger level      : ?
+trigger slope      : ?
+trigger reject     : ?
+trigger noise rej  : ?
+trigger holdoff    : ?
+CH1 V/div         : ?
+CH1 offset        : ?
+CH1 coupling      : ?
+CH1 probe atten   : ?
+CH1 units         : ?
+CH1 bandwidth lim : ?
+CH1 invert        : ?

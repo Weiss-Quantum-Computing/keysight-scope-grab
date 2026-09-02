@@ -1,0 +1,6 @@
+# core.autocrlf is on here, so everything is stored as LF and checked out as
+# CRLF. The test goldens are the exception: they hold what metadata() and
+# describe_setup() return, which is joined with \n, and the tests compare them
+# byte for byte. Left to the usual rule they would come back CRLF on a fresh
+# clone and every output test would fail on a machine that had never seen them.
+tests/golden/*.txt -text

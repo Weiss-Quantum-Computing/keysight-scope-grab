@@ -1,0 +1,70 @@
+Scope Grab setup - saved 2026-08-24T22:19:39
+Instrument: AGILENT TECHNOLOGIES,MSO-X 2014A,MY63080029,02.65.2021030741
+Panel last read from the scope at 22:18:19
+
+Timebase / acquisition
+  Timebase s/div  0.0015
+  Position (s)    0.0053
+  Reference       CENT
+  Sweep mode      MAIN
+  Acquisition     HRES
+  Averages        1
+
+Trigger
+  Type          EDGE
+  Sweep         NORM
+  Source        EXT
+  Level (V)     4.9
+  Slope         POS
+  Reject        OFF
+  Noise reject  OFF
+  Holdoff (s)   4e-08
+
+CH1
+  V/div     2
+  Offset    6
+  Coupling  DC
+  Probe     1
+  Units     VOLT
+  BW lim    OFF
+  Invert    OFF
+  Display   ON
+
+CH2
+  V/div     2
+  Offset    7
+  Coupling  DC
+  Probe     1
+  Units     VOLT
+  BW lim    OFF
+  Invert    OFF
+  Display   ON
+
+CH3
+  V/div     1
+  Offset    3
+  Coupling  DC
+  Probe     1
+  Units     VOLT
+  BW lim    OFF
+  Invert    OFF
+  Display   ON
+
+CH4
+  V/div     1
+  Offset    3.5
+  Coupling  DC
+  Probe     1
+  Units     VOLT
+  BW lim    OFF
+  Invert    OFF
+  Display   ON
+
+Capture settings
+  Prefix            ilc
+  Trigger wait (s)  0
+  Transfer points   20000
+  CH1 on   AWG Ch1
+  CH2 on   AWG Ch2
+  CH3 on   Trek Monitor X1
+  CH4 on   Trek Monitor X2

@@ -1,0 +1,51 @@
+captured           : 2026-09-02T14:30:15.123456
+instrument         : KEYSIGHT TECHNOLOGIES,MSO-X 2014A,MY12345678,02.65.2021012345
+visa address       : USB0::0x2A8D::0x1797::MY12345678::INSTR
+capture mode       : existing trace on the scope, not a new trigger
+sample rate (Sa/s) : +2.00000000E+09
+points acquired    : +7680
+acquisition type   : AVER
+averages           : +256
+averages taken     : +256 of +256   (hits actually in the trace that was read out)
+timebase s/div     : +1.00000000E-03
+timebase position  : +0.0E+00
+timebase reference : CENT
+timebase mode      : MAIN
+trigger type       : EDGE
+trigger sweep      : NORM
+trigger source     : CHAN1
+trigger level      : +1.20000E+00
+trigger slope      : POS
+trigger reject     : OFF
+trigger noise rej  : 0
+trigger holdoff    : +6.0E-08
+CH1 name          : PD
+CH1 V/div         : +4.00000E-02
+CH1 offset        : -1.0E-01
+CH1 coupling      : DC
+CH1 probe atten   : +1.0E+00
+CH1 units         : VOLT
+CH1 bandwidth lim : 0
+CH1 invert        : 0
+CH2 V/div         : +4.00000E-02
+CH2 offset        : -1.0E-01
+CH2 coupling      : DC
+CH2 probe atten   : +1.0E+00
+CH2 units         : VOLT
+CH2 bandwidth lim : 0
+CH2 invert        : 0
+CH3 name          : trig
+CH3 V/div         : +4.00000E-02
+CH3 offset        : -1.0E-01
+CH3 coupling      : DC
+CH3 probe atten   : +1.0E+00
+CH3 units         : VOLT
+CH3 bandwidth lim : 0
+CH3 invert        : 0
+CH4 V/div         : +4.00000E-02
+CH4 offset        : -1.0E-01
+CH4 coupling      : DC
+CH4 probe atten   : +1.0E+00
+CH4 units         : VOLT
+CH4 bandwidth lim : 0
+CH4 invert        : 0

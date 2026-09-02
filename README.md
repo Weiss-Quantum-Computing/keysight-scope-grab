@@ -609,6 +609,18 @@ Selecting a model is a config key today (`"model"` above), because with one
 profile there is nothing to choose between. It becomes a control in the window
 when there is a second one.
 
+### Tests
+
+```
+python tests/run_tests.py
+```
+
+No scope and no pip install. The goldens were generated from the last commit
+before profiles existed, so they check that the metadata `.txt` and the setup
+`.txt` still come out exactly as they did then - every capture in the archive
+was written by that version. `tests/README.md` has the detail, including what
+these cannot cover: everything behavioural still has to be checked at the bench.
+
 ## Notes on acquisition
 
 A plain capture uses `:SINGle` rather than `:DIGitize`, so the trace stays on the
