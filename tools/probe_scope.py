@@ -15,18 +15,28 @@ back, and the profile gets written from measurements instead of from a PDF.
     python tools/probe_scope.py                 find it, probe it, restore it
     python tools/probe_scope.py --addr <VISA>   skip the scan
     python tools/probe_scope.py --channel 2     probe a channel other than 1
+    python tools/probe_scope.py --fix-trigger   let it arrange its own trigger
     python tools/probe_scope.py --yes           skip the confirmation
 
 WHAT IT CHANGES: the acquisition type, the average count, and the run state,
 plus the waveform-readout settings, which are not knobs anyone sets by hand.
 Everything it touches is read first and put back at the end - including on
-Ctrl-C and on an error. It never writes a timebase, a channel scale, a trigger
-setting, or anything the front panel shows as your setup.
+Ctrl-C and on an error. It never writes a timebase or a channel scale.
 
-WHAT IT NEEDS: a repeating, triggering signal on the probed channel. The
-averaging tests are built on watching noise fall as hits accumulate, so a
-static or untriggered trace tells it nothing and it will say so rather than
-guess.
+With --fix-trigger it also points the trigger at the channel being probed and
+puts the sweep in AUTO, which is the one case where it writes a setting the
+front panel shows as yours. Those three are read first and restored too, and
+the report says so on both sides.
+
+WHAT IT NEEDS: a repeating signal on the probed channel, and triggers actually
+arriving. The averaging tests watch noise fall as hits accumulate, so an
+untriggered scope tells them nothing. This is checked up front now rather than
+discovered two phases in: if nothing is triggering, the probe says exactly what
+the trigger is set to and what to do about it, instead of filling a report with
+zeroes.
+
+The easiest signal on a DS1054Z is its own front-panel probe-compensation
+terminal - a 1 kHz square wave that always triggers.
 """
 import argparse
 import datetime
@@ -268,6 +278,87 @@ def phase_settings(p, say, chan):
         p.errors()
 
 
+def phase_trigger(p, say, chan, fix):
+    """Is anything actually triggering? Returns True if the rest can proceed.
+
+    This exists because the first real run of this script produced two phases
+    of zeroes and a noise ruler of nan, and the reason - the scope was set to
+    trigger on a different channel than the one being read, in NORMal sweep,
+    with nothing crossing the level - was sitting in the phase 2 dump the whole
+    time. A probe that cannot measure should say so in three seconds, not fill
+    a report with nothing and let someone read it to find out.
+    """
+    say.head("2.5 Is anything triggering?")
+
+    sweep = p.ask(":TRIGger:SWEep?")
+    source = p.ask(":TRIGger:EDGe:SOURce?")
+    level = p.ask(":TRIGger:EDGe:LEVel?")
+    say(f"  sweep={sweep}  source={source}  level={level}  "
+        f"probing CHANnel{chan}")
+    say("")
+    say("  channels the scope is showing:")
+    for ch in (1, 2, 3, 4):
+        on = p.ask(f":CHANnel{ch}:DISPlay?")
+        if on in ("1", "ON"):
+            say(f"    CH{ch}  on   {p.ask(f':CHANnel{ch}:SCALe?')} V/div, "
+                f"offset {p.ask(f':CHANnel{ch}:OFFSet?')}")
+        else:
+            say(f"    CH{ch}  off")
+
+    if fix:
+        say("")
+        say("  --fix-trigger: pointing the trigger at the probed channel and")
+        say("  putting the sweep in AUTO, so a sweep arrives whatever the")
+        say("  signal does. Both are restored at the end.")
+        p.send(":TRIGger:MODE EDGE")
+        p.send(f":TRIGger:EDGe:SOURce CHANnel{chan}")
+        p.send(":TRIGger:SWEep AUTO")
+        p.errors()
+        time.sleep(0.5)
+
+    p.send(":RUN")
+    say("")
+    say("  watching :TRIGger:STATus? for 6 s:")
+    seen, t0 = [], time.time()
+    while time.time() - t0 < 6.0:
+        status = p.ask(":TRIGger:STATus?", 2000)
+        if status and (not seen or seen[-1] != status):
+            seen.append(status)
+        time.sleep(0.2)
+    say(f"    {' -> '.join(seen) if seen else '(no answer)'}")
+
+    # A record with points in it is the real test: TD and RUN come and go too
+    # fast to catch reliably, but a served trace cannot be faked.
+    _, v, pre = p.read_trace(chan, "NORMal")
+    points = 0 if v is None else len(v)
+    say(f"    a NORMal read returns {points} points"
+        f"{', preamble points=' + pre['points'] if pre else ''}")
+
+    if points > 0:
+        rough = p.roughness(v)
+        say(f"    noise ruler on that trace: {rough:.6g} V")
+        if np.isfinite(rough) and rough > 0:
+            say("  -> triggering, and the trace has noise to measure. Good.")
+            return True
+        say("  !! a trace, but it is perfectly flat - nothing to measure.")
+        say("     The channel is probably railed or unconnected. Put a signal")
+        say("     on it (the front-panel probe-comp terminal will do).")
+        return False
+
+    say("")
+    say("  !! nothing is triggering, so phases 3 and 5 would measure nothing.")
+    if source and f"CHAN{chan}" not in source.upper():
+        say(f"     The trigger is on {source} but this is probing CH{chan}.")
+        say(f"     Either run with --channel {source.upper().replace('CHAN', '')}"
+            f" or add --fix-trigger.")
+    if sweep and sweep.upper().startswith("NORM"):
+        say("     Sweep is NORMal, so with no trigger there is never a sweep.")
+        say("     --fix-trigger puts it in AUTO for the duration.")
+    say("     Or connect the probed channel to the scope's own probe-comp")
+    say("     terminal, which is a 1 kHz square wave that always triggers.")
+    return False
+
+
 def phase_readout(p, say, chan):
     say.head("3. Waveform readout - which modes serve a record, and how big")
     say("Run state first, then after a :SINGle, because on the MSO-X those")
@@ -457,6 +548,12 @@ def main():
                     help="channel to probe (default 1)")
     ap.add_argument("--depth", type=int, default=64,
                     help="averaging depth to test (default 64)")
+    ap.add_argument("--fix-trigger", action="store_true",
+                    help="point the trigger at the probed channel and put the "
+                         "sweep in AUTO, restoring both afterwards")
+    ap.add_argument("--force", action="store_true",
+                    help="run the measuring phases even if nothing is "
+                         "triggering (they will report nothing useful)")
     ap.add_argument("--yes", action="store_true",
                     help="skip the confirmation prompt")
     args = ap.parse_args()
@@ -484,9 +581,16 @@ def main():
         print("\n" + "-" * 72)
         print("This changes the acquisition type, the average count and the run")
         print("state, and puts them all back at the end. It does not touch the")
-        print("timebase, the channel scales or the trigger setup.")
-        print("It needs a live, repeating, triggering signal on channel "
-              f"{args.channel}.")
+        print("timebase or the channel scales.")
+        if args.fix_trigger:
+            print("")
+            print("--fix-trigger: it will ALSO point the trigger at channel "
+                  f"{args.channel}")
+            print("and put the sweep in AUTO. Both are read first and restored.")
+        print("")
+        print(f"It needs a repeating signal on channel {args.channel}, and")
+        print("triggers arriving. It checks that up front and stops early if")
+        print("not, rather than writing a report full of zeroes.")
         print("-" * 72)
         if input("Go ahead? [y/N] ").strip().lower() not in ("y", "yes"):
             print("nothing done")
@@ -499,9 +603,14 @@ def main():
     inst.chunk_size = 1024 * 1024
     p = Probe(inst, say)
 
-    # Read back what we are about to disturb, so it can be put back.
+    # Read back what we are about to disturb, so it can be put back. The
+    # trigger settings are only in here when --fix-trigger will write them,
+    # so a plain run cannot restore something it never touched.
+    wanted = [":ACQuire:TYPE", ":ACQuire:AVERages", ":ACQuire:MDEPth"]
+    if args.fix_trigger:
+        wanted += [":TRIGger:MODE", ":TRIGger:EDGe:SOURce", ":TRIGger:SWEep"]
     restore = {}
-    for scpi in (":ACQuire:TYPE", ":ACQuire:AVERages", ":ACQuire:MDEPth"):
+    for scpi in wanted:
         restore[scpi] = p.ask(scpi + "?")
     was_running = p.ask(":TRIGger:STATus?") != "STOP"
     say(f"\n  saved for restore: {restore}, running={was_running}")
@@ -509,9 +618,17 @@ def main():
     try:
         phase_identity(p, say)
         phase_settings(p, say, args.channel)
-        phase_readout(p, say, args.channel)
-        phase_screenshot(p, say)
-        phase_averaging(p, say, args.channel, args.depth)
+        live = phase_trigger(p, say, args.channel, args.fix_trigger)
+        if not live and not args.force:
+            say("")
+            say("  Skipping phases 3 and 5 - they need triggers and there are")
+            say("  none. Phase 4 still runs; it only needs a screen. Re-run")
+            say("  with --fix-trigger, or --force to see them fail in detail.")
+            phase_screenshot(p, say)
+        else:
+            phase_readout(p, say, args.channel)
+            phase_screenshot(p, say)
+            phase_averaging(p, say, args.channel, args.depth)
     except KeyboardInterrupt:
         say("\n!! interrupted - restoring settings")
     except Exception as exc:

@@ -50,9 +50,13 @@ class FakeScope:
            + b"\x00" * 200)
 
     def __init__(self, idn="RIGOL TECHNOLOGIES,DS1054Z,DS1ZA1,00.04.04.SP4",
-                 unsupported=()):
+                 unsupported=(), dead_trigger=False):
         self.idn = idn
         self.unsupported = unsupported
+        # Reproduces the first real run: sweep NORMal, trigger pointed at a
+        # channel with nothing on it, so the status sits at WAIT and every
+        # read comes back empty rather than erroring.
+        self.dead_trigger = dead_trigger
         self.timeout = 5000
         self.chunk_size = 0
         self.read_termination = self.write_termination = None
@@ -83,6 +87,11 @@ class FakeScope:
     def _refuses(self, scpi):
         return any(u in scpi for u in self.unsupported)
 
+    def _dead(self):
+        """A scope waiting for a trigger it will never get has no record to
+        serve, and answers with an empty one rather than an error."""
+        return self.dead_trigger and self.state[":TRIGger:STATus"] != "AUTO"
+
     def query(self, scpi):
         scpi = scpi.strip()
         if self._refuses(scpi):
@@ -92,6 +101,8 @@ class FakeScope:
         if scpi == ":SYSTem:ERRor?":
             return '0,"No error"\n'
         if scpi == ":WAVeform:PREamble?":
+            if self._dead():
+                return "0,0,0,1,0.0,0.0,0,0.0,0,0\n"
             count = (self.state[":ACQuire:AVERages"]
                      if self.state[":ACQuire:TYPE"].startswith("AVER") else "1")
             return f"0,0,1200,{count},1.0e-09,-6.0e-04,0,4.0e-03,0,127\n"
@@ -113,12 +124,19 @@ class FakeScope:
             self.state[":TRIGger:STATus"] = "RUN"
         elif scpi in (":STOP", ":SINGle"):
             self.state[":TRIGger:STATus"] = "STOP"
+        if self.dead_trigger and scpi == ":RUN":
+            # NORMal sweep with nothing crossing the level: waits forever.
+            self.state[":TRIGger:STATus"] = (
+                "AUTO" if self.state[":TRIGger:SWEep"].startswith("AUTO")
+                else "WAIT")
 
     def query_binary_values(self, scpi, datatype="B", container=None):
         if self._refuses(scpi):
             raise IOError("timeout")
         if scpi.startswith(":DISPlay:DATA"):
             return bytearray(self.PNG)
+        if self._dead():
+            return np.array([], dtype=np.uint8)
         # A noisy sine whose noise falls with the average count, so the probe's
         # roughness ruler has something real to measure.
         n = 1200
@@ -137,8 +155,12 @@ class FakeScope:
         pass
 
 
-def run_phases(scope, label):
-    """Every phase against one mock, with output captured."""
+def run_phases(scope, label, fix=False):
+    """Every phase against one mock, with output captured.
+
+    Phases 3 and 5 only run when the trigger preflight says there is something
+    to measure, which is the same gate main() applies."""
+    live = False
     say = probe_scope.Report()
     buf = io.StringIO()
     real_stdout, sys.stdout = sys.stdout, buf
@@ -150,24 +172,27 @@ def run_phases(scope, label):
         try:
             probe_scope.phase_identity(p, say)
             probe_scope.phase_settings(p, say, 1)
-            probe_scope.phase_readout(p, say, 1)
+            live = probe_scope.phase_trigger(p, say, 1, fix)
             probe_scope.phase_screenshot(p, say)
-            probe_scope.phase_averaging(p, say, 1, 64)
+            if live:
+                probe_scope.phase_readout(p, say, 1)
+                probe_scope.phase_averaging(p, say, 1, 64)
         finally:
             probe_scope.time.sleep = real_sleep
     finally:
         sys.stdout = real_stdout
-    return "\n".join(say.lines)
+    return "\n".join(say.lines), live
 
 
 def main():
     print("probe against a DS1054Z-like mock")
     scope = FakeScope()
     try:
-        out = run_phases(scope, "rigol")
-        check("all five phases ran", True)
+        out, live = run_phases(scope, "rigol")
+        check("all phases ran", True)
+        check("preflight said the scope is measurable", live)
     except Exception as exc:
-        check("all five phases ran", False, f"{type(exc).__name__}: {exc}")
+        check("all phases ran", False, f"{type(exc).__name__}: {exc}")
         import traceback
         traceback.print_exc()
         return 1
@@ -192,12 +217,39 @@ def main():
     check("noise ruler responds to averaging depth",
           any(r > 3 for r in ratios), f"max ratio {max(ratios) if ratios else 0:.2f}")
 
+    print("\nprobe against a scope that is not triggering")
+    print("(the failure the first real run hit: NORMal sweep, trigger on a")
+    print(" channel with nothing on it, every read comes back empty)")
+    dead = FakeScope(dead_trigger=True)
+    dead.state[":TRIGger:SWEep"] = "NORM"
+    dead.state[":TRIGger:EDGe:SOURce"] = "CHAN2"
+    out3, live3 = run_phases(dead, "dead")
+    check("preflight catches it", not live3)
+    check("says nothing is triggering", "nothing is triggering" in out3)
+    check("names the channel mismatch", "trigger is on CHAN2" in out3)
+    check("names the NORMal sweep", "Sweep is NORMal" in out3)
+    check("suggests the probe-comp terminal", "probe-comp" in out3)
+    check("screenshot still ran, since it needs no trigger", "800x480" in out3)
+    check("did not waste time in the phases that need one",
+          "5. Averaging" not in out3)
+
+    print("\nsame scope, with --fix-trigger")
+    fixed = FakeScope(dead_trigger=True)
+    fixed.state[":TRIGger:SWEep"] = "NORM"
+    fixed.state[":TRIGger:EDGe:SOURce"] = "CHAN2"
+    out4, live4 = run_phases(fixed, "fixed", fix=True)
+    check("AUTO sweep rescues the run", live4)
+    check("it pointed the trigger at the probed channel",
+          ":TRIGger:EDGe:SOURce CHANnel1" in fixed.written)
+    check("and put the sweep in AUTO", ":TRIGger:SWEep AUTO" in fixed.written)
+    check("so the averaging phase ran after all", "5. Averaging" in out4)
+
     print("\nprobe against a scope that refuses almost everything")
     stubborn = FakeScope(idn="SOME OTHER SCOPE,X,1,1.0",
                          unsupported=(":WAVeform", ":DISPlay:DATA", ":ACQuire",
                                       ":TRIGger:STATus"))
     try:
-        out2 = run_phases(stubborn, "stubborn")
+        out2, _ = run_phases(stubborn, "stubborn")
         check("survives a scope that answers almost nothing", True)
     except Exception as exc:
         check("survives a scope that answers almost nothing", False,
@@ -206,14 +258,12 @@ def main():
         traceback.print_exc()
         return 1
     check("says so rather than crashing", "NO ANSWER" in out2)
-    check("bails out of the averaging phase cleanly",
-          "cannot measure noise" in out2 or "no trigger" in out2)
 
     print()
     if FAILS:
         print(f"FAILED: {len(FAILS)} check(s): {', '.join(FAILS)}")
         return 1
-    print("Probe survives both mocks.")
+    print("Probe survives every mock.")
     return 0
 
 
