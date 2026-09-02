@@ -195,6 +195,12 @@ class Scope:
         self.inst = None
         self.idn = ""
         self.addr = ""
+        # Traces an accumulate() built here rather than on the scope, waiting
+        # for waveform() to collect them, and how many sweeps went into them.
+        # Both empty on any instrument whose own averager can be trusted to do
+        # the job. See accumulate().
+        self.averaged = {}
+        self.averaged_depth = None
 
     def _make_rm(self):
         # A profile may name a VISA implementation to prefer, so a
@@ -295,6 +301,18 @@ class Scope:
         Returns True if it triggered, False on timeout, None if cancelled, and
         raises if the scope stops answering the poll.
         """
+        self.averaged.clear()
+        self.averaged_depth = None
+        # Arming is not free of side effects everywhere: on a Rigol :SINGle is
+        # a :TRIGger:SWEep write and leaves the sweep changed. The profile gets
+        # to save whatever it has to, and gets it back in the finally below.
+        state = self.prof.before_single(self)
+        try:
+            return self._single(wait_s, cancelled)
+        finally:
+            self.prof.after_single(self, state)
+
+    def _single(self, wait_s, cancelled):
         self.inst.write(self.prof.cmd_single)
         started = time.time()
         deadline = None if wait_s <= 0 else started + wait_s
@@ -331,7 +349,7 @@ class Scope:
         return False
 
     def accumulate(self, count, wait_s=10.0, cancelled=None, progress=None,
-                   source=1):
+                   channels=(1,)):
         """Acquire a true `count`-deep average and report how deep it got.
 
         How that is done is the profile's business. What the averager does under
@@ -350,9 +368,18 @@ class Scope:
         ever came, -1 if a record was built but the scope would not say how deep
         it is, None if cancelled. In every case but None the scope is left
         holding a stopped record that the transfer which follows can read.
+
+        `channels` is every channel this capture wants, not just one. An
+        instrument whose own averager cannot be trusted to count - see the
+        DS1000Z profile - has to build the average here instead, and it must
+        read every channel out of the same sweeps or they stop being
+        simultaneous. Such a profile leaves its results in scope.averaged for
+        waveform() to collect.
         """
+        self.averaged.clear()
+        self.averaged_depth = None
         return self.prof.accumulate(self, count, wait_s, cancelled, progress,
-                                    source)
+                                    tuple(channels))
 
     def is_running(self):
         """Whether an acquisition is in progress, with an unanswerable scope
@@ -369,6 +396,8 @@ class Scope:
         acquisition. Stopping first matters: reading memory while the scope is
         still acquiring returns a record torn between two acquisitions. Returns
         whether it had been running, so its state can be put back."""
+        self.averaged.clear()
+        self.averaged_depth = None
         was_running = self.is_running()
         self.inst.write(self.prof.cmd_stop)
         return was_running
@@ -453,6 +482,12 @@ class Scope:
             return n if n > 1 else None
         except Exception:
             return None
+
+    def hit_count(self):
+        """How many hits are in the record being read out, or None. Asked only
+        where a record is known to exist - some instruments answer an error
+        rather than a number when acquisition memory is empty."""
+        return self.prof.hit_count(self)
 
     def is_displayed(self, ch):
         """Whether the scope is showing a channel - one it is not has no record
@@ -1464,7 +1499,7 @@ class App:
                     avg_want, wait_s=wait_s, cancelled=self.stop_flag.is_set,
                     progress=lambda sec: self.set_phase(
                         f"building a {avg_want}-deep average - {sec:.0f} s"),
-                    source=chans[0])
+                    channels=chans)
                 if hits is None:
                     self.log("  cancelled while the average was building - "
                              "nothing saved")
@@ -1524,7 +1559,7 @@ class App:
             # Asked here rather than in the settings read: the waveform transfer
             # above has just succeeded, so there is certainly a record for the
             # scope to describe.
-            hits = self.scope.try_get(self.prof.wave_count)
+            hits = self.scope.hit_count()
             if hits is not None:
                 settings[self.prof.wave_count] = hits
             self.report_averaging(settings, existing=existing)

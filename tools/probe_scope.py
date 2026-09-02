@@ -180,16 +180,54 @@ class Probe:
 
     @staticmethod
     def roughness(v):
-        """A noise figure that does not care what the signal is.
+        """A noise figure that ignores the signal, edges included.
 
-        The standard deviation of the second difference: a smooth waveform of
-        any shape contributes almost nothing, while sample-to-sample noise
-        contributes all of it. Averaging N sweeps should drop this by sqrt(N),
-        which is what makes it a usable ruler for how deep an average really
-        is - and it needs no knowledge of the signal on the probe."""
+        The second difference of a smooth waveform is near zero while
+        sample-to-sample noise contributes all of it, so it makes a ruler for
+        how deep an average really is: averaging N sweeps should drop it by
+        sqrt(N), and it needs no knowledge of what is on the probe.
+
+        The estimator has to be a robust one, though, and this used a standard
+        deviation at first. On a square wave - which is what the probe-comp
+        terminal produces, and what anyone will reach for when told to put a
+        signal on the channel - the two edges produce enormous second
+        differences and a standard deviation is dominated by the handful of
+        samples in them. Averaging does not reduce an edge, so the ratio would
+        have sat near 1 at every depth and the report would have concluded the
+        scope does not average at all.
+
+        So the edges have to be trimmed off rather than averaged in. A median
+        was the first attempt and was worse: once the scope averages, the noise
+        drops below one code, most second differences are then exactly zero,
+        and the median of them is exactly zero too. It reported a perfect 0.000
+        at every depth and measured nothing at all.
+
+        A trimmed RMS keeps both properties. Dropping the largest 2% by
+        magnitude removes the handful of edge samples - a square wave has two
+        transitions in 1200 points, well under that - and what is left is an
+        honest RMS of the noise, which still resolves a sub-code trace instead
+        of collapsing to zero."""
         if v is None or len(v) < 8:
             return float("nan")
-        return float(np.std(np.diff(v, n=2)) / np.sqrt(6.0))
+        d2 = np.diff(np.asarray(v, dtype=float), n=2)
+        if not len(d2):
+            return float("nan")
+        keep = np.abs(d2) <= np.percentile(np.abs(d2), 98)
+        if not keep.any():
+            return float("nan")
+        return float(np.sqrt(np.mean(d2[keep] ** 2)) / np.sqrt(6.0))
+
+    @staticmethod
+    def codes(v):
+        """How many distinct sample values the transferred trace uses.
+
+        The other half of the resolution question. The scope hands back 8-bit
+        codes whatever the format, so an averaged record is re-quantised on
+        transfer: if averaging is smoothing the trace below one code, this
+        number collapses even though the screen looks better."""
+        if v is None or not len(v):
+            return 0
+        return int(len(np.unique(np.asarray(v))))
 
 
 def scan(rm, say, want=("USB", "TCPIP")):
@@ -374,9 +412,14 @@ def phase_trigger(p, say, chan, fix):
         if np.isfinite(rough) and rough > 0:
             if fix:
                 # A level the signal actually crosses, or :SINGle never fires
-                # and phase 3 learns nothing about a stopped record. The
-                # midpoint of what is on screen is the safe choice.
-                mid = float(np.median(v))
+                # and phase 3 learns nothing about a stopped record. Halfway
+                # between the 5th and 95th percentiles: for a square wave that
+                # is the 50% crossing, which is exactly where you want it, and
+                # the percentiles rather than min/max keep one spike from
+                # dragging it off. A plain median would be wrong here - on a
+                # square wave it lands on whichever level has more samples.
+                lo, hi = np.percentile(v, [5, 95])
+                mid = float((lo + hi) / 2.0)
                 p.send(f":TRIGger:EDGe:LEVel {mid:.6e}")
                 p.errors()
                 say(f"    trigger level set to the trace midpoint, {mid:.4g} V,"
@@ -475,6 +518,21 @@ def phase_screenshot(p, say):
     say("  no working PNG form found - the profile will need BMP and a convert")
 
 
+def ratio_str(base, r):
+    """How much the noise fell, or a word when it fell out of sight.
+
+    A ruler of exactly zero is not a failed measurement here: it means the
+    averaged trace has no sample-to-sample variation left at all once it has
+    been re-quantised to 8 bits for transfer. That is a real result and worth
+    saying in words, rather than printing nan and looking like the earlier runs
+    that genuinely measured nothing."""
+    if not np.isfinite(r):
+        return "   n/a"
+    if r <= 0:
+        return "sub-LSB"
+    return f"{base / r:6.2f}"
+
+
 def phase_averaging(p, say, chan, depth):
     """The one the guide cannot answer, and the one that matters most."""
     say.head(f"5. Averaging - the {depth}-deep behaviour, measured")
@@ -487,8 +545,10 @@ def phase_averaging(p, say, chan, depth):
     time.sleep(1.5)
     _, v, _ = p.read_trace(chan, "NORMal")
     base = p.roughness(v)
+    base_codes = p.codes(v)
     say("")
-    say(f"  unaveraged noise ruler: {base:.6g} V")
+    say(f"  unaveraged noise ruler: {base:.6g} V over {base_codes} distinct "
+        f"codes")
     if not np.isfinite(base) or base <= 0:
         say("  !! cannot measure noise - is there a live, triggering signal?")
         say("     Every test below needs one. Stopping this phase.")
@@ -502,10 +562,50 @@ def phase_averaging(p, say, chan, depth):
     p.send(":ACQuire:TYPE AVERages")
     say(f"  :ACQuire:TYPE? -> {p.ask(':ACQuire:TYPE?')}")
 
+    # Q0: does the count report the setting, or the hits so far? This is the
+    # one question the noise ruler cannot reach - readback quantisation puts a
+    # floor under it - and it is answerable on its own by asking for a deep
+    # average and watching the number from the first moment it exists.
+    say("")
+    say("  Q0  Does the preamble count report the SETTING or the hits so far?")
+    say("      Asking for a deep average and reading the count straight away:")
+    say("      a number that jumps to the setting reports the setting; one")
+    say("      that climbs is counting real hits. (MSO-X: reports the setting")
+    say("      the moment RUN is involved, which made a poll declare a")
+    say("      contaminated average complete immediately.)")
+    deep = 1024
+    p.send(":ACQuire:TYPE NORMal")
+    p.send(":RUN")
+    time.sleep(0.8)
+    p.send(f":ACQuire:AVERages {deep}")
+    p.send(":ACQuire:TYPE AVERages")
+    t0 = time.time()
+    counts = []
+    for _ in range(14):
+        _, v, pre = p.read_trace(chan, "NORMal")
+        c = pre["count"] if pre else "?"
+        counts.append(c)
+        say(f"      t={time.time() - t0:5.1f}s  count={c:>6}  "
+            f"noise={p.roughness(v):.6g}  codes={p.codes(v)}")
+        time.sleep(0.7)
+    uniq = [c for i, c in enumerate(counts) if i == 0 or c != counts[i - 1]]
+    say(f"      count went: {' -> '.join(uniq)}")
+    if len(uniq) == 1 and uniq[0] == str(deep):
+        say(f"      -> pinned at the setting from the first read: it reports")
+        say(f"         the SETTING, exactly as the MSO-X does. A poll on this")
+        say(f"         number cannot tell you an average is finished.")
+    elif len(uniq) > 1:
+        say("      -> it climbed, so it is counting real hits. This is better")
+        say("         than the MSO-X and a build can be polled to completion.")
+    p.send(f":ACQuire:AVERages {depth}")
+    p.errors()
+
     # Q1: under RUN, does the average build to depth and stop, or keep running?
     say("")
-    say("  Q1  Under RUN, does noise settle at sqrt(N) and the count stop?")
-    say("      (MSO-X: exponential running average, count reports the SETTING)")
+    say(f"  Q1  Under RUN, does noise settle at sqrt({depth}) and stay there?")
+    say("      (MSO-X: exponential running average - it never settles, and it")
+    say("      carries a memory of whatever played before)")
+    say(f"      unaveraged: noise={base:.6g}, codes={base_codes}")
     p.send(":RUN")
     t0 = time.time()
     for _ in range(10):
@@ -513,10 +613,13 @@ def phase_averaging(p, say, chan, depth):
         _, v, pre = p.read_trace(chan, "NORMal")
         r = p.roughness(v)
         say(f"      t={time.time() - t0:5.1f}s  noise={r:.6g}  "
-            f"ratio={base / r if r else float('nan'):6.2f}  "
+            f"ratio={ratio_str(base, r)}  "
+            f"codes={p.codes(v):>4}  "
             f"preamble count={pre['count'] if pre else '?'}")
     say(f"      expected ratio at a true {depth}-deep average: "
         f"{np.sqrt(depth):.2f}")
+    say("      codes falling as the ratio rises = averaging is smoothing the")
+    say("      trace below what an 8-bit transfer can carry.")
 
     # Q2: does anything reset it?
     say("")
@@ -551,14 +654,63 @@ def phase_averaging(p, say, chan, depth):
     time.sleep(0.3)
     p.send(":CLEar")
     single_shot(p, say, wait_s=15.0)
+    # Stop before reading. single_shot puts the sweep back the way it found it,
+    # which here means AUTO, so the scope starts free-running again the instant
+    # the single completes and the record moves under the read. The first go at
+    # this returned an empty trace for exactly that reason.
+    p.send(":STOP")
     time.sleep(0.5)
     _, v, pre = p.read_trace(chan, "NORMal")
     single = p.roughness(v)
     say(f"      after :SINGle  noise={single:.6g}  "
-        f"ratio={base / single if single else float('nan'):.2f}  "
+        f"ratio={ratio_str(base, single)}  codes={p.codes(v)}  "
         f"count={pre['count'] if pre else '?'}")
     say(f"      ratio near 1.00 = one hit; near {np.sqrt(depth):.2f} = "
         f"a real {depth}-deep average")
+
+    # Q5: if the scope cannot be trusted to count an average, can we just do
+    # it ourselves? This is the one that decides the design, so it is measured
+    # rather than assumed.
+    say("")
+    say("  Q5  Software averaging: N plain traces averaged here, against the")
+    say("      scope's own N-deep average.")
+    say("      The scope hands back 8-bit codes whatever the format, so its")
+    say("      average is re-quantised on transfer and arrives with the")
+    say("      resolution thrown away. Averaging raw traces in float here")
+    say("      should keep it. If so, that is how the profile should do it.")
+    p.send(":ACQuire:TYPE NORMal")
+    p.send(":RUN")
+    time.sleep(0.5)
+    stack, seen_first = [], None
+    t0 = time.time()
+    for _ in range(depth):
+        _, v, _ = p.read_trace(chan, "NORMal")
+        if v is None or not len(v):
+            continue
+        if seen_first is None:
+            seen_first = v
+        stack.append(v)
+    took = time.time() - t0
+    if len(stack) < 4:
+        say(f"      only got {len(stack)} traces - cannot compare")
+    else:
+        arr = np.vstack(stack)
+        # Consecutive reads can land on the same sweep. Count how many are
+        # actually distinct, or the depth claimed here is as dishonest as the
+        # scope's own count.
+        distinct = len(np.unique(arr, axis=0))
+        mean = arr.mean(axis=0)
+        say(f"      {len(stack)} traces in {took:.1f} s "
+            f"({took / max(1, len(stack)) * 1000:.0f} ms each), "
+            f"{distinct} of them distinct sweeps")
+        say(f"      one raw trace     noise={p.roughness(seen_first):.6g}  "
+            f"codes={p.codes(seen_first)}")
+        say(f"      averaged here     noise={p.roughness(mean):.6g}  "
+            f"ratio={ratio_str(base, p.roughness(mean))}  "
+            f"codes={p.codes(mean)}")
+        say(f"      (the scope's own {depth}-deep average above, for contrast)")
+        say(f"      expected ratio for {distinct} honest hits: "
+            f"{np.sqrt(max(1, distinct)):.2f}")
 
     # Q4: is there any honest counted build?
     say("")

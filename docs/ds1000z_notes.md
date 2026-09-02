@@ -144,46 +144,73 @@ DS1054Z, `DS1ZA184752794`, firmware **00.04.04.SP1**, over USB
    Rigol's `EDGe`. So that root can be spelled the same in both profiles.
    `:TRIGger:EDGE:REJect` still does not exist; it is `:TRIGger:COUPling`.
 
-### Not settled, because the signal was inadequate
+### The averager, measured on a proper signal
 
-CH2 carried a DC level with about one LSB of dither - **two distinct ADC codes
-across the whole 1200-point trace** - and no edges. That is enough to prove a
-scope is alive and nowhere near enough to measure an averager.
+The first two runs measured nothing here: the channel carried a DC level with
+one LSB of dither and no edges, so nothing triggered and the noise ruler was
+quantisation-limited. With CH1 on the probe-comp terminal - a 1 kHz square -
+all of it came out.
 
-- **Does the averager run or block under RUN?** The noise ratio sat at 4.6-5.3
-  against an expected sqrt(64) = 8 and never climbed over 11 s. That is
-  consistent with a running average that had already converged before the first
-  read, and equally consistent with the ruler hitting the 8-bit readback floor.
-  Cannot separate the two on this signal.
-- **Does the preamble count report the setting or the accumulated depth?** It
-  read 64 from the first sample and never moved, including immediately after a
-  `:CLEar`. Suggestive of the setting, as on the MSO-X, but a fast free-running
-  AUTO sweep could have reached 64 hits inside the first second.
-- **What does `:SINGle` give in averaging mode?** Nothing measured: with no
-  edges the single shot never fired, so every "after `:SINGle`" reading is the
-  *previous* record being served again.
-- **Does a stop/run cycle reset it?** The reading afterwards was byte-identical
-  to the one before, so it was a stale record rather than a fresh sweep.
+**The count reports the SETTING, not the hits so far.** Asking for a 1024-deep
+average made the preamble count read `1024` within 0.4 s and sit there, while
+the noise on the trace was still visibly falling for another five seconds
+(0.0126 -> 0.0040 V). It claims the average is finished long before it is.
+Exactly the MSO-X trap, and it means **polling cannot tell you an average is
+complete**.
 
-### The one worth chasing
+**Nothing resets the averager.** Not `:CLEar`, not a stop/run cycle. So a
+hardware average always carries whatever was on the probe before it.
 
-The Rigol hands back 8-bit codes whatever the format. The MSO-X does not - its
-WORD readback carries a genuine 16x on an averaged record, which is why
-`read_waveform` uses WORD there. So an averaged Rigol record is **re-quantised
-to 8 bits on transfer**, and averaging may improve what is on the screen more
-than it improves what lands in the CSV.
+**There is no `:DIGitize`.** `-113,"Undefined header"`.
 
-If that is right it matters for how this scope gets used, not just for the
-profile. It is inference from a two-level trace so far, and the next run should
-measure it directly: average depth against the number of distinct codes in the
-transferred record.
+Three ways of being lied to and no way to check, which is what drives the
+design below.
 
-### What the next run needs
+The one question left genuinely open is whether the averager is running or
+block. The noise ratio settled at 4.7-5.9 against sqrt(64) = 8, which is
+consistent with either once the 8-bit readback floor is allowed for, and
+separating them would need a controlled step change in the signal. It stopped
+mattering: the profile does not use the hardware averager at all.
 
-A real signal - edges to trigger on, and amplitude across a good part of the
-screen. The DS1054Z has one on its own front panel: the probe-compensation
-terminal, a 1 kHz square wave of about 3 Vpp. Clip the probed channel to it and
-every question above becomes answerable.
+`:SINGle` in averaging mode was never measured either - the read after it came
+back empty each time. Same reason it stopped mattering.
+
+### Why the profile averages in software
+
+Given a counter that lies, no reset, and no counted build, there is nothing to
+build a trustworthy hardware average on. Averaging in `accumulate()` instead
+turns out to be better rather than merely safer, and the deciding measurement
+was direct: **64 sweeps averaged here came back using 188 distinct codes; the
+scope's own 64-deep average came back using 13-14.** Thirteen times the
+effective resolution, from the same 64 sweeps.
+
+The reason is the 8-bit readback. The scope averages internally and then
+re-quantises to 8 bits on the way out, so most of what averaging bought is
+thrown away in the transfer. Summing raw codes in float here keeps it. This is
+the mirror image of the MSO-X, where WORD readback carries a real 16x on an
+averaged record and using the hardware averager is the right answer.
+
+It also gets an exact, known depth - the sweeps are counted here - and no
+contamination, because the sum starts empty every time. `accumulate()` reads
+every channel out of the same sweeps so they stay simultaneous, discards a
+record identical to the previous one so a fast read cannot inflate the depth,
+and files the honest number where the metadata will find it.
+
+**The cost is speed.** Each sweep is a VISA round trip, measured at about
+157 ms for 1200 points in the probe and ~110 ms in the profile's tighter loop,
+so a 64-deep average takes several seconds where the MSO-X's `:DIGitize` would
+take 64 trigger periods. Deep averages are correspondingly slow: 1024 deep is
+around two minutes. If that becomes a problem the fix is to stop re-sending
+the readout setup on every sweep, which is most of the round trip.
+
+### Verified against the instrument
+
+`tools/check_profile.py ds1054z` runs the profile through `Scope`, the same
+path the GUI uses. All 47 panel fields answer; a plain capture returns 1200
+points of sane volts; `single()` leaves the trigger sweep exactly as it found
+it; an 8-deep average builds in 0.9 s and raises the trace from 21 to 32
+distinct levels; the screenshot is a PNG; the metadata file comes out with no
+unknowns; and every setting it touched came home.
 
 ## Running the probe
 
