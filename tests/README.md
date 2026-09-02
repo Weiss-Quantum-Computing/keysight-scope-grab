@@ -14,6 +14,7 @@ nothing opens a VISA session.
 | `test_output.py` | The metadata `.txt` and the setup `.txt` against golden copies |
 | `test_panel.py` | The window, the profile wiring, and the connect logic against a fake VISA layer |
 | `cases.py` | The settings snapshot and the metadata cases both of the above are built from |
+| `test_probe.py` | `tools/probe_scope.py` driven against mock instruments |
 | `golden/` | Expected output, byte for byte |
 
 ## What the goldens are
