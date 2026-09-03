@@ -16,6 +16,7 @@ import io
 import json
 import os
 import queue
+import re
 import threading
 import time
 import tkinter as tk
@@ -252,6 +253,101 @@ def describe_setup(cfg):
             lines.append(f"  CH{ch} {'on ' if ticked.get(ch) else 'off'}"
                          f"  {names.get(ch, '')}".rstrip())
     return "\n".join(lines) + "\n"
+
+
+# -- averaging a numbered sequence ------------------------------------------
+#
+# A sequence is N single shots of the same thing. Their mean has the
+# shot-to-shot noise down by sqrt(N) and keeps anything that repeats -- which
+# is how a ripple that is a few tenths of a millivolt against a millivolt of
+# single-shot scatter becomes visible. Pure file work: no instrument, so it
+# runs whether or not the scope is connected, and other programs can import it.
+
+def sequence_files(outdir, prefix):
+    """The numbered CSVs of a sequence, {label: path}, in run order. Labels
+    keep their zero-padding as found, so a series written as _001 reads back
+    as '001'."""
+    pat = re.compile(re.escape(prefix) + r"_(\d+)\.csv$")
+    out = {}
+    try:
+        for n in os.listdir(outdir):
+            m = pat.match(n)
+            if m:
+                out[m.group(1)] = os.path.join(outdir, n)
+    except OSError:
+        pass
+    return dict(sorted(out.items(), key=lambda kv: int(kv[0])))
+
+
+def average_sequence(outdir, prefix, first=None, last=None, log=None):
+    """Average the numbered runs of `prefix` (optionally labels first..last)
+    into <prefix>_avg_<first>-<last>.csv, with a .txt sidecar made from the
+    first run's, headed by what was averaged.
+
+    Every run has to carry the same columns, the same point count and the
+    same time base -- a sequence taken through one scope setup does, and
+    one that changed setup mid-way is refused rather than blended. A gap in
+    the series (a deleted run) is skipped and reported. Returns
+    (csv_path, [labels used]). Raises ValueError on anything it cannot do.
+    """
+    say = log or (lambda *_: None)
+    files = sequence_files(outdir, prefix)
+    if not files:
+        raise ValueError(f"no numbered files {prefix}_NNN.csv in {outdir}")
+    labels = list(files)
+    if first is not None:
+        labels = [l for l in labels if int(l) >= int(first)]
+    if last is not None:
+        labels = [l for l in labels if int(l) <= int(last)]
+    if len(labels) < 2:
+        raise ValueError(f"need at least two runs to average; {prefix} has "
+                         f"{len(labels)} in that range (of {len(files)} on disk)")
+    lo, hi = int(labels[0]), int(labels[-1])
+    missing = sorted(set(range(lo, hi + 1)) - {int(l) for l in labels})
+    if missing:
+        say(f"  labels missing from the series and skipped: "
+            f"{', '.join(map(str, missing))}")
+
+    header, acc, t0, n = None, None, None, 0
+    for lab in labels:
+        with open(files[lab], "r", encoding="utf-8") as fh:
+            head = fh.readline().strip()
+        data = np.loadtxt(files[lab], delimiter=",", skiprows=1, ndmin=2)
+        if header is None:
+            header, t0, acc = head, data[:, 0], np.zeros_like(data[:, 1:])
+        elif head != header:
+            raise ValueError(f"{os.path.basename(files[lab])} has columns "
+                             f"{head!r}; the first run has {header!r}")
+        elif data.shape != (len(t0), acc.shape[1] + 1):
+            raise ValueError(f"{os.path.basename(files[lab])} has "
+                             f"{data.shape[0]} points x {data.shape[1]} cols; "
+                             f"the first run has {len(t0)} x {acc.shape[1] + 1}")
+        elif np.abs(data[:, 0] - t0).max() > 1e-3 * float(np.median(np.diff(t0))):
+            raise ValueError(f"{os.path.basename(files[lab])} is on a different "
+                             f"time base from the first run -- the setup changed "
+                             f"mid-sequence")
+        acc += data[:, 1:]
+        n += 1
+    mean = acc / n
+    width = len(labels[0])
+    base = os.path.join(outdir, f"{prefix}_avg_{lo:0{width}d}-{hi:0{width}d}")
+    np.savetxt(base + ".csv", np.column_stack([t0, mean]), delimiter=",",
+               header=header, comments="",
+               fmt=[TIME_FMT] + [VOLT_FMT] * mean.shape[1])
+    side = files[labels[0]][:-4] + ".txt"
+    body = open(side, "r", encoding="utf-8").read() if os.path.exists(side) else ""
+    with open(base + ".txt", "w", encoding="utf-8") as fh:
+        fh.write(f"averaged from      : {n} runs, labels {labels[0]}-{labels[-1]}"
+                 + (f" (missing: {', '.join(map(str, missing))})" if missing else "")
+                 + "\n")
+        fh.write(f"averaging          : mean of the CSV samples per channel; "
+                 f"time base from run {labels[0]}; single-shot scatter down by "
+                 f"sqrt({n}) = {n ** 0.5:.1f}x\n")
+        fh.write(f"settings below are : run {labels[0]}'s\n")
+        fh.write(body)
+    say(f"{os.path.basename(base)}.csv  (mean of {n} runs, "
+        f"{len(t0)} pts x {mean.shape[1]} cols)")
+    return base + ".csv", labels
 
 
 class Scope:
@@ -808,6 +904,11 @@ class App:
         self.seq_btn.pack(side="left")
         self.seq_status = ttk.Label(row2, text="idle", foreground="#666")
         self.seq_status.pack(side="left", padx=8)
+        # Averaging needs files, not the instrument, so it is live whenever
+        # nothing is running -- connected or not.
+        self.avg_btn = ttk.Button(row2, text="Average sequence...",
+                                  command=self.do_average)
+        self.avg_btn.pack(side="right")
         self.seq_next = tk.StringVar()
         ttk.Label(qf, textvariable=self.seq_next, foreground="#666").pack(
             anchor="w", padx=8, pady=(0, 6))
@@ -1366,6 +1467,8 @@ class App:
             if btn is not None and btn.winfo_exists():
                 btn.configure(state="disabled" if busy or self.seq_active
                               else "normal")
+        self.avg_btn.configure(state="disabled" if busy or self.seq_active
+                               else "normal")
         # During a one-off grab the GRAB button becomes the way to call off a
         # long trigger wait. A sequence has its own Stop button instead.
         if busy and not self.seq_active:
@@ -2083,6 +2186,66 @@ class App:
         self.seq_next.set(f"next file: {name}" if first == start else
                           f"next file: {name}  ({count} runs from "
                           f"{start:0{width}d} would land on files already there)")
+
+    def do_average(self):
+        """Average the current prefix's numbered runs into one CSV -- a
+        small dialog picks the label range, prefilled with what is on disk."""
+        outdir, prefix = self.outdir.get(), self.safe_prefix()
+        files = sequence_files(outdir, prefix)
+        if len(files) < 2:
+            return messagebox.showerror(
+                "Average sequence",
+                f"{prefix} has {len(files)} numbered run(s) in\n{outdir}\n\n"
+                f"An average needs at least two ({prefix}_NNN.csv).")
+        labels = list(files)
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Average sequence")
+        dlg.transient(self.root)
+        dlg.grab_set()
+        fr = ttk.Frame(dlg, padding=10)
+        fr.pack(fill="both", expand=True)
+        ttk.Label(fr, text=f"{prefix}: {len(files)} numbered runs on disk, "
+                           f"labels {labels[0]}-{labels[-1]}").grid(
+            row=0, column=0, columnspan=4, sticky="w")
+        ttk.Label(fr, text="from label").grid(row=1, column=0, sticky="w",
+                                              pady=(8, 0))
+        v_first = tk.StringVar(value=labels[0])
+        ttk.Entry(fr, textvariable=v_first, width=8).grid(row=1, column=1,
+                                                          sticky="w", pady=(8, 0))
+        ttk.Label(fr, text="to label").grid(row=1, column=2, sticky="w",
+                                            padx=(12, 0), pady=(8, 0))
+        v_last = tk.StringVar(value=labels[-1])
+        ttk.Entry(fr, textvariable=v_last, width=8).grid(row=1, column=3,
+                                                         sticky="w", pady=(8, 0))
+        ttk.Label(fr, foreground="#666", justify="left", text=(
+            "Writes <prefix>_avg_<from>-<to>.csv beside the runs, plus a .txt\n"
+            "made from the first run's, headed by what was averaged. Runs must\n"
+            "share columns, point count and time base; a gap is skipped.")).grid(
+            row=2, column=0, columnspan=4, sticky="w", pady=(8, 0))
+
+        def go():
+            try:
+                first, last = int(v_first.get()), int(v_last.get())
+            except ValueError:
+                return messagebox.showerror("Average sequence",
+                                            "labels are whole numbers",
+                                            parent=dlg)
+            dlg.destroy()
+            try:
+                path, used = average_sequence(outdir, prefix, first, last,
+                                              log=self.log)
+            except (ValueError, OSError) as e:
+                self.log(f"Average sequence: {e}")
+                return messagebox.showerror("Average sequence", str(e))
+            self.log(f"  averaged runs {used[0]}-{used[-1]} ({len(used)}) -> "
+                     f"{os.path.basename(path)}")
+
+        bb = ttk.Frame(fr)
+        bb.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(10, 0))
+        ttk.Button(bb, text="Average", command=go).pack(side="left", fill="x",
+                                                        expand=True)
+        ttk.Button(bb, text="Cancel", command=dlg.destroy).pack(side="left",
+                                                                 padx=(6, 0))
 
     def do_sequence(self):
         if self.seq_active:

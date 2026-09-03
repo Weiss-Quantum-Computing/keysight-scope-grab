@@ -228,6 +228,34 @@ inside each `.txt`, which also gains a `sequence label` line.
 - Auto-grab is switched off when a sequence starts, since only one repeating
   mechanism should drive the scope at a time.
 
+### Averaging a sequence
+
+A sequence is N single shots of the same thing, and their mean has the
+shot-to-shot noise down by sqrt(N) while keeping anything that repeats - which
+is how a ripple of a few tenths of a millivolt, buried in a millivolt of
+single-shot scatter, becomes visible. **Average sequence...** takes the current
+prefix's numbered runs from the output folder and writes
+
+```
+<prefix>_avg_<first>-<last>.csv
+<prefix>_avg_<first>-<last>.txt
+```
+
+beside them: the CSV is the per-channel mean on the first run's time base, in
+the same columns and format as a run, and the `.txt` is the first run's,
+headed by what was averaged (`averaged from : 64 runs, labels 001-064`). A
+small dialog picks the label range, prefilled with the whole series. Runs have
+to share columns, point count and time base - a sequence taken through one
+setup does, and one that changed setup half-way is refused rather than
+blended. A hole in the series (a run deleted) is skipped and named in the log.
+
+It is file work only, so it runs whether or not the scope is connected, and
+`average_sequence(outdir, prefix)` can be imported by other programs. It is
+not the same thing as the scope's own AVERage mode below: that averages inside
+the instrument before anything is read out and is limited to what the scope's
+memory and trigger scheme allow, while this averages files you already have,
+at whatever readout depth and vertical range they were taken with.
+
 ### How short can the interval be?
 
 The limit is usually writing the CSV rather than the USB transfer. Measured with
@@ -406,6 +434,9 @@ live with the scope unplugged, and grey out only while a grab or sequence is
 running.
 
 ## Averaging
+
+(For averaging the files of a numbered sequence after the fact, see
+**Averaging a sequence** above.)
 
 Set **Acquisition** to `AVER` and put the depth in **Averages** - the scope rounds it
 to a power of two between 2 and 65536, and the panel shows you what it settled on.
