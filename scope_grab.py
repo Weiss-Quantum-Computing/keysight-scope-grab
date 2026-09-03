@@ -47,6 +47,15 @@ SETUP_DIR = os.path.join(os.path.expanduser("~"), "Desktop", "scope_setups")
 # significant digits already record far more than the scope resolves, and the
 # default %.18e was writing (and costing) fifteen digits of noise per sample.
 # Time keeps more digits because a long record has to separate adjacent samples.
+# One ADC code as a fraction of the V/div setting, for the offset dither below.
+# The MSO-X 2014A's 8-bit converter carries a fixed error pattern per code --
+# measured 2 Sep 2026 on the Trek monitor: ~3.4 mV pk-pk over a 40.25 mV code
+# at 1 V/div, repeating exactly every 40.25 mV of input (10.24 V / 256). A slow
+# ramp sweeps through it at slope/code, which lands in the tens of kHz, and
+# because it is a function of VOLTAGE an average of identical shots keeps it
+# whole. Another scope has another code size: change this for it.
+ADC_CODE_PER_VDIV = 0.04025
+
 TIME_FMT = "%.9e"
 VOLT_FMT = "%.6e"
 
@@ -912,6 +921,23 @@ class App:
         self.seq_next = tk.StringVar()
         ttk.Label(qf, textvariable=self.seq_next, foreground="#666").pack(
             anchor="w", padx=8, pady=(0, 6))
+        # Offset dither: step every ticked channel's offset across a few ADC
+        # codes over the runs, so the converter's per-code error pattern is
+        # sampled at a different phase in every run and 'Average sequence...'
+        # averages it out. The preamble's yorigin already puts each run's
+        # volts right, so the runs themselves are unchanged; only the mean of
+        # them gains. Offsets go back when the sequence ends, however it ends.
+        row3 = ttk.Frame(qf)
+        row3.pack(fill="x", padx=6, pady=(0, 6))
+        self.seq_dither = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row3, variable=self.seq_dither,
+                        text="dither offsets across").pack(side="left")
+        self.seq_dither_codes = tk.StringVar(value="3")
+        ttk.Entry(row3, textvariable=self.seq_dither_codes, width=4).pack(
+            side="left", padx=(4, 2))
+        ttk.Label(row3, text="ADC codes over the runs (then Average sequence)",
+                  foreground="#666").pack(side="left")
+        self.seq_dither_plan = {}      # {ch: (offset0, span V)} while running
         for var in (self.prefix, self.seq_start, self.seq_count):
             var.trace_add("write", lambda *_: self.show_next_name())
         self.show_next_name()
@@ -1015,6 +1041,8 @@ class App:
             "seq_count": self.seq_count.get(),
             "seq_interval": self.seq_interval.get(),
             "seq_start": self.seq_start.get(),
+            "seq_dither": self.seq_dither.get(),
+            "seq_dither_codes": self.seq_dither_codes.get(),
             "auto_interval": self.interval.get(),
             "save_png": self.save_png.get(),
         }
@@ -1062,6 +1090,7 @@ class App:
                          ("seq_count", self.seq_count),
                          ("seq_interval", self.seq_interval),
                          ("seq_start", self.seq_start),
+                         ("seq_dither_codes", self.seq_dither_codes),
                          ("auto_interval", self.interval)):
             value = cfg.get(key)
             if isinstance(value, str) and value.strip():
@@ -1073,6 +1102,9 @@ class App:
         save_png = cfg.get("save_png")
         if isinstance(save_png, (bool, int)):
             self.save_png.set(bool(save_png))
+        dither = cfg.get("seq_dither")
+        if isinstance(dither, (bool, int)):
+            self.seq_dither.set(bool(dither))
         names = cfg.get("channel_names")
         if isinstance(names, dict):
             for ch, var in self.ch_names.items():
@@ -2289,8 +2321,34 @@ class App:
                      f"land on files already there - starting at "
                      f"{first:0{self.seq_width}d}, the first clear stretch")
         self.seq_index = first
+        self.seq_first = first
         self.seq_last = first + count - 1
         self.seq_gap = max(0.0, gap)
+        self.seq_dither_plan = {}
+        if self.seq_dither.get():
+            try:
+                codes = max(int(float(self.seq_dither_codes.get())), 1)
+            except ValueError:
+                self.log("Sequence: the dither width must be a number of codes.")
+                return
+            if count < 2:
+                self.log("Sequence: a dither needs at least two runs to average.")
+                return
+            for ch in chans:
+                try:
+                    scale = float(self.scope.get(f":CHANnel{ch}:SCALe"))
+                    off = float(self.scope.get(f":CHANnel{ch}:OFFSet"))
+                except Exception as exc:
+                    self.log(f"Sequence: could not read CH{ch}'s scale/offset "
+                             f"for the dither ({exc}) - running without it")
+                    self.seq_dither_plan = {}
+                    break
+                self.seq_dither_plan[ch] = (off, codes * ADC_CODE_PER_VDIV * scale)
+            if self.seq_dither_plan:
+                self.log("Sequence: dithering " + ", ".join(
+                    f"CH{ch} over {span*1e3:.0f} mV ({codes} code{'s' if codes > 1 else ''})"
+                    for ch, (_, span) in self.seq_dither_plan.items())
+                    + f" across the {count} runs; offsets restored at the end")
         self.seq_done = 0
         self.seq_t0 = time.time()
         self.stop_flag.clear()
@@ -2330,6 +2388,17 @@ class App:
         self.seq_status.configure(
             text=f"run {label} of {self.seq_last:0{self.seq_width}d}", foreground="#060")
         self.seq_started = time.time()
+        if self.seq_dither_plan:
+            # evenly spaced across the span, centred on the original offset;
+            # the preamble's yorigin carries it, so the CSV volts are true
+            count = self.seq_last - self.seq_first + 1
+            k = self.seq_index - self.seq_first
+            for ch, (off0, span) in self.seq_dither_plan.items():
+                want = off0 + span * ((k + 0.5) / count - 0.5)
+                try:
+                    self.scope.put(f":CHANnel{ch}:OFFSet", f"{want:.6g}")
+                except Exception as exc:
+                    self.log(f"  dither: could not set CH{ch} offset ({exc})")
         self.set_busy(True)
         threading.Thread(target=self._grab_worker, args=(self.channels(), label),
                          daemon=True).start()
@@ -2372,6 +2441,15 @@ class App:
             self.root.after_cancel(self.seq_job)
             self.seq_job = None
         self.seq_active = False
+        if self.seq_dither_plan:
+            for ch, (off0, _) in self.seq_dither_plan.items():
+                try:
+                    self.scope.put(f":CHANnel{ch}:OFFSet", f"{off0:.6g}")
+                except Exception as exc:
+                    self.log(f"  dither: could not restore CH{ch} offset "
+                             f"{off0:+.5g} V ({exc})")
+            self.log("  dither: offsets restored")
+            self.seq_dither_plan = {}
         self.seq_btn.configure(text="Start sequence")
         self.seq_status.configure(
             text=f"stopped after {self.seq_done}" if aborted else f"done ({self.seq_done} runs)",

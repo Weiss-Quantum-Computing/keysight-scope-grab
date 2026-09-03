@@ -256,6 +256,26 @@ the instrument before anything is read out and is limited to what the scope's
 memory and trigger scheme allow, while this averages files you already have,
 at whatever readout depth and vertical range they were taken with.
 
+### Dithering the offset across a sequence
+
+The MSO-X's 8-bit converter carries a fixed error pattern per code - about
+3.4 mV peak-to-peak over the 40.25 mV code at 1 V/div, repeating exactly every
+40.25 mV of input. A ramp sweeps through it at slope/code, which for a
+millivolt-per-microsecond ramp lands in the tens of kHz, and because the
+pattern is a function of *voltage* an average of identical shots keeps every
+bit of it. Tick **dither offsets across N ADC codes** and a sequence steps each
+ticked channel's offset across that many codes over its runs, evenly spaced
+and centred on the offset you set, so every run samples the pattern at a
+different phase and **Average sequence...** averages it out. Three codes is a
+good default: it takes the code-to-code variation as well, and 64 runs is
+still 21 phases per code.
+
+Nothing about the runs themselves changes - the scope's preamble carries the
+offset, so every CSV is in true volts - only their mean gains. The offsets are
+put back when the sequence ends, whether it finishes or is stopped. The code
+size is `ADC_CODE_PER_VDIV` at the top of `scope_grab.py`, measured for the
+MSO-X 2014A; another scope has another.
+
 ### How short can the interval be?
 
 The limit is usually writing the CSV rather than the USB transfer. Measured with
