@@ -11,6 +11,7 @@ Run with:  pythonw scope_grab.py      (pythonw = no console window)
 """
 
 import base64
+import csv
 import datetime
 import io
 import json
@@ -29,6 +30,66 @@ try:
     from PIL import Image, ImageTk        # smooth (Lanczos) preview rescale
 except ImportError:                       # without pillow: Tk's integer subsample
     Image = ImageTk = None
+
+# The plot tabs. Capture works without matplotlib - the tabs then say what to
+# install - and the ledgers (Statistics, Measurements) never needed it.
+try:
+    import matplotlib
+    import matplotlib.colors as mcolors
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_tkagg import (FigureCanvasTkAgg,
+                                                   NavigationToolbar2Tk)
+except ImportError:
+    matplotlib = mcolors = Figure = FigureCanvasTkAgg = NavigationToolbar2Tk = None
+NO_MPL = ("matplotlib is not installed, so this tab cannot draw.\n"
+          "pip install matplotlib   - the Statistics and Measurements tabs work "
+          "without it.")
+
+# Plot colours, the ILC panel's scheme: the current prefix's runs ride a viridis
+# ramp, oldest dark to newest yellow, and each compare key takes one of these -
+# hues that sit far from that ramp - with its older runs blended toward white.
+# Compare traces draw under the current prefix's (CMP_ZORDER: below a line's
+# default 2, above the grid's 1.5).
+CMP_COLOURS = ["#ff7f0e", "#e377c2", "#8c564b", "#d62728", "#17becf", "#7f7f7f"]
+CMP_ZORDER = 1.8
+# Traces per pane past which the legend is left off - a 64-run sequence is a
+# ramp of colour, not a list of names.
+LEGEND_MAX = 12
+
+
+def _cosine_window(n, a):
+    """Generalised cosine window: sum_i (-1)^i a_i cos(2 pi i k/(N-1))."""
+    k = np.arange(n) / max(n - 1, 1)
+    return sum(((-1) ** i) * ai * np.cos(2 * np.pi * i * k)
+               for i, ai in enumerate(a))
+
+
+# FFT windows for the Spectrum tab, by name. The usual trade between side-lobe
+# suppression and main-lobe width: hann for looking; the 4-term Blackman-Harris
+# (-92 dB) for a weak line beside a strong one; flat-top for the height of a line
+# rather than its position; rectangular for a record that already ends where it
+# started, which is the only case it does not smear.
+WINDOWS = {
+    "hann": lambda n: _cosine_window(n, (0.5, 0.5)),
+    "blackman-harris": lambda n: _cosine_window(
+        n, (0.35875, 0.48829, 0.14128, 0.01168)),
+    "flat-top": lambda n: _cosine_window(
+        n, (0.21557895, 0.41663158, 0.277263158, 0.083578947, 0.006947368)),
+    "rectangular": np.ones,
+}
+SPEC_UNITS = {"V rms": "rms", "V/sqrt(Hz)": "asd"}
+# The measurements the scope's own Snapshot All lists, in its order, with the
+# unit each is shown in. Computed from the samples by measure().
+MEAS_COLUMNS = [
+    ("Vpp", "V"), ("Vmax", "V"), ("Vmin", "V"), ("Vtop", "V"), ("Vbase", "V"),
+    ("Vamp", "V"), ("Vavg", "V"), ("Vrms", "V"), ("Vrms AC", "V"),
+    ("Freq", "Hz"), ("Period", "s"), ("+Width", "s"), ("-Width", "s"),
+    ("Duty", "%"), ("Rise", "s"), ("Fall", "s"),
+    ("Overshoot", "%"), ("Preshoot", "%"),
+    ("X@max", "s"), ("X@min", "s"), ("Area", "Vs"),
+]
+# What the scope answers for a measurement it could not make.
+NOT_MEASURED = 9.9e37
 
 KTVISA = r"C:\Windows\System32\ktvisa32.dll"
 # Remembered between sessions: output folder, filename prefix, channel names.
@@ -359,6 +420,340 @@ def average_sequence(outdir, prefix, first=None, last=None, log=None):
     return base + ".csv", labels
 
 
+# ---------------------------------------------------------------------------
+# Reading captures back: what the plot tabs draw and the ledgers tabulate.
+# Everything here works from the files alone, so it serves a capture from any
+# folder and needs no instrument.
+# ---------------------------------------------------------------------------
+
+def capture_files(outdir, prefix):
+    """Every CSV of `prefix` in `outdir`, {run: path} in name order. The run
+    is whatever follows the prefix: '003' for a sequence run, '20260903_120000'
+    for a one-off, 'avg_001-064' for an averaged sequence. Name order puts a
+    sequence in run order and one-offs in capture order."""
+    head = prefix + "_"
+    out = {}
+    try:
+        names = sorted(n for n in os.listdir(outdir)
+                       if n.lower().endswith(".csv") and n.startswith(head))
+    except OSError:
+        return out
+    for n in names:
+        out[n[len(head):-4]] = os.path.join(outdir, n)
+    return out
+
+
+def split_capture_name(path):
+    """(prefix, run) of a capture's filename, by the patterns Scope Grab
+    writes: prefix_NNN, prefix_YYYYMMDD_HHMMSS[_n], prefix_avg_A-B. A file
+    named any other way is its own prefix with no run."""
+    stem = os.path.basename(path)
+    if stem.lower().endswith(".csv"):
+        stem = stem[:-4]
+    # Shortest prefix that leaves a whole run behind it, so a timestamp with a
+    # _2 collision suffix is one run and a prefix that ends in digits keeps them.
+    m = re.match(r"^(.+?)_(\d+|\d{8}_\d{6}(?:_\d+)?|avg_\d+-\d+)$", stem)
+    return (m.group(1), m.group(2)) if m else (stem, "")
+
+
+def select_runs(files, spec, notes=None):
+    """Which of a prefix's runs a Runs box names: [(run, path)] in name order.
+
+    files is capture_files()' {run: path}. The grammar, space or comma
+    separated: N or A-B pick numbered runs; 'last' or 'lastN' the newest N by
+    file time; 'all' every file; 'avg' every averaged file; anything else is
+    a run as it appears after the prefix. Blank means the newest file. What
+    did not resolve goes to `notes`."""
+    say = notes.append if notes is not None else (lambda *_: None)
+    if not files:
+        return []
+    tokens = [t for t in re.split(r"[\s,]+", spec.strip()) if t]
+    if not tokens:
+        tokens = ["last"]
+    numbered = {int(r): r for r in files if r.isdigit()}
+    chosen = set()
+    for tok in tokens:
+        low = tok.lower()
+        if low == "all":
+            chosen.update(files)
+        elif low == "avg":
+            hit = [r for r in files if r.startswith("avg_")]
+            chosen.update(hit)
+            if not hit:
+                say(f"'{tok}': no averaged file for this prefix")
+        elif re.fullmatch(r"last(\d*)", low):
+            n = int(low[4:] or 1)
+            newest = sorted(files, key=lambda r: os.path.getmtime(files[r]))
+            chosen.update(newest[-n:])
+        elif re.fullmatch(r"\d+-\d+", tok):
+            a, b = (int(x) for x in tok.split("-"))
+            hit = [numbered[i] for i in range(min(a, b), max(a, b) + 1)
+                   if i in numbered]
+            chosen.update(hit)
+            if not hit:
+                say(f"'{tok}': no numbered runs in that range")
+        elif tok.isdigit() and int(tok) in numbered:
+            chosen.add(numbered[int(tok)])
+        elif tok in files:
+            chosen.add(tok)
+        else:
+            say(f"'{tok}': no such run")
+    return [(r, files[r]) for r in files if r in chosen]
+
+
+def read_sidecar(path):
+    """The .txt beside a capture as {key: value}, keys as written. The first
+    colon separates key from value, which is where the metadata writer puts
+    it, so a value with colons in it - a timestamp, a VISA address - survives."""
+    meta = {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                key, sep, val = line.partition(":")
+                key = key.strip()
+                if sep and key and key not in meta:
+                    meta[key] = val.strip()
+    except OSError:
+        pass
+    return meta
+
+
+def spectrum(t, v, window="hann", units="rms"):
+    """One-sided spectrum of a uniformly sampled record, DC bin dropped.
+
+    The mean is removed first, so the window's leakage from a DC offset does
+    not bury the low bins. units 'rms': the amplitude of a sine at that
+    frequency, in V rms - what a spectrum analyser shows; 'asd': V/sqrt(Hz),
+    the amplitude spectral density, which is what a noise floor is quoted in
+    and does not change with the record length."""
+    n = len(v)
+    dt = float(np.median(np.diff(t)))
+    w = WINDOWS[window](n)
+    x = np.abs(np.fft.rfft((v - v.mean()) * w))
+    f = np.fft.rfftfreq(n, dt)
+    if units == "asd":
+        a = np.sqrt(2.0) * x / np.sqrt(np.sum(w * w) / dt)
+    else:
+        a = np.sqrt(2.0) * x / np.sum(w)
+    return f[1:], a[1:]
+
+
+def _top_base(v, vmax, vmin):
+    """Vtop and Vbase the way the scope finds them: the most populated level
+    in the upper and lower halves of a 256-bin histogram - the flats of a
+    pulse. A level only counts as a flat when it holds a real share of the
+    record; a sine or a ramp has none and takes max and min instead."""
+    if vmax <= vmin:
+        return vmax, vmin
+    hist, edges = np.histogram(v, bins=256, range=(vmin, vmax))
+    floor = 0.02 * len(v)
+
+    def level(lo_bin, hi_bin, fallback):
+        part = hist[lo_bin:hi_bin]
+        if part.max() <= floor:
+            return fallback
+        k = lo_bin + int(part.argmax())
+        # The flat's own samples, a bin either side of the fullest one: their
+        # mean puts the level where the samples sit rather than at a bin
+        # centre, which is half a bin off for a clean flat.
+        sel = v[(v >= edges[max(k - 1, 0)]) & (v <= edges[min(k + 2, 256)])]
+        return float(sel.mean()) if len(sel) else float((edges[k] + edges[k + 1]) / 2)
+
+    return level(128, 256, vmax), level(0, 128, vmin)
+
+
+def _crossing(t, v, level, j):
+    """Time at which v crosses `level` between samples j and j+1."""
+    dv = v[j + 1] - v[j]
+    frac = (level - v[j]) / dv if dv else 0.0
+    return float(t[j] + frac * (t[j + 1] - t[j]))
+
+
+def _edges(t, v, base, amp):
+    """Rising and falling edges by the scope's rule: a crossing of the 50 %
+    level counts only once the signal has come from below 10 % and gone on
+    above 90 % (or the reverse), so noise riding a flat does not fire edges.
+
+    Returns (rising, falling, rise_times, fall_times): the mid-level times of
+    each edge, and each edge's 10-90 % transition time."""
+    lo, mid, hi = base + 0.1 * amp, base + 0.5 * amp, base + 0.9 * amp
+    level = np.where(v > hi, 1, np.where(v < lo, -1, 0))
+    nz = np.flatnonzero(level)
+    if len(nz) < 2:
+        return [], [], [], []
+    idx = np.zeros(len(v), dtype=int)
+    idx[nz] = nz
+    state = level[np.maximum.accumulate(idx)]      # last decided level
+    change = np.flatnonzero(np.diff(state) != 0) + 1
+    up_mid = np.flatnonzero((v[:-1] < mid) & (v[1:] >= mid))
+    dn_mid = np.flatnonzero((v[:-1] >= mid) & (v[1:] < mid))
+    up_lo = np.flatnonzero((v[:-1] < lo) & (v[1:] >= lo))
+    dn_hi = np.flatnonzero((v[:-1] >= hi) & (v[1:] < hi))
+    rising, falling, rise_t, fall_t = [], [], [], []
+    for i in change:
+        if state[i - 1] == 0:                # the first decision, not an edge
+            continue
+        if state[i] == 1:
+            k = np.searchsorted(up_mid, i) - 1
+            if k < 0:
+                continue
+            rising.append(_crossing(t, v, mid, up_mid[k]))
+            k2 = np.searchsorted(up_lo, i) - 1
+            if k2 >= 0:
+                rise_t.append(_crossing(t, v, hi, i - 1)
+                              - _crossing(t, v, lo, up_lo[k2]))
+        else:
+            k = np.searchsorted(dn_mid, i) - 1
+            if k < 0:
+                continue
+            falling.append(_crossing(t, v, mid, dn_mid[k]))
+            k2 = np.searchsorted(dn_hi, i) - 1
+            if k2 >= 0:
+                fall_t.append(_crossing(t, v, lo, i - 1)
+                              - _crossing(t, v, hi, dn_hi[k2]))
+    return rising, falling, rise_t, fall_t
+
+
+def _gaps(a, b):
+    """For each time in a, the interval to the next time in b after it."""
+    if not a or not b:
+        return []
+    b = np.asarray(b)
+    out = []
+    for x in a:
+        k = np.searchsorted(b, x, side="right")
+        if k < len(b):
+            out.append(float(b[k] - x))
+    return out
+
+
+def measure(t, v):
+    """The scope's Snapshot All, computed from the samples: {name: value} for
+    every entry of MEAS_COLUMNS, NaN where the waveform does not define one.
+
+    Period, widths, duty and the transition times are means over every full
+    cycle in the record rather than the first one, which is what a record of
+    many cycles is for. Overshoot and preshoot are relative to Vamp."""
+    nan = float("nan")
+    out = {name: nan for name, _ in MEAS_COLUMNS}
+    if len(v) < 2:
+        return out
+    vmax, vmin = float(v.max()), float(v.min())
+    out["Vpp"], out["Vmax"], out["Vmin"] = vmax - vmin, vmax, vmin
+    out["Vavg"] = float(v.mean())
+    out["Vrms"] = float(np.sqrt(np.mean(v * v)))
+    out["Vrms AC"] = float(v.std())
+    out["X@max"] = float(t[int(v.argmax())])
+    out["X@min"] = float(t[int(v.argmin())])
+    trap = getattr(np, "trapezoid", None) or np.trapz
+    out["Area"] = float(trap(v, t))
+    top, base = _top_base(v, vmax, vmin)
+    amp = top - base
+    out["Vtop"], out["Vbase"], out["Vamp"] = top, base, amp
+    if amp <= 0:
+        return out
+    out["Overshoot"] = 100.0 * (vmax - top) / amp
+    out["Preshoot"] = 100.0 * (base - vmin) / amp
+    rising, falling, rise_t, fall_t = _edges(t, v, base, amp)
+    periods = (np.diff(rising) if len(rising) >= 2 else
+               np.diff(falling) if len(falling) >= 2 else [])
+    if len(periods):
+        out["Period"] = float(np.mean(periods))
+        out["Freq"] = 1.0 / out["Period"]
+    pos, neg = _gaps(rising, falling), _gaps(falling, rising)
+    if pos:
+        out["+Width"] = float(np.mean(pos))
+    if neg:
+        out["-Width"] = float(np.mean(neg))
+    if pos and len(periods):
+        out["Duty"] = 100.0 * out["+Width"] / out["Period"]
+    if rise_t:
+        out["Rise"] = float(np.mean(rise_t))
+    if fall_t:
+        out["Fall"] = float(np.mean(fall_t))
+    return out
+
+
+def fmt_si(x, unit=""):
+    """4 significant figures with an SI prefix: 2.5e-05 s reads as 25 us."""
+    if x is None or not np.isfinite(x):
+        return "-"
+    if x == 0:
+        return f"0 {unit}".strip()
+    exp = int(np.floor(np.log10(abs(x)) / 3)) * 3
+    exp = max(-12, min(9, exp))
+    pre = {-12: "p", -9: "n", -6: "u", -3: "m", 0: "", 3: "k", 6: "M", 9: "G"}[exp]
+    return f"{x / 10 ** exp:.4g} {pre}{unit}".strip()
+
+
+def time_unit(span):
+    """(scale, name) that puts a span of `span` seconds in the range 1-1000."""
+    for scale, name in ((1.0, "s"), (1e3, "ms"), (1e6, "us"), (1e9, "ns")):
+        if span * scale >= 1.0:
+            return scale, name
+    return 1e9, "ns"
+
+
+def elide(text, n):
+    return text if len(text) <= n else text[:n - 3] + "..."
+
+
+def same_path(a, b):
+    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
+def key_safe(text):
+    """A compare key has to survive the Compare box's split on whitespace, and
+    this lab's prefixes and folders have spaces in them."""
+    return re.sub(r"\s+", "-", text.strip())
+
+
+def blend_white(colour, frac):
+    """`colour` moved `frac` of the way to white: how a compare key's older
+    runs fade behind its newest."""
+    r, g, b = mcolors.to_rgb(colour)
+    return (r + (1 - r) * frac, g + (1 - g) * frac, b + (1 - b) * frac)
+
+
+PLOT_HINT = ("Runs: blank = newest, or  1-10  last3  avg  all.   "
+             "Compare: PREFIX or PREFIX:RUNS, or Add files...")
+
+
+class Capture:
+    """One capture's CSV in memory, with its .txt sidecar parsed.
+
+    key is the prefix it is known by in the plot boxes, run what follows the
+    prefix in its filename. chan maps channel number to column, names carries
+    the typed name the header was made from."""
+
+    def __init__(self, path, key, run):
+        self.path, self.key, self.run = path, key, run
+        with open(path, encoding="utf-8") as fh:
+            header = fh.readline().strip()
+        self.columns = header.split(",")
+        if self.columns[:1] != ["time_s"]:
+            raise ValueError("not a Scope Grab CSV: the first column is not time_s")
+        data = np.loadtxt(path, delimiter=",", skiprows=1, ndmin=2)
+        if data.shape[1] != len(self.columns):
+            raise ValueError(f"{data.shape[1]} columns of data under "
+                             f"{len(self.columns)} headers")
+        self.data = data
+        self.t = data[:, 0]
+        self.chan, self.names = {}, {}
+        for i, col in enumerate(self.columns[1:], 1):
+            m = re.fullmatch(r"CH(\d)(?:_(.*))?_V", col)
+            if m:
+                self.chan[int(m.group(1))] = i
+                self.names[int(m.group(1))] = m.group(2) or ""
+        self.dt = (float(np.median(np.diff(self.t))) if len(self.t) > 1
+                   else float("nan"))
+        self.meta = read_sidecar(path[:-4] + ".txt")
+        self.label = f"{key} {run}" if run else key
+
+    def v(self, ch):
+        return self.data[:, self.chan[ch]]
+
+
 class Scope:
     def __init__(self):
         self.rm = None
@@ -687,7 +1082,13 @@ class Scope:
             f"averages           : {s(':ACQuire:COUNt')}{avg_note}",
         ] + ([f"averages taken     : {s(WAVE_COUNT)} of {s(':ACQuire:COUNt')}"
               f"   (hits actually in the trace that was read out)"]
-             if averaging and WAVE_COUNT in settings else []) + [
+             if averaging and WAVE_COUNT in settings else []) + (
+            # The scope's own measurement results, verbatim, when they were
+            # asked for - see the Measurements tab. The scope's format, not
+            # ours: label,value pairs, or label,current,min,max,mean,sd,count
+            # with statistics on.
+            [f"scope measurements : {s(':MEASure:RESults')}"]
+            if ":MEASure:RESults" in settings else []) + [
             f"timebase s/div     : {s(':TIMebase:SCALe')}",
             f"timebase position  : {s(':TIMebase:POSition')}",
             f"timebase reference : {s(':TIMebase:REFerence')}",
@@ -734,6 +1135,15 @@ class App:
         self.busy = False
         self.auto_job = None
         self.prefix_job = None    # debounce for re-pointing the shot browser
+        # The plot tabs' state. Captures are cached by path against their file
+        # time; the tabs redraw lazily - a capture marks every tab dirty and
+        # only the one on show is drawn, the others when they are turned to.
+        self.plot_cache = {}      # path -> (mtime, Capture)
+        self.plot_tabs = {}       # tab frame -> its draw function
+        self.plot_dirty = set()
+        self.plot_groups = None   # what the boxes last resolved to
+        self.plot_notes_seen = set()
+        self.cmp_paths = {}       # compare key -> ["prefix", folder, prefix] | ["file", path]
         self.seq_active = False   # a numbered sequence is running
         self.seq_job = None       # pending after() for the next run
         self.seq_index = 0
@@ -945,9 +1355,19 @@ class App:
         self.toggle_existing()
         self.build_settings(left, pad)
 
+        # --- the right column: a notebook of tabs, the log underneath.
+        # The screenshot browser is the first tab; the rest draw and tabulate
+        # the captured data, the way the ILC panel's tabs do. The plot bar
+        # (built with the tabs) sits above the notebook only while a plot tab
+        # is showing, so the Screenshot tab is as it always was.
+        self.nb = ttk.Notebook(right)
+        self.nb.pack(fill="both", expand=True, padx=8, pady=(4, 0))
+        shot_tab = ttk.Frame(self.nb)
+        self.nb.add(shot_tab, text="Screenshot")
+
         # --- last screenshot
-        self.shot_frame = ttk.LabelFrame(right, text="Last screenshot")
-        self.shot_frame.pack(fill="x", **pad)
+        self.shot_frame = ttk.LabelFrame(shot_tab, text="Last screenshot")
+        self.shot_frame.pack(fill="x", padx=4, pady=4)
         box = tk.Frame(self.shot_frame, width=PREVIEW_W, height=PREVIEW_H)
         box.pack(padx=4, pady=4)
         box.pack_propagate(False)          # keep the box from shrinking to the label
@@ -978,10 +1398,12 @@ class App:
         self.shot_pos = ttk.Label(nav, text="", foreground="#666")
         self.shot_pos.pack(side="left", padx=8)
 
+        self.build_plots(right)
+
         # --- log
         lf = ttk.LabelFrame(right, text="Log")
-        lf.pack(fill="both", expand=True, **pad)
-        self.logbox = tk.Text(lf, height=6, wrap="word", font=("Consolas", 9))
+        lf.pack(fill="x", **pad)
+        self.logbox = tk.Text(lf, height=7, wrap="word", font=("Consolas", 9))
         # Wrapped continuations are indented, so a long message reads as one
         # entry rather than as several. Wrapping by width rather than at a fixed
         # column means it still fits after the window is resized.
@@ -1017,6 +1439,7 @@ class App:
         if d:
             self.outdir.set(d)
             self.load_latest_preview()
+            self.refresh_plots()
             self.save_config()
 
     def pick_setup_dir(self):
@@ -1045,6 +1468,13 @@ class App:
             "seq_dither_codes": self.seq_dither_codes.get(),
             "auto_interval": self.interval.get(),
             "save_png": self.save_png.get(),
+            "plot_runs": self.plot_runs.get(),
+            "plot_compare": self.plot_cmp.get(),
+            "plot_show": {str(ch): var.get() for ch, var in self.plot_show.items()},
+            "spec_window": self.spec_window.get(),
+            "spec_units": self.spec_units.get(),
+            "record_measurements": self.rec_meas.get(),
+            "cmp_paths": self.cmp_paths,
         }
 
     def load_config(self):
@@ -1069,6 +1499,36 @@ class App:
             if isinstance(value, str) and value.strip():
                 var.set(value)
         self.load_grab_prefs(cfg)
+        # The plot bar's state, app-level like the folders: what was being
+        # looked at last time, not a property of any setup. A blank Runs box
+        # is a real value (the newest capture), so blanks are restored too.
+        for key, var in (("plot_runs", self.plot_runs),
+                         ("plot_compare", self.plot_cmp),
+                         ("spec_window", self.spec_window),
+                         ("spec_units", self.spec_units)):
+            value = cfg.get(key)
+            if isinstance(value, str):
+                var.set(value)
+        if self.spec_window.get() not in WINDOWS:
+            self.spec_window.set("hann")
+        if self.spec_units.get() not in SPEC_UNITS:
+            self.spec_units.set("V rms")
+        show = cfg.get("plot_show")
+        if isinstance(show, dict):
+            for ch, var in self.plot_show.items():
+                value = show.get(str(ch))
+                if isinstance(value, (bool, int)):
+                    var.set(bool(value))
+        rec = cfg.get("record_measurements")
+        if isinstance(rec, (bool, int)):
+            self.rec_meas.set(bool(rec))
+        paths = cfg.get("cmp_paths")
+        if isinstance(paths, dict):
+            self.cmp_paths = {
+                key: entry for key, entry in paths.items()
+                if isinstance(key, str) and isinstance(entry, list) and entry
+                and entry[0] in ("prefix", "file")
+                and all(isinstance(x, str) for x in entry)}
 
         self.saved_cfg = self.current_cfg()
         self.log(f"Restored last session from {CONFIG_PATH}")
@@ -1466,6 +1926,7 @@ class App:
     def _prefix_settled(self):
         self.prefix_job = None
         self.refresh_shots(newest=True)
+        self.refresh_plots()
 
     def open_preview(self, _event=None):
         if not self.preview_path:
@@ -1752,6 +2213,16 @@ class App:
             hits = self.scope.try_get(WAVE_COUNT)
             if hits is not None:
                 settings[WAVE_COUNT] = hits
+            if self.rec_meas.get():
+                # The scope's own measurement results, for the Measurements
+                # tab. RESults? reports what is already being measured on the
+                # screen and installs nothing; it has not been tried on this
+                # scope, so it is asked with the short timeout and the device
+                # clear behind it rather than letting an unterminated reply
+                # hold a fast sequence for the full VISA timeout.
+                meas = self.scope.try_get(":MEASure:RESults")
+                if meas:
+                    settings[":MEASure:RESults"] = meas
             self.report_averaging(settings, existing=existing)
             # The screenshot has to be taken before :RUN, while the captured
             # trace is still the one on screen.
@@ -1785,6 +2256,9 @@ class App:
                     fh.write(img)
                 self.log(f"{os.path.basename(png_path)}  ({len(img)} bytes)")
                 self.root.after(0, self.refresh_shots)
+            # The data tabs follow a capture the way the screenshot pane does:
+            # with the Runs box blank the newest run is what they draw.
+            self.root.after(0, self.refresh_plots)
             t_write = time.time() - write_at
 
             self.root.after(0, lambda v=settings: self.show_settings(v))
@@ -1851,6 +2325,707 @@ class App:
                  "exponential average of whatever played before")
         self.log("    untick 'take the trace already on the scope' to have the "
                  "average built and counted out instead")
+
+    # -- plots ------------------------------------------------------------
+
+    def build_plots(self, right):
+        """The plot bar and the data tabs, after the Screenshot tab.
+
+        The bar is shared by every data tab: which runs of the current prefix
+        to draw, what to compare them with, and which channels to show. Each
+        tab keeps its own knobs in a strip above its figure or table. The bar
+        is not packed here - _on_tab_changed puts it above the notebook while a
+        data tab is showing and takes it away for the Screenshot tab."""
+        bar = self.plot_bar = ttk.LabelFrame(right, text="Plot data")
+        row = ttk.Frame(bar)
+        row.pack(fill="x", padx=6, pady=(4, 2))
+        ttk.Label(row, text="Runs:").pack(side="left")
+        self.plot_runs = tk.StringVar()
+        e = ttk.Entry(row, textvariable=self.plot_runs, width=14)
+        e.pack(side="left", padx=(4, 10))
+        e.bind("<Return>", lambda _e: self.do_plot_redraw())
+        ttk.Label(row, text="Compare:").pack(side="left")
+        self.plot_cmp = tk.StringVar()
+        e = ttk.Entry(row, textvariable=self.plot_cmp, width=24)
+        e.pack(side="left", fill="x", expand=True, padx=(4, 6))
+        e.bind("<Return>", lambda _e: self.do_plot_redraw())
+        ttk.Button(row, text="Add files...",
+                   command=self.do_compare_add).pack(side="left")
+        self.cmp_clear_btn = ttk.Button(row, text="Clear",
+                                        command=self.do_compare_clear)
+        self.cmp_clear_btn.pack(side="left", padx=(4, 0))
+        ttk.Button(row, text="Redraw",
+                   command=self.do_plot_redraw).pack(side="left", padx=(10, 0))
+
+        row2 = ttk.Frame(bar)
+        row2.pack(fill="x", padx=6, pady=(0, 4))
+        ttk.Label(row2, text="Show:").pack(side="left")
+        self.plot_show = {}
+        for ch in (1, 2, 3, 4):
+            var = tk.BooleanVar(value=True)
+            self.plot_show[ch] = var
+            ttk.Checkbutton(row2, text=f"CH{ch}", variable=var,
+                            command=self.refresh_plots).pack(side="left",
+                                                             padx=(4, 0))
+        self.plot_status = ttk.Label(row2, text=PLOT_HINT, foreground="#666")
+        self.plot_status.pack(side="left", padx=(14, 0))
+
+        _ctl, self.fig_wave = self._fig_tab("Waveforms", self._plot_waveforms)
+
+        ctl, self.fig_spec = self._fig_tab("Spectrum", self._plot_spectrum)
+        ttk.Label(ctl, text="Window:").pack(side="left")
+        self.spec_window = tk.StringVar(value="hann")
+        cb = ttk.Combobox(ctl, textvariable=self.spec_window,
+                          values=list(WINDOWS), width=15, state="readonly")
+        cb.pack(side="left", padx=(4, 10))
+        cb.bind("<<ComboboxSelected>>", lambda _e: self.refresh_plots())
+        ttk.Label(ctl, text="Units:").pack(side="left")
+        self.spec_units = tk.StringVar(value="V rms")
+        cb = ttk.Combobox(ctl, textvariable=self.spec_units,
+                          values=list(SPEC_UNITS), width=11, state="readonly")
+        cb.pack(side="left", padx=(4, 0))
+        cb.bind("<<ComboboxSelected>>", lambda _e: self.refresh_plots())
+        ttk.Label(ctl, foreground="#666",
+                  text="mean removed; V rms is the height of a line, "
+                       "V/sqrt(Hz) a noise floor").pack(side="left", padx=(12, 0))
+
+        ctl, self.fig_diff = self._fig_tab("Difference", self._plot_difference)
+        ttk.Label(ctl, text="Reference:").pack(side="left")
+        self.diff_ref = tk.StringVar()
+        self.diff_ref_box = ttk.Combobox(ctl, textvariable=self.diff_ref,
+                                         width=28, state="readonly")
+        self.diff_ref_box.pack(side="left", padx=(4, 0))
+        self.diff_ref_box.bind("<<ComboboxSelected>>",
+                               lambda _e: self.refresh_plots())
+        ttk.Label(ctl, foreground="#666",
+                  text="every other selected capture minus this one, on its "
+                       "time base").pack(side="left", padx=(12, 0))
+
+        ctl, self.fig_xy = self._fig_tab("XY", self._plot_xy)
+        self.xy_x, self.xy_y = tk.StringVar(value="CH1"), tk.StringVar(value="CH2")
+        for text, var in (("X:", self.xy_x), ("Y:", self.xy_y)):
+            ttk.Label(ctl, text=text).pack(side="left",
+                                           padx=(0 if text == "X:" else 10, 0))
+            cb = ttk.Combobox(ctl, textvariable=var, width=5, state="readonly",
+                              values=["CH1", "CH2", "CH3", "CH4"])
+            cb.pack(side="left", padx=(4, 0))
+            cb.bind("<<ComboboxSelected>>", lambda _e: self.refresh_plots())
+        ttk.Label(ctl, foreground="#666",
+                  text="one channel against another, sample by sample, per "
+                       "capture").pack(side="left", padx=(12, 0))
+
+        self.stats_heads = ("key", "run", "CH", "name", "points", "dt", "rate",
+                            "V/div", "offset (V)", "coupling", "mean", "rms",
+                            "pk-pk")
+        _ctl, self.stats_tv = self._table_tab(
+            "Statistics", self.stats_heads,
+            (70, 110, 36, 110, 60, 70, 84, 56, 70, 60, 84, 84, 84),
+            self._fill_stats,
+            "every selected capture, per shown channel: what was acquired, "
+            "and its mean, rms and swing")
+
+        self.meas_heads = ("key", "run", "CH") + tuple(
+            f"{name} ({unit})" for name, unit in MEAS_COLUMNS)
+        ctl, self.meas_tv = self._table_tab(
+            "Measurements", self.meas_heads,
+            (70, 110, 36) + (78,) * len(MEAS_COLUMNS),
+            self._fill_measurements,
+            "the scope's Snapshot All set, computed from the samples of every "
+            "selected capture")
+        # The scope's own results, as an extra: asked at grab time and written
+        # into the .txt, shown here under the computed ones. Opt-in, because
+        # the query has not been tried on this scope and a fast sequence should
+        # not find out the hard way.
+        self.rec_meas = tk.BooleanVar(value=False)
+        foot = ttk.Frame(ctl.master)          # under the table, full width
+        foot.pack(side="bottom", fill="x", padx=8, pady=(0, 4))
+        ttk.Checkbutton(foot, variable=self.rec_meas,
+                        text="also record the scope's own results with each "
+                             "grab (:MEASure:RESults?, not yet tried on this "
+                             "scope)").pack(anchor="w")
+        self.scope_meas = ttk.Label(foot, text="", foreground="#666",
+                                    justify="left", wraplength=700)
+        self.scope_meas.pack(anchor="w", pady=(2, 0))
+
+        self.nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+
+    def _fig_tab(self, name, draw):
+        """A tab holding a matplotlib figure with the zoom/pan toolbar, plus a
+        strip above it for that tab's own knobs. Returns (strip, figure); the
+        figure carries its canvas and toolbar as _canvas and _toolbar the way
+        the ILC panel's do. Without matplotlib the tab says so and draws
+        nothing, but still counts as a data tab so the bar shows."""
+        frame = ttk.Frame(self.nb)
+        self.nb.add(frame, text=name)
+        ctl = ttk.Frame(frame)
+        ctl.pack(fill="x", padx=4, pady=(4, 0))
+        self.plot_dirty.add(frame)
+        if Figure is None:
+            ttk.Label(frame, text=NO_MPL, foreground="#a00",
+                      justify="left").pack(anchor="w", padx=8, pady=12)
+            self.plot_tabs[frame] = lambda groups: None
+            return ctl, None
+        matplotlib.rcParams["font.size"] = 8
+        fig = Figure(figsize=(6.4, 4.6), dpi=100, constrained_layout=True)
+        canvas = FigureCanvasTkAgg(fig, master=frame)
+        toolbar = NavigationToolbar2Tk(canvas, frame)   # packs itself, bottom
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+        fig._canvas, fig._toolbar = canvas, toolbar
+        self.plot_tabs[frame] = draw
+        return ctl, fig
+
+    def _table_tab(self, name, heads, widths, fill, note):
+        """A tab holding a ledger, saveable as CSV the way the figures save as
+        PNG from their toolbars. Returns (strip, treeview)."""
+        frame = ttk.Frame(self.nb)
+        self.nb.add(frame, text=name)
+        ctl = ttk.Frame(frame)
+        ctl.pack(fill="x", padx=4, pady=(4, 0))
+        ttk.Label(ctl, text=note, foreground="#666").pack(side="left")
+        body = ttk.Frame(frame)
+        body.pack(fill="both", expand=True, padx=4, pady=4)
+        cols = [f"c{i}" for i in range(len(heads))]
+        tv = ttk.Treeview(body, columns=cols, show="headings")
+        for c, h, w in zip(cols, heads, widths):
+            tv.heading(c, text=h)
+            tv.column(c, width=w, minwidth=36, stretch=False,
+                      anchor="w" if h in ("key", "run", "name", "coupling")
+                      else "e")
+        ysb = ttk.Scrollbar(body, orient="vertical", command=tv.yview)
+        xsb = ttk.Scrollbar(body, orient="horizontal", command=tv.xview)
+        tv.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
+        ysb.pack(side="right", fill="y")
+        xsb.pack(side="bottom", fill="x")
+        tv.pack(side="left", fill="both", expand=True)
+        ttk.Button(ctl, text="Save CSV...",
+                   command=lambda: self._save_table(tv, heads, name)).pack(
+            side="right")
+        self.plot_tabs[frame] = fill
+        self.plot_dirty.add(frame)
+        return ctl, tv
+
+    def _current_tab(self):
+        try:
+            return self.nb.nametowidget(self.nb.select())
+        except (tk.TclError, KeyError):
+            return None
+
+    def _on_tab_changed(self, _event=None):
+        tab = self._current_tab()
+        if tab in self.plot_tabs:
+            if self.plot_bar.winfo_manager() != "pack":
+                self.plot_bar.pack(fill="x", padx=8, pady=(4, 0), before=self.nb)
+            if tab in self.plot_dirty:
+                self._draw_tab(tab)
+        else:
+            self.plot_bar.pack_forget()
+
+    def refresh_plots(self):
+        """Something moved - a capture landed, the folder or the prefix
+        changed, a box or a tick - so every data tab is stale. Only the one on
+        show is drawn now; the rest draw when they are turned to, so a fast
+        sequence is not paying for four figures per run."""
+        self.plot_dirty = set(self.plot_tabs)
+        self.plot_groups = None
+        tab = self._current_tab()
+        if tab in self.plot_tabs:
+            self._draw_tab(tab)
+
+    def do_plot_redraw(self):
+        """Redraw, and let a warning that was said once be said again: the
+        boxes may have been edited to answer it."""
+        self.plot_notes_seen.clear()
+        self.refresh_plots()
+
+    def _draw_tab(self, tab):
+        if self.plot_groups is None:
+            groups, notes = self._resolve_plot_selection()
+            self.plot_groups = groups
+            for note in notes:
+                if note not in self.plot_notes_seen:
+                    self.plot_notes_seen.add(note)
+                    self.log(f"plot: {note}")
+            self._refresh_plot_status(groups, notes)
+        try:
+            self.plot_tabs[tab](self.plot_groups)
+        except Exception as exc:
+            self.log(f"plot: ERROR {exc}")
+        self.plot_dirty.discard(tab)
+
+    def _resolve_plot_selection(self):
+        """The two boxes -> ([(key, [Capture], primary)], notes).
+
+        Primary is the current prefix in the output folder, on the viridis
+        ramp; every Compare token is a key, either a prefix the output folder
+        answers for or something Add files... mapped, with the Runs grammar
+        after a colon. What did not resolve is returned as notes, said once
+        each in the log."""
+        outdir, prefix = self.outdir.get(), self.safe_prefix()
+        notes, groups = [], []
+        files = capture_files(outdir, prefix)
+        if not files:
+            notes.append(f"{prefix}: no {prefix}_*.csv in {outdir}")
+        sub = []
+        caps = self._load_runs(select_runs(files, self.plot_runs.get(), sub),
+                               prefix, notes)
+        notes += [f"Runs {n}" for n in sub]
+        groups.append((prefix, caps, True))
+        for tok in self.plot_cmp.get().split():
+            key, _, spec = tok.partition(":")
+            if not key:
+                continue
+            entry = self.cmp_paths.get(key)
+            if entry and entry[0] == "file":
+                cap = self._load_capture(entry[1], key, "", notes)
+                caps = [cap] if cap else []
+            else:
+                folder, pre = (entry[1], entry[2]) if entry else (outdir, key)
+                cfiles = capture_files(folder, pre)
+                if not cfiles:
+                    notes.append(f"{key}: no {pre}_*.csv in {folder}")
+                    continue
+                sub = []
+                caps = self._load_runs(select_runs(cfiles, spec, sub), key, notes)
+                notes += [f"{key} {n}" for n in sub]
+            groups.append((key, caps, False))
+        # A different grid does not stop an overlay - it is a legitimate
+        # comparison - but the spectra then have their own bin widths and a
+        # difference is interpolated, and neither shows in a plot of curves.
+        ref = next((c for c in groups[0][1]), None)
+        if ref is not None:
+            for key, caps, primary in groups[1:]:
+                for cap in caps:
+                    if (len(cap.t) != len(ref.t)
+                            or abs(cap.dt - ref.dt) > 1e-6 * ref.dt):
+                        notes.append(
+                            f"NOTE: {cap.label} runs {len(cap.t)} pts @ "
+                            f"{fmt_si(cap.dt, 's')} against {ref.label}'s "
+                            f"{len(ref.t)} @ {fmt_si(ref.dt, 's')} - drawn on "
+                            f"its own grid; its spectrum has its own bin width "
+                            f"and a difference against it is interpolated")
+        return groups, notes
+
+    def _load_runs(self, runs, key, notes):
+        caps = [self._load_capture(path, key, run, notes) for run, path in runs]
+        return [c for c in caps if c is not None]
+
+    def _load_capture(self, path, key, run, notes):
+        """A Capture from the cache, or read now. Cached against the file's
+        time, so a run rewritten under the same name is read again."""
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            notes.append(f"{os.path.basename(path)} is not there")
+            return None
+        hit = self.plot_cache.get(path)
+        if hit is not None and hit[0] == mtime:
+            cap = hit[1]
+            cap.key, cap.run = key, run
+            cap.label = f"{key} {run}" if run else key
+            return cap
+        try:
+            cap = Capture(path, key, run)
+        except Exception as exc:
+            notes.append(f"{os.path.basename(path)}: {exc}")
+            return None
+        if len(self.plot_cache) >= 200:       # a long sequence, not the disk
+            self.plot_cache.pop(next(iter(self.plot_cache)))
+        self.plot_cache[path] = (mtime, cap)
+        self.log(f"  {cap.label}: {len(cap.t)} pts @ {fmt_si(cap.dt, 's')}, "
+                 + ", ".join(f"CH{ch}" for ch in sorted(cap.chan))
+                 + ("" if cap.meta else "   (no .txt beside it)"))
+        return cap
+
+    def _refresh_plot_status(self, groups, notes):
+        """Keep the status line telling the truth: what resolved, and whether
+        the boxes asked for more than that."""
+        shown = [(key, caps) for key, caps, _ in groups if caps]
+        if shown:
+            names = "; ".join(f"{key} ({len(caps)})" for key, caps in shown)
+            total = sum(len(caps) for _, caps in shown)
+            text = f"{total} capture(s): {names}"
+            colour = "#060"
+            if any(not n.startswith("NOTE") for n in notes):
+                text += "   [not everything resolved - see the log]"
+                colour = "#c60"
+        elif notes:
+            text, colour = "nothing resolved - see the log", "#c60"
+        else:
+            text, colour = PLOT_HINT, "#666"
+        self.plot_status.configure(text=elide(text, 110), foreground=colour)
+        self.cmp_clear_btn.configure(
+            state="normal" if self.plot_cmp.get().strip() or self.cmp_paths
+            else "disabled")
+
+    def do_compare_add(self):
+        """Pick captures to overlay, from anywhere on disk.
+
+        Files that share a folder and a prefix become one key with the Runs
+        grammar behind it, so a sequence from another day is picked in one go
+        and addressed as KEY:1-10 like a prefix in the output folder. A file in
+        the output folder needs no key of its own - the folder answers for its
+        prefix - and a file not named the way Scope Grab names them is its own
+        key. The Compare box stays the record of what is drawn: picking appends
+        to it, so the box and the picks are one thing seen two ways."""
+        paths = filedialog.askopenfilenames(
+            title="Pick captures to compare",
+            initialdir=self.outdir.get() if os.path.isdir(self.outdir.get()) else ".",
+            filetypes=[("Capture CSV", "*.csv"), ("All files", "*.*")],
+            parent=self.root)
+        if not paths:
+            return
+        outdir = self.outdir.get()
+        spec, order = {}, []
+        for tok in self.plot_cmp.get().split():
+            key, _, runs = tok.partition(":")
+            if key and key not in spec:
+                spec[key] = []
+                order.append(key)
+            if key:
+                spec[key] += [r for r in re.split(r"[\s,]+", runs)
+                              if r and r not in spec[key]]
+        for p in paths:
+            p = os.path.abspath(p)
+            if not os.path.exists(p):
+                self.log(f"compare: {p} is not there - skipped")
+                continue
+            key, run = self._compare_key(p, outdir)
+            if key not in spec:
+                spec[key] = []
+                order.append(key)
+            if run and run not in spec[key]:
+                spec[key].append(run)
+        self.plot_cmp.set(" ".join(
+            key + (":" + ",".join(spec[key]) if spec[key] else "")
+            for key in order))
+        self.do_plot_redraw()
+
+    def _compare_key(self, path, outdir):
+        """(key, run) for a picked file, adding to cmp_paths when the output
+        folder cannot answer for it by itself."""
+        folder = os.path.dirname(path)
+        pre, run = split_capture_name(path)
+        if run and key_safe(pre) == pre and same_path(folder, outdir):
+            return pre, run               # the output folder answers for it
+        for key, entry in self.cmp_paths.items():
+            if run and entry[0] == "prefix" and entry[2] == pre \
+                    and same_path(entry[1], folder):
+                return key, run
+            if not run and entry[0] == "file" and same_path(entry[1], path):
+                return key, ""
+        want = key_safe(pre if run else os.path.splitext(os.path.basename(path))[0])
+        key = self._free_key(want, folder, outdir)
+        self.cmp_paths[key] = ["prefix", folder, pre] if run else ["file", path]
+        return key, run
+
+    def _free_key(self, want, folder, outdir):
+        """`want` unless something already answers to it - the current prefix,
+        a prefix the output folder holds, or a mapped key - in which case the
+        folder's name is appended, and a number after that."""
+        taken = set(self.cmp_paths) | {self.safe_prefix()}
+        try:
+            taken |= {split_capture_name(n)[0] for n in os.listdir(outdir)
+                      if n.lower().endswith(".csv")}
+        except OSError:
+            pass
+        if want not in taken:
+            return want
+        stem = f"{want}@{key_safe(os.path.basename(os.path.normpath(folder)))}"
+        key, n = stem, 2
+        while key in taken:
+            key = f"{stem}-{n}"
+            n += 1
+        return key
+
+    def do_compare_clear(self):
+        """Unload every comparison: the box, the picked keys, and the cache
+        behind them, which would otherwise hold a sequence nobody is drawing."""
+        self.plot_cmp.set("")
+        self.cmp_paths.clear()
+        self.plot_cache.clear()
+        self.log("compare: cleared - only the current prefix is drawn.")
+        self.do_plot_redraw()
+
+    # -- the drawing itself
+
+    def _captures(self, groups):
+        """Every selected capture in box order: the current prefix's runs,
+        then each compare key's. The order the ledgers list them in."""
+        return [cap for _, caps, _ in groups for cap in caps]
+
+    def _traces(self, groups):
+        """[(capture, colour, width, zorder)] in draw order: compare keys
+        first so they sit under the current prefix's, and within each key
+        oldest first so the newest paints last and is drawn heaviest."""
+        out, ci = [], 0
+        for key, caps, primary in groups:
+            if primary:
+                continue
+            base = CMP_COLOURS[ci % len(CMP_COLOURS)]
+            ci += 1
+            k = len(caps)
+            for idx, cap in enumerate(caps):
+                out.append((cap, blend_white(base, 0.6 * (k - 1 - idx) / max(k - 1, 1)),
+                            1.0 if idx == k - 1 else 0.8, CMP_ZORDER))
+        for key, caps, primary in groups:
+            if not primary:
+                continue
+            n = len(caps)
+            for idx, cap in enumerate(caps):
+                col = matplotlib.colormaps["viridis"](0.1 + 0.75 * idx / max(n - 1, 1))
+                out.append((cap, col, 1.3 if idx == n - 1 else 0.8,
+                            2.2 if idx == n - 1 else 2.0))
+        return out
+
+    def _shown_channels(self, traces):
+        """Channels ticked under Show that at least one selected capture has."""
+        present = set()
+        for cap, *_ in traces:
+            present |= set(cap.chan)
+        return [ch for ch in (1, 2, 3, 4)
+                if self.plot_show[ch].get() and ch in present]
+
+    def _ch_label(self, ch, traces, unit="V"):
+        name = next((cap.names[ch] for cap, *_ in traces
+                     if cap.names.get(ch)), "")
+        return f"CH{ch}{' ' + name if name else ''} ({unit})"
+
+    def _plot_title(self, groups):
+        """The data record: the folder, and which runs of which keys."""
+        parts = []
+        for key, caps, _ in groups:
+            if caps:
+                runs = [cap.run or cap.key for cap in caps]
+                parts.append(f"{key}: " + (", ".join(runs) if len(runs) <= 4 else
+                                           f"{runs[0]} .. {runs[-1]} ({len(runs)})"))
+        folder = os.path.basename(os.path.normpath(self.outdir.get())) or "?"
+        return elide(f"{folder}   |   " + ";   ".join(parts), 120)
+
+    def _panes(self, fig, n, sharex=True):
+        """`n` stacked axes on a cleared figure, or a placeholder for none."""
+        fig.clear()
+        if n == 0:
+            ax = fig.add_subplot(111)
+            ax.text(0.5, 0.5, "nothing to draw - see the plot bar and the log",
+                    ha="center", va="center", color="#999", transform=ax.transAxes)
+            ax.set_axis_off()
+            return []
+        return list(np.atleast_1d(fig.subplots(n, 1, sharex=sharex)))
+
+    def _finish(self, fig):
+        fig._canvas.draw_idle()
+        fig._toolbar.update()       # the axes are new: the zoom stack was theirs
+
+    def _legend(self, ax, count, loc="best"):
+        if 0 < count <= LEGEND_MAX:
+            ax.legend(loc=loc, fontsize=7, ncols=2 if count > 6 else 1)
+
+    def _plot_note(self, ax, text, loc="nw"):
+        """Method notes, small and grey, in a corner the data leaves empty."""
+        xy = (0.01, 0.99) if loc == "nw" else (0.01, 0.01)
+        ax.annotate(text, xy, xycoords="axes fraction", fontsize=6.5,
+                    color="#999999", ha="left",
+                    va="top" if loc == "nw" else "bottom")
+
+    def _plot_waveforms(self, groups):
+        fig = self.fig_wave
+        if fig is None:
+            return
+        traces = self._traces(groups)
+        chans = self._shown_channels(traces)
+        axes = self._panes(fig, len(chans))
+        if not axes:
+            return self._finish(fig)
+        span = max((cap.t[-1] - cap.t[0] for cap, *_ in traces if len(cap.t) > 1),
+                   default=1.0)
+        scale, unit = time_unit(span)
+        for ax, ch in zip(axes, chans):
+            n = 0
+            for cap, col, lw, z in traces:
+                if ch in cap.chan:
+                    ax.plot(cap.t * scale, cap.v(ch), color=col, lw=lw,
+                            zorder=z, label=cap.label)
+                    n += 1
+            ax.set_ylabel(self._ch_label(ch, traces))
+            ax.grid(True, alpha=0.3)
+            self._legend(ax, n)
+        axes[-1].set_xlabel(f"time ({unit})")
+        fig.suptitle(self._plot_title(groups), fontsize=8)
+        self._finish(fig)
+
+    def _plot_spectrum(self, groups):
+        fig = self.fig_spec
+        if fig is None:
+            return
+        traces = self._traces(groups)
+        chans = self._shown_channels(traces)
+        axes = self._panes(fig, len(chans))
+        if not axes:
+            return self._finish(fig)
+        window = self.spec_window.get() if self.spec_window.get() in WINDOWS else "hann"
+        units = SPEC_UNITS.get(self.spec_units.get(), "rms")
+        ulabel = "V rms" if units == "rms" else "V/sqrt(Hz)"
+        for ax, ch in zip(axes, chans):
+            n, bins = 0, []
+            for cap, col, lw, z in traces:
+                if ch not in cap.chan or len(cap.t) < 8:
+                    continue
+                f, a = spectrum(cap.t, cap.v(ch), window, units)
+                ax.loglog(f, a, color=col, lw=lw, zorder=z, label=cap.label)
+                n += 1
+                bins.append(f[0])
+            ax.set_ylabel(self._ch_label(ch, traces, ulabel))
+            ax.grid(True, which="both", alpha=0.3)
+            # upper right: a falling spectrum leaves the lower left empty, and
+            # that corner is the note's
+            self._legend(ax, n, loc="upper right")
+            if bins:
+                width = fmt_si(min(bins), "Hz")
+                if max(bins) > 1.5 * min(bins):
+                    width += f" - {fmt_si(max(bins), 'Hz')}"
+                self._plot_note(ax, f"{window} window, mean removed, bin {width}",
+                                loc="sw")
+        axes[-1].set_xlabel("frequency (Hz)")
+        fig.suptitle(self._plot_title(groups), fontsize=8)
+        self._finish(fig)
+
+    def _plot_difference(self, groups):
+        fig = self.fig_diff
+        if fig is None:
+            return
+        traces = self._traces(groups)
+        labels = [cap.label for cap, *_ in traces]
+        self.diff_ref_box.configure(values=labels)
+        if self.diff_ref.get() not in labels:
+            # the current prefix's oldest selected run, failing that whatever
+            # is first: the thing the others are held against
+            first = next((cap.label for _, caps, primary in groups
+                          if primary for cap in caps[:1]), labels[0] if labels else "")
+            self.diff_ref.set(first)
+        ref = next((cap for cap, *_ in traces if cap.label == self.diff_ref.get()),
+                   None)
+        chans = [ch for ch in self._shown_channels(traces)
+                 if ref is not None and ch in ref.chan]
+        axes = self._panes(fig, len(chans) if len(traces) > 1 else 0)
+        if not axes:
+            return self._finish(fig)
+        scale, unit = time_unit(ref.t[-1] - ref.t[0] if len(ref.t) > 1 else 1.0)
+        regridded = []
+        for ax, ch in zip(axes, chans):
+            n = 0
+            for cap, col, lw, z in traces:
+                if cap is ref or ch not in cap.chan:
+                    continue
+                other = cap.v(ch)
+                if (len(cap.t) != len(ref.t)
+                        or np.abs(cap.t - ref.t).max() > 1e-3 * abs(ref.dt)):
+                    other = np.interp(ref.t, cap.t, other)
+                    if cap.label not in regridded:
+                        regridded.append(cap.label)
+                ax.plot(ref.t * scale, other - ref.v(ch), color=col, lw=lw,
+                        zorder=z, label=f"{cap.label} - {ref.label}")
+                n += 1
+            ax.axhline(0, color="#999999", lw=0.6)
+            ax.set_ylabel(f"CH{ch} difference (V)")
+            ax.grid(True, alpha=0.3)
+            self._legend(ax, n)
+        if regridded:
+            self._plot_note(axes[0], "interpolated onto the reference's time base: "
+                            + ", ".join(regridded[:4])
+                            + (" ..." if len(regridded) > 4 else ""))
+        axes[-1].set_xlabel(f"time ({unit})")
+        fig.suptitle(elide(f"{self._plot_title(groups)}   -   minus {ref.label}", 130),
+                     fontsize=8)
+        self._finish(fig)
+
+    def _plot_xy(self, groups):
+        fig = self.fig_xy
+        if fig is None:
+            return
+        traces = self._traces(groups)
+        try:
+            x, y = int(self.xy_x.get()[2:]), int(self.xy_y.get()[2:])
+        except ValueError:
+            x, y = 1, 2
+        usable = [tr for tr in traces if x in tr[0].chan and y in tr[0].chan]
+        axes = self._panes(fig, 1 if usable else 0)
+        if not axes:
+            return self._finish(fig)
+        ax = axes[0]
+        for cap, col, lw, z in usable:
+            ax.plot(cap.v(x), cap.v(y), color=col, lw=0.8 * lw, zorder=z,
+                    alpha=0.9, label=cap.label)
+        ax.set_xlabel(self._ch_label(x, usable))
+        ax.set_ylabel(self._ch_label(y, usable))
+        ax.grid(True, alpha=0.3)
+        self._legend(ax, len(usable))
+        fig.suptitle(self._plot_title(groups), fontsize=8)
+        self._finish(fig)
+
+    def _fill_stats(self, groups):
+        tv = self.stats_tv
+        tv.delete(*tv.get_children())
+        caps = self._captures(groups)
+        chans = self._shown_channels([(cap,) for cap in caps])
+        for cap in caps:
+            for ch in chans:
+                if ch not in cap.chan:
+                    continue
+                v, m = cap.v(ch), cap.meta
+                rate = 1.0 / cap.dt if cap.dt and np.isfinite(cap.dt) else float("nan")
+                tv.insert("", "end", values=(
+                    cap.key, cap.run, f"CH{ch}", cap.names.get(ch, ""), len(v),
+                    fmt_si(cap.dt, "s"), fmt_si(rate, "Sa/s"),
+                    m.get(f"CH{ch} V/div", "-"), m.get(f"CH{ch} offset", "-"),
+                    m.get(f"CH{ch} coupling", "-"),
+                    fmt_si(float(v.mean()), "V"),
+                    fmt_si(float(np.sqrt(np.mean(v * v))), "V"),
+                    fmt_si(float(v.max() - v.min()), "V")))
+
+    def _fill_measurements(self, groups):
+        tv = self.meas_tv
+        tv.delete(*tv.get_children())
+        caps = self._captures(groups)
+        chans = self._shown_channels([(cap,) for cap in caps])
+        from_scope = []
+        for cap in caps:
+            for ch in chans:
+                if ch not in cap.chan:
+                    continue
+                m = measure(cap.t, cap.v(ch))
+                tv.insert("", "end", values=(cap.key, cap.run, f"CH{ch}") + tuple(
+                    (f"{m[name]:.2f} %" if np.isfinite(m[name]) else "-")
+                    if unit == "%" else fmt_si(m[name], unit)
+                    for name, unit in MEAS_COLUMNS))
+            raw = cap.meta.get("scope measurements")
+            if raw:
+                from_scope.append(f"scope's own, {cap.label}: {raw}")
+        self.scope_meas.configure(
+            text="\n".join(from_scope[:6]) if from_scope else
+            "(no results from the scope itself in these captures - the tick "
+            "above records them with each grab)")
+
+    def _save_table(self, tv, heads, name):
+        rows = [tv.item(iid, "values") for iid in tv.get_children()]
+        if not rows:
+            self.log(f"{name}: nothing to save yet.")
+            return
+        path = filedialog.asksaveasfilename(
+            title=f"Save {name} as CSV", defaultextension=".csv",
+            filetypes=[("CSV", "*.csv")], parent=self.root,
+            initialdir=self.outdir.get() if os.path.isdir(self.outdir.get()) else ".",
+            initialfile=f"{self.safe_prefix()}_{name.lower()}.csv")
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8", newline="") as fh:
+                w = csv.writer(fh)
+                w.writerow(heads)
+                w.writerows(rows)
+        except OSError as exc:
+            self.log(f"ERROR saving {name}: {exc}")
+            return
+        self.log(f"{name}: {len(rows)} row(s) saved to {path}")
 
     # -- settings panel ---------------------------------------------------
 
@@ -2271,6 +3446,7 @@ class App:
                 return messagebox.showerror("Average sequence", str(e))
             self.log(f"  averaged runs {used[0]}-{used[-1]} ({len(used)}) -> "
                      f"{os.path.basename(path)}")
+            self.refresh_plots()          # 'avg' in the Runs box now resolves
 
         bb = ttk.Frame(fr)
         bb.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(10, 0))

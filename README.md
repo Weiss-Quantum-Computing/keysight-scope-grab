@@ -13,16 +13,21 @@ Press GRAB (or the space bar) and you get, in your chosen folder:
 | `<prefix>_<timestamp>.txt` | Acquisition metadata: sample rate, timebase, acquisition and trigger settings, and per-channel settings |
 
 The panel shows the screenshots inline and you can scroll back through them while
-a run is still going - see [Watching a run come in](#watching-a-run-come-in).
+a run is still going - see [Watching a run come in](#watching-a-run-come-in) - and
+draws and tabulates the captured data beside them, overlaid against other runs,
+other prefixes and other days: see
+[Plotting and comparing captures](#plotting-and-comparing-captures).
 
 ## Requirements
 
 - [Keysight IO Libraries Suite](https://www.keysight.com/find/iosuite) (provides the VISA layer)
 - Python 3.9+
-- `pip install pyvisa numpy pillow`
+- `pip install pyvisa numpy pillow matplotlib`
 
-Pillow is optional - it only gives the screenshot preview a smoother rescale. Without
-it the preview falls back to Tk's integer subsample.
+Pillow and matplotlib are both optional. Pillow only gives the screenshot preview a
+smoother rescale; without it the preview falls back to Tk's integer subsample.
+matplotlib draws the Waveforms, Spectrum, Difference and XY tabs; without it those
+tabs say so, and capture, the Statistics table and the Measurements table all work.
 
 ## Usage
 
@@ -86,6 +91,74 @@ put while captures keep landing, with the counter showing how many have arrived.
 Only screenshots matching the current filename prefix are browsed, so several runs
 can share one folder without their screenshots interleaving. A prefix with no
 captures yet shows an empty pane rather than someone else's run.
+
+## Plotting and comparing captures
+
+The right-hand column is a set of tabs. **Screenshot** is the browser described
+above. The rest draw and tabulate the CSVs, the way the ILC panel's tabs do, and
+need no scope: they read the files, so they work on a laptop that only has the
+data folder, and on captures from any folder.
+
+| Tab | Shows |
+|-----|-------|
+| **Waveforms** | one pane per shown channel, every selected capture overlaid |
+| **Spectrum** | the same as one-sided amplitude spectra on log axes. `V rms` is the height of a line; `V/sqrt(Hz)` is the level of a noise floor and does not move with the record length. The window is picked above the figure: hann for looking, blackman-harris for a weak line beside a strong one, flat-top for the height of a line, rectangular for a record that already ends where it started. The mean is removed first, so the window's leakage from an offset does not bury the low bins |
+| **Difference** | every other selected capture minus a reference, per channel, on the reference's time base - interpolated onto it when theirs differs |
+| **XY** | one channel against another, sample by sample, per capture |
+| **Statistics** | a row per capture per channel: points, dt, sample rate, V/div, offset, coupling, mean, rms, pk-pk |
+| **Measurements** | the scope's Snapshot All set, computed from the samples: Vpp, Vmax, Vmin, Vtop, Vbase, Vamp, Vavg, Vrms, Vrms AC, frequency, period, +width, -width, duty, rise, fall, overshoot, preshoot, X at max and min, area |
+
+The figures carry the usual matplotlib toolbar: zoom to a box, pan, home, save as
+PNG. The tables save as CSV.
+
+### What is drawn
+
+The bar above the tabs decides. **Runs** picks captures of the current prefix from
+the output folder. Blank is the newest file; otherwise `1-10`, `3 7 9`, `last3`,
+`avg` (the file Average sequence... wrote), `all`, or a run exactly as it appears
+after the prefix in the filename, such as `20260903_120000`. They ride a viridis
+ramp, oldest dark to newest yellow, and the newest is drawn heaviest.
+
+**Compare** overlays other captures. Each token is a key, optionally `KEY:RUNS`
+with the same grammar, comma-separated after the colon: `ilc:1,2,5`. A key is
+another prefix in the output folder, or whatever **Add files...** mapped: pick CSVs
+anywhere on disk, and files that share a folder and a prefix become one key, so a
+sequence from another day is picked in one go and addressed as `sq@day-8:1-10`
+from then on. A key with a space in it is written with `-` instead, since the box
+splits on spaces - a prefix like `MKJX1 and X2 AWG` becomes `MKJX1-and-X2-AWG`, and
+has to come in through Add files... rather than be typed. Each key gets a colour of
+its own, its older runs faded toward white, drawn under the current prefix's. The
+status line says what resolved; what did not is in the log, said once. **Clear**
+empties the box and the picks.
+
+**Show** ticks which channels get a pane and a row. The tabs follow captures the
+way the screenshot pane does: with Runs blank, each grab redraws the newest. Only
+the tab on show is drawn; the others draw when you turn to them, so a fast sequence
+pays for one figure per run, not five.
+
+A compare capture on a different grid - another point count or sample rate - is
+drawn on its own axes and noted in the log: its spectrum then has its own bin
+width, and a difference against it is interpolated onto the reference's time base.
+The keys and the boxes are remembered between sessions.
+
+### Measurements from the scope itself
+
+Everything in the Measurements tab is computed here, so it reads the same for a
+capture from any day and any machine. The scope's own results can travel with the
+file as well: tick **also record the scope's own results with each grab** on that
+tab, and every grab asks `:MEASure:RESults?` - what the scope is already measuring
+on its screen; nothing is installed or changed - and writes the reply verbatim into
+the `.txt` as `scope measurements`, which the tab shows under its table. It is off by
+default because the query has not been tried on this scope: it is asked with the
+short timeout and a device clear behind it, and a fast sequence should not be the
+way to find out that it stalls.
+
+On the computed side: period, widths, duty and the transition times are means over
+every full cycle in the record rather than the first one; edges count only once the
+signal has come from below 10 % of Vamp and gone on past 90 %, so noise on a flat
+does not fire them; Vtop and Vbase are the most populated levels of a 256-bin
+histogram, as on the scope, with max and min standing in for a trace that has no
+flats; overshoot and preshoot are relative to Vamp.
 
 ## Looking without saving
 
