@@ -605,9 +605,13 @@ anything resets it, whether the hit count reports the setting or the depth, and
 which points modes will serve a record stopped one way rather than another are
 all things this program got wrong until they were measured on the bench.
 
-Selecting a model is a config key today (`"model"` above), because with one
-profile there is nothing to choose between. It becomes a control in the window
-when there is a second one.
+The **Scope** box on the connection row picks which one the panel is for. It
+restarts the program: the settings rows, the channel list, the metadata layout
+and the screenshot box are all built from the profile, so switching in place
+would mean rebuilding almost every widget in the window, and a restart is the
+version of that which cannot leave a half-built panel behind. Your folder,
+prefix and channel names are kept; unapplied settings edits are not. It refuses
+while a capture or a sequence is running.
 
 ### Tests
 

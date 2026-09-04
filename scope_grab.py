@@ -21,6 +21,7 @@ import io
 import json
 import os
 import queue
+import sys
 import threading
 import time
 import tkinter as tk
@@ -29,7 +30,18 @@ from tkinter import filedialog, messagebox, ttk
 import numpy as np
 import pyvisa
 
-import scope_profiles
+# scope_profiles.py sits beside this file, but a plain import is not enough to
+# find it. EOM-ILC loads this module by path - ilc_bench.load_module does a
+# spec_from_file_location and exec_module - and that does NOT put the containing
+# directory on sys.path, so `import scope_profiles` there raises
+# ModuleNotFoundError and the whole bench panel fails to start. Splitting this
+# file in two is what introduced that; putting our own directory on the path is
+# what pays for it. tests/test_path_import.py is the regression test.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+import scope_profiles  # noqa: E402
 
 try:
     from PIL import Image, ImageTk        # smooth (Lanczos) preview rescale
@@ -620,6 +632,20 @@ class App:
         ttk.Button(top, text="Connect", command=self.do_connect).pack(side="right")
         ttk.Button(top, text="Load/save setups...",
                    command=self.do_setups).pack(side="right", padx=(0, 6))
+        # Which scope this panel is for. Everything below is laid out from the
+        # profile - the settings rows, the channel list, the metadata file, the
+        # screenshot box - so this cannot be switched in place without building
+        # the whole window again. It restarts instead, which is honest and takes
+        # a second; swapping scopes is a rare, deliberate act.
+        self.model_names = {p.name: key
+                            for key, p in sorted(scope_profiles.PROFILES.items())}
+        self.model_var = tk.StringVar(value=self.prof.name)
+        self.model_box = ttk.Combobox(
+            top, textvariable=self.model_var, state="readonly", width=16,
+            values=sorted(self.model_names))
+        self.model_box.pack(side="right", padx=(0, 6))
+        self.model_box.bind("<<ComboboxSelected>>", self.on_model_picked)
+        ttk.Label(top, text="Scope:").pack(side="right", padx=(8, 3))
 
         # --- channels
         chf = ttk.LabelFrame(left, text="Channels")
@@ -1342,12 +1368,86 @@ class App:
         else:
             self.grab_btn.configure(text="GRAB  (or press Space)", state=state,
                                     command=self.do_grab)
+        # Switching scope restarts the program, so it is dead while a capture
+        # is running - that would abandon a VISA session and a half-written file.
+        self.model_box.configure(
+            state="disabled" if busy or self.seq_active else "readonly")
         # The sequence button stays live while a sequence runs, so it can stop it.
         self.seq_btn.configure(
             state="normal" if self.scope.inst and (self.seq_active or not busy)
             else "disabled")
 
     # -- actions ----------------------------------------------------------
+
+    def on_model_picked(self, _event=None):
+        """Switch the panel to another instrument, by restarting on it.
+
+        A profile decides the settings rows, which channels exist, the metadata
+        layout and the screenshot size, so changing it means rebuilding almost
+        every widget in the window. Restarting is the version of that which
+        cannot leave a half-rebuilt panel behind, and the config is already
+        where the choice is remembered.
+
+        A grab or a sequence in flight is left alone - it holds the VISA session
+        and has files half-written."""
+        wanted = self.model_names.get(self.model_var.get())
+        if wanted is None or wanted == self.prof.key:
+            return
+        if self.busy or self.seq_active:
+            self.model_var.set(self.prof.name)
+            self.log("Cannot switch scope while a capture is running.")
+            return
+        other = scope_profiles.PROFILES[wanted]
+        if not messagebox.askyesno(
+                "Switch scope",
+                f"Switch this panel from {self.prof.name} to {other.name}?\n\n"
+                "The settings panel, the channel list and the metadata file are "
+                "all built from the instrument, so Scope Grab has to restart to "
+                "lay them out again. It will reconnect on its own.\n\n"
+                "Your folder, prefix and channel names are kept. Anything in the "
+                "settings panel that has not been applied will be lost.",
+                parent=self.root):
+            self.model_var.set(self.prof.name)
+            return
+        # Written before the restart, because the new process reads the model
+        # out of the config file - see read_config().
+        self.prof = other
+        try:
+            self.save_config()
+        except Exception as exc:
+            self.log(f"Could not save the scope choice: {exc}")
+            self.prof = scope_profiles.get_profile(self.model_names.get(
+                self.model_box.get()))
+            return
+        self.log(f"Switching to {other.name} - restarting...")
+        self.restart()
+
+    def restart(self):
+        """Relaunch this program and close this window.
+
+        pythonw for a GUI relaunch: sys.executable is python.exe when the app
+        was started from a console, and re-exec'ing that would leave a console
+        window behind that was not there before."""
+        self.stop_flag.set()
+        self.stop_sequence()
+        if self.auto_job is not None:
+            self.root.after_cancel(self.auto_job)
+            self.auto_job = None
+        self.scope.close()
+        exe = sys.executable
+        gui = os.path.join(os.path.dirname(exe), "pythonw.exe")
+        if os.path.exists(gui):
+            exe = gui
+        try:
+            os.spawnv(os.P_NOWAIT, exe, [f'"{exe}"',
+                                         f'"{os.path.abspath(__file__)}"'])
+        except Exception as exc:
+            messagebox.showerror(
+                "Restart failed",
+                f"Could not start Scope Grab again: {exc}\n\n"
+                "The scope choice is saved, so starting it by hand will come up "
+                "on the new instrument.", parent=self.root)
+        self.root.destroy()
 
     def do_connect(self):
         def work():
