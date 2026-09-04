@@ -14,6 +14,7 @@ import importlib.util
 import inspect
 import os
 import sys
+import tempfile
 import tkinter as tk
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -27,6 +28,18 @@ spec = importlib.util.spec_from_file_location(
 scope_grab = importlib.util.module_from_spec(spec)
 sys.modules["scope_grab"] = scope_grab
 spec.loader.exec_module(scope_grab)
+
+# Point the config somewhere harmless BEFORE any App exists.
+#
+# App reads the scope model out of the session config to decide how to lay the
+# panel out, and writes that file back when things change. Left alone, this
+# test would build its panel for whichever scope the user last selected rather
+# than the one it is checking - which is exactly how it started failing every
+# MSO-X assertion against a Rigol panel - and a run could overwrite the folder,
+# prefix and channel names of a live session.
+_SANDBOX = os.path.join(tempfile.mkdtemp(prefix="scopegrab-test-"),
+                        "config.json")
+scope_grab.CONFIG_PATH = _SANDBOX
 
 FAILS = []
 
@@ -100,6 +113,10 @@ def panel_checks(prof):
         check("model in current_cfg", app.current_cfg().get("model") == prof.key)
         check("read_config survives a missing file",
               isinstance(scope_grab.read_config(), dict))
+        check("the test is not reading the real config",
+              scope_grab.CONFIG_PATH == _SANDBOX and
+              "AppData\\Roaming" not in scope_grab.CONFIG_PATH,
+              scope_grab.CONFIG_PATH)
 
         print("\nthe scope selector")
         check("every profile is offered",

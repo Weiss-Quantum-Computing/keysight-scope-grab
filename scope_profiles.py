@@ -67,6 +67,17 @@ class ScopeProfile:
     # command and the number comes out of the waveform preamble, so what
     # reads it is hit_count() below and this is only a label.
     wave_count = ""
+    ch_scale = ""         # per-channel volts/div, with {ch}
+    ch_offset = ""        # per-channel vertical offset, with {ch}
+    # Volts per ADC code at 1 V/div. The 8-bit converter quantises the input,
+    # and the offset dither steps by whole codes, so this is what a code is
+    # worth. Every scope has its own: it is the full-scale span the converter
+    # covers divided by 256, expressed per division.
+    adc_code_per_vdiv = 0.0
+    # The scope's own measurement results, if it has such a command, else None.
+    # Recorded in the metadata when the Measurements tab asks for it; a scope
+    # without it is never asked, rather than being asked and timing out.
+    meas_results = None
     ch_display = ""       # per-channel display flag, with {ch}
 
     # -- one-shot commands ------------------------------------------------
@@ -252,6 +263,13 @@ class KeysightInfiniiVision(ScopeProfile):
     # out the VISA timeout. It is only ever asked where a record is known to
     # exist.
     wave_count = ":WAVeform:COUNt"
+    ch_scale = ":CHANnel{ch}:SCALe"
+    ch_offset = ":CHANnel{ch}:OFFSet"
+    # MEASURED 2 Sep 2026 on the Trek monitor: a fixed ~3.4 mV pk-pk error
+    # pattern repeating exactly every 40.25 mV of input at 1 V/div, which is
+    # 10.24 V / 256. That is the code size.
+    adc_code_per_vdiv = 0.04025
+    meas_results = ":MEASure:RESults"
 
     cmd_run = ":RUN"
     cmd_stop = ":STOP"
@@ -545,6 +563,16 @@ class RigolDS1000Z(ScopeProfile):
     # A label only. There is no :WAVeform:COUNt on this scope; the number comes
     # out of the preamble - see hit_count().
     wave_count = "hits in trace"
+    ch_scale = ":CHANnel{ch}:SCALe"
+    ch_offset = ":CHANnel{ch}:OFFSet"
+    # MEASURED: the preamble's yincrement is exactly 0.04 V at 1 V/div and
+    # 0.08 V at 2 V/div, so 25 codes per division - 200 over the eight-division
+    # screen. Close to the MSO-X but not the same number.
+    adc_code_per_vdiv = 0.04
+    # No :MEASure:RESults on this scope. Asking would cost a timeout and a
+    # device clear on every grab, so the metadata simply does not carry the
+    # row - see Scope.metadata and the Measurements tab.
+    meas_results = None
 
     cmd_run = ":RUN"
     cmd_stop = ":STOP"
