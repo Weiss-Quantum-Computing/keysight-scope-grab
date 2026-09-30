@@ -124,8 +124,11 @@ PNG. The tables save as CSV.
 
 ### What is drawn
 
-The bar above the tabs decides. **Runs** picks captures of the current prefix from
-the output folder. Blank is the newest file; otherwise `1-10`, `3 7 9`, `last3`,
+The bar above the tabs decides. It is there on every tab, so nothing moves when
+turning between them, and whatever the tab on show does not read is greyed out:
+all of it on Screenshot, the Show ticks on XY.
+
+**Runs** picks captures of the current prefix from the output folder. Blank is the newest file; otherwise `1-10`, `3 7 9`, `last3`,
 `avg` (the file Average sequence... wrote), `all`, or a run exactly as it appears
 after the prefix in the filename, such as `20260903_120000`. They ride a viridis
 ramp, oldest dark to newest yellow, and the newest is drawn heaviest.

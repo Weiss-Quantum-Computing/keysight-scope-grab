@@ -1358,8 +1358,8 @@ class App:
         # --- the right column: a notebook of tabs, the log underneath.
         # The screenshot browser is the first tab; the rest draw and tabulate
         # the captured data, the way the ILC panel's tabs do. The plot bar
-        # (built with the tabs) sits above the notebook only while a plot tab
-        # is showing, so the Screenshot tab is as it always was.
+        # (built with the tabs) sits above the notebook on every tab, greyed
+        # out on Screenshot, so turning between tabs moves nothing.
         self.nb = ttk.Notebook(right)
         self.nb.pack(fill="both", expand=True, padx=8, pady=(4, 0))
         shot_tab = ttk.Frame(self.nb)
@@ -2410,39 +2410,51 @@ class App:
         The bar is shared by every data tab: which runs of the current prefix
         to draw, what to compare them with, and which channels to show. Each
         tab keeps its own knobs in a strip above its figure or table. The bar
-        is not packed here - _on_tab_changed puts it above the notebook while a
-        data tab is showing and takes it away for the Screenshot tab."""
+        stays above the notebook on every tab, so the tabs do not jump when
+        turning to or from Screenshot; _sync_plot_bar greys out whatever the
+        tab on show does not read."""
         bar = self.plot_bar = ttk.LabelFrame(right, text="Plot data")
+        bar.pack(fill="x", padx=8, pady=(4, 0), before=self.nb)
+        # What picks the captures, and what picks the channels: greyed
+        # separately, since XY reads the first and not the second.
+        sel = self.plot_sel_widgets = []
         row = ttk.Frame(bar)
         row.pack(fill="x", padx=6, pady=(4, 2))
-        ttk.Label(row, text="Runs:").pack(side="left")
+        sel.append(ttk.Label(row, text="Runs:"))
+        sel[-1].pack(side="left")
         self.plot_runs = tk.StringVar()
         e = ttk.Entry(row, textvariable=self.plot_runs, width=14)
         e.pack(side="left", padx=(4, 10))
         e.bind("<Return>", lambda _e: self.do_plot_redraw())
-        ttk.Label(row, text="Compare:").pack(side="left")
+        sel.append(e)
+        sel.append(ttk.Label(row, text="Compare:"))
+        sel[-1].pack(side="left")
         self.plot_cmp = tk.StringVar()
         e = ttk.Entry(row, textvariable=self.plot_cmp, width=24)
         e.pack(side="left", fill="x", expand=True, padx=(4, 6))
         e.bind("<Return>", lambda _e: self.do_plot_redraw())
-        ttk.Button(row, text="Add files...",
-                   command=self.do_compare_add).pack(side="left")
+        sel.append(e)
+        sel.append(ttk.Button(row, text="Add files...",
+                              command=self.do_compare_add))
+        sel[-1].pack(side="left")
         self.cmp_clear_btn = ttk.Button(row, text="Clear",
                                         command=self.do_compare_clear)
         self.cmp_clear_btn.pack(side="left", padx=(4, 0))
-        ttk.Button(row, text="Redraw",
-                   command=self.do_plot_redraw).pack(side="left", padx=(10, 0))
+        sel.append(ttk.Button(row, text="Redraw", command=self.do_plot_redraw))
+        sel[-1].pack(side="left", padx=(10, 0))
 
         row2 = ttk.Frame(bar)
         row2.pack(fill="x", padx=6, pady=(0, 4))
-        ttk.Label(row2, text="Show:").pack(side="left")
+        show = self.plot_show_widgets = [ttk.Label(row2, text="Show:")]
+        show[-1].pack(side="left")
         self.plot_show = {}
         for ch in (1, 2, 3, 4):
             var = tk.BooleanVar(value=True)
             self.plot_show[ch] = var
-            ttk.Checkbutton(row2, text=f"CH{ch}", variable=var,
-                            command=self.refresh_plots).pack(side="left",
-                                                             padx=(4, 0))
+            show.append(ttk.Checkbutton(row2, text=f"CH{ch}", variable=var,
+                                        command=self.refresh_plots))
+            show[-1].pack(side="left", padx=(4, 0))
+        self.plot_status_colour = "#666"      # put back when the bar is live
         self.plot_status = ttk.Label(row2, text=PLOT_HINT, foreground="#666")
         self.plot_status.pack(side="left", padx=(14, 0))
 
@@ -2478,7 +2490,8 @@ class App:
                        "time base").pack(side="left", padx=(12, 0))
 
         ctl, self.fig_xy = self._fig_tab("XY", self._plot_xy)
-        self.xy_x, self.xy_y = tk.StringVar(value="CH1"), tk.StringVar(value="CH2")
+        self.plot_no_show = {ctl.master}      # its channels are the two below
+        self.xy_x,self.xy_y = tk.StringVar(value="CH1"), tk.StringVar(value="CH2")
         for text, var in (("X:", self.xy_x), ("Y:", self.xy_y)):
             ttk.Label(ctl, text=text).pack(side="left",
                                            padx=(0 if text == "X:" else 10, 0))
@@ -2524,13 +2537,14 @@ class App:
         self.scope_meas.pack(anchor="w", pady=(2, 0))
 
         self.nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+        self._sync_plot_bar()
 
     def _fig_tab(self, name, draw):
         """A tab holding a matplotlib figure with the zoom/pan toolbar, plus a
         strip above it for that tab's own knobs. Returns (strip, figure); the
         figure carries its canvas and toolbar as _canvas and _toolbar the way
         the ILC panel's do. Without matplotlib the tab says so and draws
-        nothing, but still counts as a data tab so the bar shows."""
+        nothing, but still counts as a data tab so the bar is live."""
         frame = ttk.Frame(self.nb)
         self.nb.add(frame, text=name)
         ctl = ttk.Frame(frame)
@@ -2588,13 +2602,29 @@ class App:
 
     def _on_tab_changed(self, _event=None):
         tab = self._current_tab()
-        if tab in self.plot_tabs:
-            if self.plot_bar.winfo_manager() != "pack":
-                self.plot_bar.pack(fill="x", padx=8, pady=(4, 0), before=self.nb)
-            if tab in self.plot_dirty:
-                self._draw_tab(tab)
-        else:
-            self.plot_bar.pack_forget()
+        if tab in self.plot_tabs and tab in self.plot_dirty:
+            self._draw_tab(tab)
+        self._sync_plot_bar()
+
+    def _sync_plot_bar(self):
+        """Grey out what the tab on show does not read: all of the bar on
+        Screenshot, and the Show ticks on XY, which picks its two channels
+        itself. Clear is live only with something to clear."""
+        tab = self._current_tab()
+        live = tab in self.plot_tabs
+        shows = live and tab not in self.plot_no_show
+        for w in self.plot_sel_widgets:
+            w.configure(state="normal" if live else "disabled")
+        for w in self.plot_show_widgets:
+            w.configure(state="normal" if shows else "disabled")
+        self.cmp_clear_btn.configure(
+            state="normal" if live and (self.plot_cmp.get().strip()
+                                        or self.cmp_paths) else "disabled")
+        # The status line's colour is its own, so the theme's grey only shows
+        # through once that is taken off.
+        self.plot_status.configure(
+            state="normal" if live else "disabled",
+            foreground=self.plot_status_colour if live else "")
 
     def refresh_plots(self):
         """Something moved - a capture landed, the folder or the prefix
@@ -2728,10 +2758,9 @@ class App:
             text, colour = "nothing resolved - see the log", "#c60"
         else:
             text, colour = PLOT_HINT, "#666"
-        self.plot_status.configure(text=elide(text, 110), foreground=colour)
-        self.cmp_clear_btn.configure(
-            state="normal" if self.plot_cmp.get().strip() or self.cmp_paths
-            else "disabled")
+        self.plot_status.configure(text=elide(text, 110))
+        self.plot_status_colour = colour
+        self._sync_plot_bar()
 
     def do_compare_add(self):
         """Pick captures to overlay, from anywhere on disk.

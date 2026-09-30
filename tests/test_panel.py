@@ -146,6 +146,38 @@ def panel_checks(prof):
         app.set_busy(False)
         check("and comes back afterwards",
               str(app.model_box.cget("state")) == "readonly")
+
+        print("\nthe plot bar stays put and greys out by tab")
+        # The bar used to be packed only for the data tabs, which moved the
+        # notebook every time Screenshot was turned to or from.
+        tabs = {app.nb.tab(t, "text"): t for t in app.nb.tabs()}
+
+        def turn_to(name):
+            app.nb.select(tabs[name])
+            root.update()
+            packed = app.plot_bar.winfo_manager() == "pack"
+            sel = {str(w.cget("state")) for w in app.plot_sel_widgets}
+            show = {str(w.cget("state")) for w in app.plot_show_widgets}
+            return packed, sel, show, str(app.plot_status.cget("state"))
+
+        check("Screenshot: there, and all of it grey",
+              turn_to("Screenshot") == (True, {"disabled"}, {"disabled"},
+                                        "disabled"))
+        check("Clear is grey with it",
+              str(app.cmp_clear_btn.cget("state")) == "disabled")
+        for name in ("Waveforms", "Spectrum", "Difference", "Statistics",
+                     "Measurements"):
+            check(f"{name}: all of it live",
+                  turn_to(name) == (True, {"normal"}, {"normal"}, "normal"))
+        check("XY: live but for the Show ticks, which it does not read",
+              turn_to("XY") == (True, {"normal"}, {"disabled"}, "normal"))
+        app.plot_cmp.set("other")
+        app.refresh_plots()
+        check("Clear is live with something to clear",
+              str(app.cmp_clear_btn.cget("state")) == "normal")
+        turn_to("Screenshot")
+        check("and grey again on Screenshot",
+              str(app.cmp_clear_btn.cget("state")) == "disabled")
     finally:
         root.destroy()
 
