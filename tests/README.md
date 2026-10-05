@@ -17,6 +17,7 @@ nothing opens a VISA session.
 | `cases.py` | The settings snapshot and the metadata cases both of the above are built from |
 | `test_probe.py` | `tools/probe_scope.py` driven against mock instruments |
 | `test_path_import.py` | That EOM-ILC can still load `scope_grab.py` by file path |
+| `test_headless.py` | The API another program drives a `Scope` through: settings snapshot, offset dither, capture files, each against what the panel does |
 | `golden/` | Expected output, byte for byte |
 
 ## What the goldens are

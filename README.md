@@ -803,6 +803,24 @@ version of that which cannot leave a half-built panel behind. Your folder,
 prefix and channel names are kept; unapplied settings edits are not. It refuses
 while a capture or a sequence is running.
 
+### Driving a scope from another program
+
+Two programs load `scope_grab.py` by file path and drive a `Scope` without the
+window: EOM-ILC's bench loop, and the ramp polarimeter. What they share with
+the panel is module-level, so a capture they write is the same file the panel
+would have written:
+
+| | |
+|---|---|
+| `Scope(prof).connect()`, `single()`, `accumulate()`, `record()` | acquisition, as the panel does it |
+| `Scope.read_settings()` | the panel's settings snapshot (`setting_roots(prof)`), for `metadata()` |
+| `Scope.dither_plan()` / `dither_step()` / `restore_offsets()` | the sequence's offset dither - see [Dithering the offset](#dithering-the-offset-across-a-sequence) |
+| `write_capture(base, ext, recs, metadata)` | the NPZ or CSV plus the `.txt` sidecar |
+| `read_npz()`, `load_capture()` | reading either format back |
+
+The panel and another program cannot use the scope at the same time; close the
+panel first.
+
 ### Tests
 
 ```

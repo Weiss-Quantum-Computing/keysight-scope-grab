@@ -318,6 +318,62 @@ def write_csv(path, columns, data):
     return path
 
 
+def write_capture(base, ext, recs, metadata):
+    """Write one capture: `base` + `ext` (".npz" or ".csv") holding `recs`,
+    {column name: scope_profiles.Record} in channel order, and `base`.txt
+    holding `metadata`, the text Scope.metadata() formatted. Returns the data
+    file's path.
+
+    The panel's grab and any program driving a Scope without the panel (the
+    ramp polarimeter loads this file by path) write through here, so their
+    captures cannot drift apart in layout. The time base is the first
+    channel's, as it always was."""
+    columns = ["time_s"] + list(recs)
+    first = next(iter(recs.values()))
+    if ext == ".npz":
+        path = write_npz(base + ext, columns, first.x, list(recs.values()))
+    else:
+        path = write_csv(base + ext, columns, np.column_stack(
+            [first.t()] + [r.v() for r in recs.values()]))
+    # utf-8 explicitly: the file records channel names exactly as typed, and
+    # the machine default here is cp1252, which cannot encode half of what a
+    # name in this lab has in it. Failing on one would abort the grab with the
+    # data file already written and the run reported as having saved nothing.
+    with open(base + ".txt", "w", encoding="utf-8") as fh:
+        fh.write(metadata)
+    return path
+
+
+def setting_roots(prof):
+    """Every SCPI root the panel reads for its settings snapshot, in the order
+    the panel lays them out. Scope.read_settings() asks exactly these, so a
+    capture made without the panel carries the same metadata as one made with
+    it."""
+    roots = [scpi for _, scpi, _, _ in prof.timebase]
+    roots += [scpi for _, scpi in prof.info]
+    roots += [scpi for _, scpi, _, _ in prof.trigger]
+    roots += [tmpl.format(ch=ch) for ch in prof.channels
+              for _, tmpl, _, _ in prof.channel]
+    return list(dict.fromkeys(roots))
+
+
+def dither_offset(off0, span, k, count):
+    """Channel offset for run k of `count` in an offset dither: evenly spaced
+    across `span` volts, centred on the original offset `off0`. The preamble's
+    yorigin carries the offset, so the volts read back are true at every
+    step - only the converter's per-code error pattern moves."""
+    return off0 + span * ((k + 0.5) / count - 0.5)
+
+
+class DitherError(Exception):
+    """A channel's scale or offset could not be read to plan a dither."""
+
+    def __init__(self, ch, exc):
+        super().__init__(f"CH{ch}: {exc}")
+        self.ch = ch
+        self.exc = exc
+
+
 def read_config():
     """The session config as a plain dict, or {} when there is not one to read.
 
@@ -1262,6 +1318,58 @@ class Scope:
             lines += [chrow(f"CH{ch} {lbl}", s(scpi.format(ch=ch)))
                       for lbl, scpi in prof.meta_channel]
         return "\n".join(lines) + "\n"
+
+    def read_settings(self, log=None):
+        """The settings snapshot the panel takes before a capture, without the
+        panel: {scpi root: reply} for every root in setting_roots(). A root
+        that will not answer is left out (metadata() then prints '?') and
+        reported to `log` if one is given."""
+        values = {}
+        for scpi in setting_roots(self.prof):
+            try:
+                values[scpi] = self.get(scpi)
+            except Exception as exc:
+                if log:
+                    log(f"  {scpi}? failed: {exc}")
+        return values
+
+    def dither_plan(self, channels, codes):
+        """{ch: (offset now, span in volts)} for an offset dither `codes` ADC
+        codes wide on each channel - see the note at adc_code_per_vdiv for why
+        it exists. Raises DitherError naming the first channel whose scale or
+        offset would not read."""
+        plan = {}
+        for ch in channels:
+            try:
+                scale = float(self.get(self.prof.ch_scale.format(ch=ch)))
+                off = float(self.get(self.prof.ch_offset.format(ch=ch)))
+            except Exception as exc:
+                raise DitherError(ch, exc) from exc
+            plan[ch] = (off, codes * self.prof.adc_code_per_vdiv * scale)
+        return plan
+
+    def dither_step(self, plan, k, count):
+        """Set every planned channel to its offset for run k of `count`.
+        Returns {ch: exception} for any that refused; the rest are set."""
+        failed = {}
+        for ch, (off0, span) in plan.items():
+            try:
+                self.put(self.prof.ch_offset.format(ch=ch),
+                         f"{dither_offset(off0, span, k, count):.6g}")
+            except Exception as exc:
+                failed[ch] = exc
+        return failed
+
+    def restore_offsets(self, plan):
+        """Put every planned channel back on the offset it had before the
+        dither. Returns {ch: exception} for any that refused."""
+        failed = {}
+        for ch, (off0, _) in plan.items():
+            try:
+                self.put(self.prof.ch_offset.format(ch=ch), f"{off0:.6g}")
+            except Exception as exc:
+                failed[ch] = exc
+        return failed
 
     def run(self):
         try:
@@ -2497,25 +2605,13 @@ class App:
 
             self.set_phase("writing files")
             write_at = time.time()
-            columns = ["time_s"] + list(recs)
+            data_path = write_capture(
+                base, ext, recs,
+                self.scope.metadata(chans, settings, names, label, existing))
             first = next(iter(recs.values()))
-            if ext == ".npz":
-                data_path = write_npz(base + ext, columns, first.x,
-                                      list(recs.values()))
-            else:
-                data_path = write_csv(base + ext, columns, np.column_stack(
-                    [first.t()] + [r.v() for r in recs.values()]))
             self.log(f"{os.path.basename(data_path)}  "
-                     f"({len(first)} pts x {len(columns)} cols, "
+                     f"({len(first)} pts x {len(recs) + 1} cols, "
                      f"{os.path.getsize(data_path) / 1e6:.1f} MB)")
-
-            # utf-8 explicitly: the file records channel names exactly as typed,
-            # and the machine default here is cp1252, which cannot encode half
-            # of what a name in this lab has in it. Failing on one would abort
-            # the grab with the CSV already written and the run reported as
-            # having saved nothing.
-            with open(base + ".txt", "w", encoding="utf-8") as fh:
-                fh.write(self.scope.metadata(chans, settings, names, label, existing))
             self.grab_wrote = True
 
             if img is not None:
@@ -3901,19 +3997,12 @@ class App:
             if count < 2:
                 self.log("Sequence: a dither needs at least two runs to average.")
                 return
-            for ch in chans:
-                try:
-                    scale = float(self.scope.get(
-                        self.prof.ch_scale.format(ch=ch)))
-                    off = float(self.scope.get(
-                        self.prof.ch_offset.format(ch=ch)))
-                except Exception as exc:
-                    self.log(f"Sequence: could not read CH{ch}'s scale/offset "
-                             f"for the dither ({exc}) - running without it")
-                    self.seq_dither_plan = {}
-                    break
-                self.seq_dither_plan[ch] = (
-                    off, codes * self.prof.adc_code_per_vdiv * scale)
+            try:
+                self.seq_dither_plan = self.scope.dither_plan(chans, codes)
+            except DitherError as err:
+                self.log(f"Sequence: could not read CH{err.ch}'s scale/offset "
+                         f"for the dither ({err.exc}) - running without it")
+                self.seq_dither_plan = {}
             if self.seq_dither_plan:
                 self.log("Sequence: dithering " + ", ".join(
                     f"CH{ch} over {span*1e3:.0f} mV ({codes} code{'s' if codes > 1 else ''})"
@@ -3961,15 +4050,11 @@ class App:
         if self.seq_dither_plan:
             # evenly spaced across the span, centred on the original offset;
             # the preamble's yorigin carries it, so the CSV volts are true
-            count = self.seq_last - self.seq_first + 1
-            k = self.seq_index - self.seq_first
-            for ch, (off0, span) in self.seq_dither_plan.items():
-                want = off0 + span * ((k + 0.5) / count - 0.5)
-                try:
-                    self.scope.put(self.prof.ch_offset.format(ch=ch),
-                                   f"{want:.6g}")
-                except Exception as exc:
-                    self.log(f"  dither: could not set CH{ch} offset ({exc})")
+            failed = self.scope.dither_step(
+                self.seq_dither_plan, self.seq_index - self.seq_first,
+                self.seq_last - self.seq_first + 1)
+            for ch, exc in failed.items():
+                self.log(f"  dither: could not set CH{ch} offset ({exc})")
         self.set_busy(True)
         threading.Thread(target=self._grab_worker, args=(self.channels(), label),
                          daemon=True).start()
@@ -4013,13 +4098,11 @@ class App:
             self.seq_job = None
         self.seq_active = False
         if self.seq_dither_plan:
-            for ch, (off0, _) in self.seq_dither_plan.items():
-                try:
-                    self.scope.put(self.prof.ch_offset.format(ch=ch),
-                                   f"{off0:.6g}")
-                except Exception as exc:
-                    self.log(f"  dither: could not restore CH{ch} offset "
-                             f"{off0:+.5g} V ({exc})")
+            failed = self.scope.restore_offsets(self.seq_dither_plan)
+            for ch, exc in failed.items():
+                off0 = self.seq_dither_plan[ch][0]
+                self.log(f"  dither: could not restore CH{ch} offset "
+                         f"{off0:+.5g} V ({exc})")
             self.log("  dither: offsets restored")
             self.seq_dither_plan = {}
         self.seq_btn.configure(text="Start sequence")
