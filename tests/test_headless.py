@@ -165,8 +165,43 @@ def write_checks(tmp):
     check("NPZ volts are bit-exact", np.array_equal(data[:, 1], rec1.v()))
 
 
+def refused_checks():
+    print("\nwhy a connect was refused (Windows asked through USB_PROBE, stubbed)")
+    prof = scope_profiles.PROFILES["msox2014a"]
+    s = sg.Scope(prof)
+    scope = "USB0::0x0957::0x1798::MY63080029::0::INSTR"
+    rigol = "USB0::0x1AB1::0x04CE::DS1ZA184752794::0::INSTR"
+    ncic = Exception("VI_ERROR_NCIC (-1073807264): The interface associated "
+                     "with this session is not currently the controller in charge.")
+    real = sg.USB_PROBE
+    try:
+        sg.USB_PROBE = lambda res: {scope: ("error", "10", "USB Test and Measurement Device (IVI)"),
+                                    rigol: ("absent", "", "")}
+        msg = s._nothing_found([], [(scope, ncic), (rigol, ncic)])
+        check("a failed USB driver is reported as such, not as another program",
+              "driver failed" in msg and "Code 10" in msg and "another copy" not in msg.lower())
+        sg.USB_PROBE = lambda res: {scope: ("ok", "", "x"), rigol: ("absent", "", "")}
+        msg = s._nothing_found([], [(scope, ncic), (rigol, ncic)])
+        check("a working device that refuses is still 'something else has it open'",
+              "already has it open" in msg)
+        check("...listing only devices that are plugged in", scope in msg and rigol not in msg)
+        sg.USB_PROBE = lambda res: {}
+        msg = s._nothing_found([], [(scope, ncic)])
+        check("no answer from Windows falls back to the old message", "already has it open" in msg)
+        sg.USB_PROBE = lambda res: (_ for _ in ()).throw(AssertionError("asked"))
+        s._nothing_found(["KEYSIGHT,OTHER"], [])
+        check("Windows is not asked when nothing was refused", True)
+    except AssertionError:
+        check("Windows is not asked when nothing was refused", False)
+    finally:
+        sg.USB_PROBE = real
+    states = sg.usb_device_states(["GPIB0::10::INSTR", "TCPIP0::1.2.3.4::INSTR"])
+    check("non-USB resources are not looked up", states == {})
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="scopegrab-headless-")
+    refused_checks()
     settings_checks()
     dither_checks()
     write_checks(tmp)

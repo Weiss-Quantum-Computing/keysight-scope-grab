@@ -357,6 +357,53 @@ def setting_roots(prof):
     return list(dict.fromkeys(roots))
 
 
+def usb_device_states(resources, timeout=15):
+    """What Windows says about the USB devices behind VISA resources:
+    {resource: (state, problem code, device name)} with state 'ok', 'error'
+    (present but not working - Device Manager's yellow triangle) or 'absent'
+    (VISA still lists it, but it is not plugged in). Empty where it cannot
+    tell: not Windows, not USB, or PowerShell did not answer. Asked only after
+    a connect has failed, so its second or two is never on the normal path."""
+    if os.name != "nt":
+        return {}
+    ids = {}
+    for r in resources:
+        m = re.match(r"USB\d*::(0x[0-9A-Fa-f]+)::(0x[0-9A-Fa-f]+)::", r)
+        if m:
+            ids[r] = f"VID_{int(m.group(1), 16):04X}&PID_{int(m.group(2), 16):04X}"
+    if not ids:
+        return {}
+    pats = " -or ".join(f"$_.InstanceId -like 'USB\\{v}\\*'" for v in set(ids.values()))
+    cmd = ("Get-PnpDevice -PresentOnly | Where-Object { " + pats + " } | "
+           "ForEach-Object { $c = (Get-PnpDeviceProperty -InstanceId $_.InstanceId "
+           "-KeyName DEVPKEY_Device_ProblemCode -ErrorAction SilentlyContinue).Data; "
+           "\"$($_.InstanceId)|$($_.Status)|$c|$($_.FriendlyName)\" }")
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
+            capture_output=True, text=True, timeout=timeout,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+    except Exception:
+        return {}
+    found = {}
+    for line in out.splitlines():
+        parts = line.strip().split("|")
+        if len(parts) != 4:
+            continue
+        inst, status, code, name = parts
+        key = inst.upper().split("\\")[1] if "\\" in inst else ""
+        ok = status.strip().upper() == "OK"
+        prev = found.get(key)
+        if prev is None or (prev[0] == "error" and ok):
+            found[key] = ("ok" if ok else "error", code.strip(), name.strip())
+    return {r: found.get(v, ("absent", "", "")) for r, v in ids.items()}
+
+
+# Replaceable in tests, which must not depend on what is plugged into the PC.
+USB_PROBE = usb_device_states
+
+
 def dither_offset(off0, span, k, count):
     """Channel offset for run k of `count` in an offset dither: evenly spaced
     across `span` volts, centred on the original offset `off0`. The preamble's
@@ -1018,6 +1065,27 @@ class Scope:
         busy = [res for res, exc in refused
                 if "NCIC" in str(exc) or "BUSY" in str(exc).upper()
                 or "controller in charge" in str(exc).lower()]
+        # VI_ERROR_NCIC is ALSO what every USB resource answers when Windows
+        # has the instrument's USB driver in a failed state - measured 5 Oct
+        # 2026: the MSO-X sat at Device Manager Code 10 (0xC000009A) after a
+        # re-plug, nothing had it open, and this message sent Maarten looking
+        # for another copy of the program; a reboot was the old cure. Ask
+        # Windows before blaming another program.
+        if busy:
+            states = USB_PROBE(busy)
+            failed = {r: s for r, s in states.items() if s[0] == "error"}
+            absent = [r for r, s in states.items() if s[0] == "absent"]
+            if failed:
+                lines = "\n".join(f"  {r}  ({s[2] or 'USB device'}, Code {s[1]})"
+                                  for r, s in failed.items())
+                return ("Windows reports the instrument's USB driver failed to "
+                        "start, so nothing can open it - no other program is "
+                        "holding it:\n" + lines + "\n\nUnplug the scope's USB "
+                        "cable for ~10 s and plug it back into the same port "
+                        "(or power-cycle the scope), then press Connect. If "
+                        "Device Manager still shows the error, Disable and "
+                        "Enable the device there. A reboot is not needed.")
+            busy = [r for r in busy if r not in absent] or busy
         if busy:
             return ("Found the instrument, but something else already has it "
                     "open:\n" + "\n".join(f"  {r}" for r in busy)
