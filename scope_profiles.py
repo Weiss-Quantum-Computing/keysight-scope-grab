@@ -29,6 +29,40 @@ import time
 import numpy as np
 
 
+class Record:
+    """One channel's readout as the instrument sent it: the integer codes and
+    the preamble numbers that turn them into time and volts.
+
+    Kept in this form so a capture can be saved as what the scope actually
+    said - two bytes a sample - rather than as decimal text, and so the volts
+    can be rebuilt later exactly as t() and v() build them now. A trace that
+    was averaged here rather than on the instrument has no integer codes left;
+    it carries its volts outright and `codes` is None.
+
+        t = (i - x_ref) * x_inc + x_orig
+        v = (code - y_ref) * y_inc + y_orig
+    """
+
+    def __init__(self, x, codes=None, y=None, volts=None):
+        self.x = tuple(float(a) for a in x)          # (x_inc, x_orig, x_ref)
+        self.codes = codes
+        self.y = None if y is None else tuple(float(a) for a in y)
+        self.volts = volts
+
+    def __len__(self):
+        return len(self.codes if self.codes is not None else self.volts)
+
+    def t(self):
+        x_inc, x_orig, x_ref = self.x
+        return (np.arange(len(self)) - x_ref) * x_inc + x_orig
+
+    def v(self):
+        if self.codes is None:
+            return np.asarray(self.volts, dtype=np.float64)
+        y_inc, y_ref, y_orig = self.y
+        return (self.codes.astype(np.float64) - y_ref) * y_inc + y_orig
+
+
 class ScopeProfile:
     """The contract a profile has to satisfy. See KeysightInfiniiVision for a
     worked example of every field."""
@@ -110,9 +144,17 @@ class ScopeProfile:
         Scope.accumulate documents the contract this has to meet."""
         raise NotImplementedError
 
-    def read_waveform(self, scope, channel, points_mode, points):
-        """Return (t, v) for one channel."""
+    def read_record(self, scope, channel, points_mode, points):
+        """Return one channel's Record: the codes as they came, with the
+        preamble that scales them."""
         raise NotImplementedError
+
+    def read_waveform(self, scope, channel, points_mode, points):
+        """Return (t, v) for one channel. Derived from read_record so the
+        arrays a caller gets here (EOM-ILC's bench loop among them) and the
+        ones a saved file rebuilds are computed by the same two lines."""
+        rec = self.read_record(scope, channel, points_mode, points)
+        return rec.t(), rec.v()
 
     def screenshot(self, scope):
         """Return the scope screen as PNG bytes."""
@@ -388,7 +430,7 @@ class KeysightInfiniiVision(ScopeProfile):
             # that never triggered.
             return count if completed else -1
 
-    def read_waveform(self, scope, channel, points_mode, points):
+    def read_record(self, scope, channel, points_mode, points):
         w = scope.inst
         w.write(f":WAVeform:SOURce CHANnel{channel}")
         w.write(f":WAVeform:POINts:MODE {points_mode}")
@@ -413,9 +455,8 @@ class KeysightInfiniiVision(ScopeProfile):
 
         raw = w.query_binary_values(":WAVeform:DATA?", datatype="H",
                                     container=np.array)
-        t = (np.arange(len(raw)) - xref) * xinc + xorig
-        v = (raw.astype(np.float64) - yref) * yinc + yorig
-        return t, v
+        return Record((xinc, xorig, xref), codes=raw.astype(np.uint16),
+                      y=(yinc, yref, yorig))
 
     def screenshot(self, scope):
         return scope.inst.query_binary_values(":DISPlay:DATA? PNG,COLor",
@@ -454,6 +495,8 @@ class RigolDS1000Z(ScopeProfile):
         # y-scaling from the last preamble read, per channel, so an
         # averaged sum of raw codes can be turned into volts at the end.
         self._scale = {}
+        # and the time base from the same read, for the Record it ends up in
+        self._x = {}
 
     key = "ds1054z"
     name = "Rigol DS1054Z"
@@ -730,9 +773,10 @@ class RigolDS1000Z(ScopeProfile):
         xinc, xorig, xref = float(pre[4]), float(pre[5]), float(pre[6])
         t = (np.arange(len(raw)) - xref) * xinc + xorig
         self._scale[ch] = (float(pre[7]), float(pre[8]), float(pre[9]))
+        self._x[ch] = (xinc, xorig, xref)
         return t, raw
 
-    def read_waveform(self, scope, channel, points_mode, points):
+    def read_record(self, scope, channel, points_mode, points):
         """A trace this profile averaged, if there is one waiting, otherwise a
         live read.
 
@@ -740,9 +784,10 @@ class RigolDS1000Z(ScopeProfile):
         exactly once - a later capture that is not averaging must not be handed
         the last one's trace."""
         if channel in scope.averaged:
-            t, codes = scope.averaged.pop(channel)
+            # A mean of codes is not a code any more, so this one carries volts.
+            _t, codes = scope.averaged.pop(channel)
             yinc, yorig, yref = self._scale[channel]
-            return t, (codes - yref - yorig) * yinc
+            return Record(self._x[channel], volts=(codes - yref - yorig) * yinc)
         w = scope.inst
         w.write(f":WAVeform:SOURce CHANnel{channel}")
         w.write(f":WAVeform:MODE {points_mode}")
@@ -757,9 +802,11 @@ class RigolDS1000Z(ScopeProfile):
         yinc, yorig, yref = float(pre[7]), float(pre[8]), float(pre[9])
         raw = w.query_binary_values(":WAVeform:DATA?", datatype="B",
                                     container=np.array)
-        t = (np.arange(len(raw)) - xref) * xinc + xorig
-        v = (raw.astype(np.float64) - yref - yorig) * yinc
-        return t, v
+        # Rigol's YORigin is in codes, so it folds into the code offset: the
+        # Record's (code - y_ref) * y_inc + 0 is this scope's
+        # (code - yref - yorig) * yinc, exactly, since both are whole numbers.
+        return Record((xinc, xorig, xref), codes=raw.astype(np.uint8),
+                      y=(yinc, yref + yorig, 0.0))
 
     def screenshot(self, scope):
         # MEASURED: 800x480 PNG, 36-43 kB. The parameters are

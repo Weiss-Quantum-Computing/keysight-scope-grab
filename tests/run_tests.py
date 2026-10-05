@@ -9,8 +9,8 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SUITES = ["test_output.py", "test_panel.py", "test_probe.py",
-          "test_path_import.py"]
+SUITES = ["test_output.py", "test_panel.py", "test_capture_files.py",
+          "test_probe.py", "test_path_import.py"]
 
 
 def main():

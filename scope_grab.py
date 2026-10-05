@@ -2,8 +2,9 @@
 """
 Scope Grab - one-click capture from a bench oscilloscope.
 
-Click a button, get a timestamped CSV of the waveform, a PNG of the screen,
-and a metadata text file in your chosen folder. No licenses, no BenchVue.
+Click a button, get a timestamped data file of the waveform (compact NPZ or
+CSV), a PNG of the screen, and a metadata text file in your chosen folder. No
+licenses, no BenchVue.
 
 Which scope it is talking to lives in scope_profiles.py, one profile per
 instrument family. This file holds everything that does not depend on that:
@@ -74,6 +75,13 @@ CMP_ZORDER = 1.8
 # Traces per pane past which the legend is left off - a 64-run sequence is a
 # ramp of colour, not a list of names.
 LEGEND_MAX = 12
+# Points per trace past which a blank 'Draw 1 in' box starts thinning. A pane is
+# some 600 pixels wide and a column of them can show a trace's lowest and
+# highest sample and nothing between, so this is exact unzoomed and to about an
+# 8x zoom. Measured in the window on synthetic ramps: ten 62500-point runs on
+# four channels redraw Waveforms in 1.4 s instead of 4.8, three 1 Mpt runs in
+# 0.7 s instead of 5.4.
+PLOT_AUTO_PTS = 10000
 
 
 def _cosine_window(n, a):
@@ -168,13 +176,146 @@ def safe_column(name):
 
 
 def free_base(base):
-    """Add a suffix rather than overwrite a capture that is already there."""
-    if not os.path.exists(base + ".csv"):
+    """Add a suffix rather than overwrite a capture that is already there -
+    in either format, so switching the Data box mid-folder cannot reuse a
+    name."""
+    if not capture_exists(base):
         return base
     n = 2
-    while os.path.exists(f"{base}_{n}.csv"):
+    while capture_exists(f"{base}_{n}"):
         n += 1
     return f"{base}_{n}"
+
+
+# -- capture files -----------------------------------------------------------
+#
+# A capture is saved one of two ways, picked by the Data box beside Save
+# screenshot. Both carry a .txt sidecar, which is the same either way.
+#
+#   CSV  time_s,CH1_..._V,... as decimal text. Opens in anything, and the AWG
+#        panels replay it. MEASURED on a 500 kpt four-channel HRES record from
+#        the MSO-X: 35.6 MB.
+#   NPZ  what the scope sent: each channel's integer codes plus the preamble
+#        numbers that scale them, in a compressed numpy archive. Same record:
+#        1.5 MB (MEASURED on that capture converted by tools/csv_to_npz.py; a
+#        fresh grab's WORD codes are not yet sized). Nothing is rounded - the CSV is the one that rounds, to
+#        seven digits - and the volts rebuild bit for bit as the panel computed
+#        them at grab time. Read with load_capture(), np.load, or EOM-ILC's
+#        eomilc/scope.py, which carries its own copy of read_npz.
+#
+# The NPZ layout, version 1 (everything a plain array, so np.load needs no
+# pickle):
+#   format   "scope-grab-npz/1"
+#   columns  the CSV header as an array of strings, time_s first
+#   x, n     [x_inc, x_orig, x_ref] and the sample count:
+#            t = (i - x_ref) * x_inc + x_orig
+#   t        instead of x and n, the times outright (an average, or a
+#            converted CSV whose time column was not a clean grid)
+#   y<j>     column j's data, j = 1.. in header order. With s<j> beside it,
+#            unsigned integer codes stored as differences from the previous
+#            sample (the first as itself) - a cumulative sum in the same dtype
+#            undoes it, wrap-around included. Without s<j>, volts as float64.
+#   s<j>     [y_inc, y_ref, y_orig]:  v = (code - y_ref) * y_inc + y_orig
+# Storing differences rather than codes is what takes a record from 2.1 MB to
+# 1.5 MB: consecutive samples sit close together, so the differences are small
+# numbers that compress better.
+
+DATA_FORMATS = ("NPZ", "CSV")
+CAPTURE_EXTS = (".npz", ".csv")
+NPZ_FORMAT = "scope-grab-npz/1"
+
+
+def capture_stem(path):
+    """A capture's path without its extension, for finding its sidecar."""
+    for ext in CAPTURE_EXTS:
+        if path.lower().endswith(ext):
+            return path[:-len(ext)]
+    return path
+
+
+def capture_exists(base):
+    return any(os.path.exists(base + ext) for ext in CAPTURE_EXTS)
+
+
+def _delta(codes):
+    d = codes.copy()
+    # Unsigned, so a step down wraps; the cumulative sum in the same dtype
+    # wraps back. No warning either way - numpy only warns on scalars.
+    d[1:] = codes[1:] - codes[:-1]
+    return d
+
+
+def write_npz(path, columns, t, ys):
+    """Save a capture as NPZ (layout above). `t` is the preamble's
+    (x_inc, x_orig, x_ref) when the time base is the scope's own, else an
+    array of times. `ys` holds, per channel column, a scope_profiles.Record -
+    its codes are what get stored - or an array of volts. Written to a
+    temporary name and moved into place, so a crash mid-write cannot leave a
+    truncated capture where a whole one is expected."""
+    arrs = {"format": np.array(NPZ_FORMAT), "columns": np.array(list(columns))}
+    for j, y in enumerate(ys, 1):
+        if isinstance(y, scope_profiles.Record) and y.codes is not None:
+            arrs[f"y{j}"] = _delta(np.ascontiguousarray(y.codes))
+            arrs[f"s{j}"] = np.array(y.y, dtype=np.float64)
+        else:
+            v = y.v() if isinstance(y, scope_profiles.Record) else y
+            arrs[f"y{j}"] = np.asarray(v, dtype=np.float64)
+    if isinstance(t, tuple):
+        arrs["x"] = np.array(t, dtype=np.float64)
+        arrs["n"] = np.array(len(ys[0]) if ys else 0, dtype=np.int64)
+    else:
+        arrs["t"] = np.asarray(t, dtype=np.float64)
+    tmp = path + ".part"
+    with open(tmp, "wb") as fh:
+        np.savez_compressed(fh, **arrs)
+    os.replace(tmp, path)
+    return path
+
+
+def read_npz(path):
+    """(columns, data) of an NPZ capture, data[:, 0] being time_s - the same
+    two things a CSV's header and np.loadtxt give."""
+    with np.load(path, allow_pickle=False) as z:
+        tag = str(z["format"]) if "format" in z.files else ""
+        if not tag.startswith("scope-grab-npz/"):
+            raise ValueError(f"{os.path.basename(path)} is not a Scope Grab "
+                             f"capture (no format tag)")
+        if tag != NPZ_FORMAT:
+            raise ValueError(f"{os.path.basename(path)} is {tag}; this "
+                             f"version of Scope Grab reads {NPZ_FORMAT}")
+        columns = [str(c) for c in z["columns"]]
+        if "t" in z.files:
+            t = z["t"].astype(np.float64)
+        else:
+            x_inc, x_orig, x_ref = (float(a) for a in z["x"])
+            t = (np.arange(int(z["n"])) - x_ref) * x_inc + x_orig
+        data = np.empty((len(t), len(columns)))
+        data[:, 0] = t
+        for j in range(1, len(columns)):
+            y = z[f"y{j}"]
+            if f"s{j}" in z.files:
+                y_inc, y_ref, y_orig = (float(a) for a in z[f"s{j}"])
+                codes = np.cumsum(y, dtype=y.dtype)
+                data[:, j] = (codes.astype(np.float64) - y_ref) * y_inc + y_orig
+            else:
+                data[:, j] = y
+    return columns, data
+
+
+def load_capture(path):
+    """(columns, data) of a capture in either format: the header names, and
+    the samples with time_s in the first column."""
+    if path.lower().endswith(".npz"):
+        return read_npz(path)
+    with open(path, encoding="utf-8") as fh:
+        header = fh.readline().strip()
+    return header.split(","), np.loadtxt(path, delimiter=",", skiprows=1, ndmin=2)
+
+
+def write_csv(path, columns, data):
+    np.savetxt(path, data, delimiter=",", header=",".join(columns),
+               comments="", fmt=[TIME_FMT] + [VOLT_FMT] * (data.shape[1] - 1))
+    return path
 
 
 def read_config():
@@ -257,6 +398,8 @@ def describe_setup(cfg, prof):
         if "save_png" in grab:
             lines.append(f"  Save screenshot   "
                          f"{'yes' if grab.get('save_png') else 'no'}")
+        if grab.get("data_format"):
+            lines.append(f"  Data format       {grab['data_format']}")
         names = grab.get("channel_names") or {}
         ticked = grab.get("channels") or {}
         for ch in prof.channels:
@@ -274,36 +417,39 @@ def describe_setup(cfg, prof):
 # runs whether or not the scope is connected, and other programs can import it.
 
 def sequence_files(outdir, prefix):
-    """The numbered CSVs of a sequence, {label: path}, in run order. Labels
-    keep their zero-padding as found, so a series written as _001 reads back
-    as '001'."""
-    pat = re.compile(re.escape(prefix) + r"_(\d+)\.csv$")
+    """The numbered captures of a sequence, {label: path}, in run order.
+    Labels keep their zero-padding as found, so a series written as _001
+    reads back as '001'. A run saved in both formats is read from its NPZ."""
+    pat = re.compile(re.escape(prefix) + r"_(\d+)\.(csv|npz)$", re.IGNORECASE)
     out = {}
     try:
         for n in os.listdir(outdir):
             m = pat.match(n)
-            if m:
+            if m and (m.group(1) not in out or m.group(2).lower() == "npz"):
                 out[m.group(1)] = os.path.join(outdir, n)
     except OSError:
         pass
     return dict(sorted(out.items(), key=lambda kv: int(kv[0])))
 
 
-def average_sequence(outdir, prefix, first=None, last=None, log=None):
+def average_sequence(outdir, prefix, first=None, last=None, log=None,
+                     fmt="CSV"):
     """Average the numbered runs of `prefix` (optionally labels first..last)
-    into <prefix>_avg_<first>-<last>.csv, with a .txt sidecar made from the
-    first run's, headed by what was averaged.
+    into <prefix>_avg_<first>-<last>.csv (or .npz, by `fmt`), with a .txt
+    sidecar made from the first run's, headed by what was averaged. The runs
+    may be in either format, or a mix.
 
     Every run has to carry the same columns, the same point count and the
     same time base -- a sequence taken through one scope setup does, and
     one that changed setup mid-way is refused rather than blended. A gap in
     the series (a deleted run) is skipped and reported. Returns
-    (csv_path, [labels used]). Raises ValueError on anything it cannot do.
+    (path written, [labels used]). Raises ValueError on anything it cannot
+    do.
     """
     say = log or (lambda *_: None)
     files = sequence_files(outdir, prefix)
     if not files:
-        raise ValueError(f"no numbered files {prefix}_NNN.csv in {outdir}")
+        raise ValueError(f"no numbered files {prefix}_NNN.csv/.npz in {outdir}")
     labels = list(files)
     if first is not None:
         labels = [l for l in labels if int(l) >= int(first)]
@@ -320,9 +466,8 @@ def average_sequence(outdir, prefix, first=None, last=None, log=None):
 
     header, acc, t0, n = None, None, None, 0
     for lab in labels:
-        with open(files[lab], "r", encoding="utf-8") as fh:
-            head = fh.readline().strip()
-        data = np.loadtxt(files[lab], delimiter=",", skiprows=1, ndmin=2)
+        cols, data = load_capture(files[lab])
+        head = ",".join(cols)
         if header is None:
             header, t0, acc = head, data[:, 0], np.zeros_like(data[:, 1:])
         elif head != header:
@@ -341,23 +486,28 @@ def average_sequence(outdir, prefix, first=None, last=None, log=None):
     mean = acc / n
     width = len(labels[0])
     base = os.path.join(outdir, f"{prefix}_avg_{lo:0{width}d}-{hi:0{width}d}")
-    np.savetxt(base + ".csv", np.column_stack([t0, mean]), delimiter=",",
-               header=header, comments="",
-               fmt=[TIME_FMT] + [VOLT_FMT] * mean.shape[1])
-    side = files[labels[0]][:-4] + ".txt"
+    # A mean of codes is not a code, so an NPZ average stores volts - still
+    # under half the CSV, and without the CSV's rounding.
+    if fmt.upper() == "NPZ":
+        path = write_npz(base + ".npz", header.split(","), t0,
+                         [mean[:, j] for j in range(mean.shape[1])])
+    else:
+        path = write_csv(base + ".csv", header.split(","),
+                         np.column_stack([t0, mean]))
+    side = capture_stem(files[labels[0]]) + ".txt"
     body = open(side, "r", encoding="utf-8").read() if os.path.exists(side) else ""
     with open(base + ".txt", "w", encoding="utf-8") as fh:
         fh.write(f"averaged from      : {n} runs, labels {labels[0]}-{labels[-1]}"
                  + (f" (missing: {', '.join(map(str, missing))})" if missing else "")
                  + "\n")
-        fh.write(f"averaging          : mean of the CSV samples per channel; "
+        fh.write(f"averaging          : mean of the samples per channel; "
                  f"time base from run {labels[0]}; single-shot scatter down by "
                  f"sqrt({n}) = {n ** 0.5:.1f}x\n")
         fh.write(f"settings below are : run {labels[0]}'s\n")
         fh.write(body)
-    say(f"{os.path.basename(base)}.csv  (mean of {n} runs, "
+    say(f"{os.path.basename(path)}  (mean of {n} runs, "
         f"{len(t0)} pts x {mean.shape[1]} cols)")
-    return base + ".csv", labels
+    return path, labels
 
 
 # ---------------------------------------------------------------------------
@@ -367,19 +517,22 @@ def average_sequence(outdir, prefix, first=None, last=None, log=None):
 # ---------------------------------------------------------------------------
 
 def capture_files(outdir, prefix):
-    """Every CSV of `prefix` in `outdir`, {run: path} in name order. The run
-    is whatever follows the prefix: '003' for a sequence run, '20260903_120000'
-    for a one-off, 'avg_001-064' for an averaged sequence. Name order puts a
-    sequence in run order and one-offs in capture order."""
+    """Every capture of `prefix` in `outdir`, {run: path} in name order. The
+    run is whatever follows the prefix: '003' for a sequence run,
+    '20260903_120000' for a one-off, 'avg_001-064' for an averaged sequence.
+    Name order puts a sequence in run order and one-offs in capture order. A
+    run saved in both formats is read from its NPZ."""
     head = prefix + "_"
     out = {}
     try:
         names = sorted(n for n in os.listdir(outdir)
-                       if n.lower().endswith(".csv") and n.startswith(head))
+                       if n.lower().endswith(CAPTURE_EXTS) and n.startswith(head))
     except OSError:
         return out
     for n in names:
-        out[n[len(head):-4]] = os.path.join(outdir, n)
+        run = capture_stem(n)[len(head):]
+        if run not in out or n.lower().endswith(".npz"):
+            out[run] = os.path.join(outdir, n)
     return out
 
 
@@ -387,9 +540,7 @@ def split_capture_name(path):
     """(prefix, run) of a capture's filename, by the patterns Scope Grab
     writes: prefix_NNN, prefix_YYYYMMDD_HHMMSS[_n], prefix_avg_A-B. A file
     named any other way is its own prefix with no run."""
-    stem = os.path.basename(path)
-    if stem.lower().endswith(".csv"):
-        stem = stem[:-4]
+    stem = capture_stem(os.path.basename(path))
     # Shortest prefix that leaves a whole run behind it, so a timestamp with a
     # _2 collision suffix is one run and a prefix that ends in digits keeps them.
     m = re.match(r"^(.+?)_(\d+|\d{8}_\d{6}(?:_\d+)?|avg_\d+-\d+)$", stem)
@@ -476,6 +627,28 @@ def spectrum(t, v, window="hann", units="rms"):
     else:
         a = np.sqrt(2.0) * x / np.sum(w)
     return f[1:], a[1:]
+
+
+def thin_index(v, step):
+    """Which samples of `v` to draw when only 1 in `step` is: the lowest and
+    the highest of each run of 2*step, in time order, and the two ends.
+
+    Every point drawn is a real sample, and the trace keeps its envelope - a
+    one-sample spike still shows, and a ripple faster than the thinned grid
+    stays a band rather than turning into a slow beat that is not in the data,
+    which is what drawing every step-th sample does to it."""
+    n = len(v)
+    if step <= 1 or n < 3:
+        return np.arange(n)
+    run = 2 * step
+    m = n // run * run
+    blocks = v[:m].reshape(-1, run)
+    base = np.arange(0, m, run)
+    idx = [base + blocks.argmin(axis=1), base + blocks.argmax(axis=1),
+           np.array([0, n - 1])]
+    if m < n:                       # what is left over is a short run of its own
+        idx.append(m + np.array([v[m:].argmin(), v[m:].argmax()]))
+    return np.unique(np.concatenate(idx))
 
 
 def _top_base(v, vmax, vmin):
@@ -660,7 +833,7 @@ PLOT_HINT = ("Runs: blank = newest, or  1-10  last3  avg  all.   "
 
 
 class Capture:
-    """One capture's CSV in memory, with its .txt sidecar parsed.
+    """One capture (CSV or NPZ) in memory, with its .txt sidecar parsed.
 
     key is the prefix it is known by in the plot boxes, run what follows the
     prefix in its filename. chan maps channel number to column, names carries
@@ -668,12 +841,9 @@ class Capture:
 
     def __init__(self, path, key, run):
         self.path, self.key, self.run = path, key, run
-        with open(path, encoding="utf-8") as fh:
-            header = fh.readline().strip()
-        self.columns = header.split(",")
+        self.columns, data = load_capture(path)
         if self.columns[:1] != ["time_s"]:
-            raise ValueError("not a Scope Grab CSV: the first column is not time_s")
-        data = np.loadtxt(path, delimiter=",", skiprows=1, ndmin=2)
+            raise ValueError("not a Scope Grab capture: the first column is not time_s")
         if data.shape[1] != len(self.columns):
             raise ValueError(f"{data.shape[1]} columns of data under "
                              f"{len(self.columns)} headers")
@@ -687,7 +857,7 @@ class Capture:
                 self.names[int(m.group(1))] = m.group(2) or ""
         self.dt = (float(np.median(np.diff(self.t))) if len(self.t) > 1
                    else float("nan"))
-        self.meta = read_sidecar(path[:-4] + ".txt")
+        self.meta = read_sidecar(capture_stem(path) + ".txt")
         self.label = f"{key} {run}" if run else key
 
     def v(self, ch):
@@ -947,6 +1117,11 @@ class Scope:
     def waveform(self, channel, points_mode="RAW", points=None):
         return self.prof.read_waveform(self, channel, points_mode, points)
 
+    def record(self, channel, points_mode="RAW", points=None):
+        """The same readout as waveform(), kept as the codes and preamble the
+        scope sent - what a compact capture file stores."""
+        return self.prof.read_record(self, channel, points_mode, points)
+
     def transfer_plan(self, averaged, points):
         """The points mode to read a record in, and the point count to ask for.
         Which modes will serve a record depends on how it was stopped, which is
@@ -1129,7 +1304,8 @@ class App:
         self.plot_dirty = set()
         self.plot_groups = None   # what the boxes last resolved to
         self.plot_notes_seen = set()
-        self.cmp_paths = {}       # compare key -> ["prefix", folder, prefix] | ["file", path]
+        self.plot_thin_warned = ""   # a 'Draw 1 in' entry already complained of
+        self.cmp_paths = {}      # compare key -> ["prefix", folder, prefix] | ["file", path]
         self.seq_active = False   # a numbered sequence is running
         self.seq_job = None       # pending after() for the next run
         self.seq_index = 0
@@ -1300,6 +1476,13 @@ class App:
         self.save_png = tk.BooleanVar(value=True)
         ttk.Checkbutton(af, text="save screenshot?",
                         variable=self.save_png).pack(side="left", padx=12)
+        # What the samples are saved as - see 'capture files' near the top.
+        # NPZ is the codes the scope sent, ~20x smaller than the CSV's text;
+        # CSV is for a file that has to open in Excel or replay on an AWG.
+        ttk.Label(af, text="Data:").pack(side="left")
+        self.data_fmt = tk.StringVar(value="NPZ")
+        ttk.Combobox(af, textvariable=self.data_fmt, values=DATA_FORMATS,
+                     state="readonly", width=5).pack(side="left", padx=(4, 0))
 
         # --- numbered sequence
         qf = ttk.LabelFrame(left, text="Sequence (numbered instead of timestamped)")
@@ -1348,7 +1531,7 @@ class App:
         ttk.Label(row3, text="ADC codes over the runs (then Average sequence)",
                   foreground="#666").pack(side="left")
         self.seq_dither_plan = {}      # {ch: (offset0, span V)} while running
-        for var in (self.prefix, self.seq_start, self.seq_count):
+        for var in (self.prefix, self.seq_start, self.seq_count, self.data_fmt):
             var.trace_add("write", lambda *_: self.show_next_name())
         self.show_next_name()
 
@@ -1470,9 +1653,11 @@ class App:
             "seq_dither_codes": self.seq_dither_codes.get(),
             "auto_interval": self.interval.get(),
             "save_png": self.save_png.get(),
+            "data_format": self.data_fmt.get(),
             "plot_runs": self.plot_runs.get(),
             "plot_compare": self.plot_cmp.get(),
             "plot_show": {str(ch): var.get() for ch, var in self.plot_show.items()},
+            "plot_thin": self.plot_thin.get(),
             "spec_window": self.spec_window.get(),
             "spec_units": self.spec_units.get(),
             "record_measurements": self.rec_meas.get(),
@@ -1506,6 +1691,7 @@ class App:
         # is a real value (the newest capture), so blanks are restored too.
         for key, var in (("plot_runs", self.plot_runs),
                          ("plot_compare", self.plot_cmp),
+                         ("plot_thin", self.plot_thin),
                          ("spec_window", self.spec_window),
                          ("spec_units", self.spec_units)):
             value = cfg.get(key)
@@ -1564,6 +1750,9 @@ class App:
         save_png = cfg.get("save_png")
         if isinstance(save_png, (bool, int)):
             self.save_png.set(bool(save_png))
+        data_format = cfg.get("data_format")
+        if isinstance(data_format, str) and data_format.upper() in DATA_FORMATS:
+            self.data_fmt.set(data_format.upper())
         dither = cfg.get("seq_dither")
         if isinstance(dither, (bool, int)):
             self.seq_dither.set(bool(dither))
@@ -1686,6 +1875,7 @@ class App:
                 "seq_start": self.seq_start.get(),
                 "auto_interval": self.interval.get(),
                 "save_png": self.save_png.get(),
+                "data_format": self.data_fmt.get(),
             },
         }
         outdir = self.setup_dir.get().strip() or SETUP_DIR
@@ -2175,9 +2365,10 @@ class App:
             # run by first_free(), but the folder and the prefix can both be
             # changed while one is going, so both paths come through here.
             wanted, base = base, free_base(base)
+            ext = "." + self.data_fmt.get().lower()
             if base != wanted:
-                self.log(f"  {os.path.basename(wanted)}.csv is already there - "
-                         f"writing {os.path.basename(base)}.csv instead")
+                self.log(f"  {os.path.basename(wanted)} is already there - "
+                         f"writing {os.path.basename(base)}{ext} instead")
 
             existing = self.use_existing.get()
             # A channel the scope is not displaying has no record to hand over:
@@ -2269,12 +2460,13 @@ class App:
             # comes in at, are both per-instrument - see transfer_plan on the
             # profile for why this scope answers the way it does.
             mode, points = self.scope.transfer_plan(bool(avg_want), points)
-            cols = {}
+            # Kept as the scope sent them; the CSV turns them into volts at
+            # write time, the NPZ stores them as they are. The time base is the
+            # first channel's either way, as it always was.
+            recs = {}
             for ch in chans:
-                t, v = self.scope.waveform(ch, points_mode=mode, points=points)
-                if "time_s" not in cols:
-                    cols["time_s"] = t
-                cols[self.column_name(ch)] = v
+                recs[self.column_name(ch)] = self.scope.record(
+                    ch, points_mode=mode, points=points)
 
             # One settings read per grab: the panel and the metadata file are
             # built from the same snapshot.
@@ -2305,13 +2497,17 @@ class App:
 
             self.set_phase("writing files")
             write_at = time.time()
-            data = np.column_stack([cols[k] for k in cols])
-            csv_path = base + ".csv"
-            np.savetxt(csv_path, data, delimiter=",",
-                       header=",".join(cols.keys()), comments="",
-                       fmt=[TIME_FMT] + [VOLT_FMT] * (data.shape[1] - 1))
-            self.log(f"{os.path.basename(csv_path)}  "
-                     f"({data.shape[0]} pts x {data.shape[1]} cols)")
+            columns = ["time_s"] + list(recs)
+            first = next(iter(recs.values()))
+            if ext == ".npz":
+                data_path = write_npz(base + ext, columns, first.x,
+                                      list(recs.values()))
+            else:
+                data_path = write_csv(base + ext, columns, np.column_stack(
+                    [first.t()] + [r.v() for r in recs.values()]))
+            self.log(f"{os.path.basename(data_path)}  "
+                     f"({len(first)} pts x {len(columns)} cols, "
+                     f"{os.path.getsize(data_path) / 1e6:.1f} MB)")
 
             # utf-8 explicitly: the file records channel names exactly as typed,
             # and the machine default here is cp1252, which cannot encode half
@@ -2444,7 +2640,7 @@ class App:
         sel[-1].pack(side="left", padx=(10, 0))
 
         row2 = ttk.Frame(bar)
-        row2.pack(fill="x", padx=6, pady=(0, 4))
+        row2.pack(fill="x", padx=6, pady=(0, 2))
         show = self.plot_show_widgets = [ttk.Label(row2, text="Show:")]
         show[-1].pack(side="left")
         self.plot_show = {}
@@ -2454,11 +2650,30 @@ class App:
             show.append(ttk.Checkbutton(row2, text=f"CH{ch}", variable=var,
                                         command=self.refresh_plots))
             show[-1].pack(side="left", padx=(4, 0))
-        self.plot_status_colour = "#666"      # put back when the bar is live
-        self.plot_status = ttk.Label(row2, text=PLOT_HINT, foreground="#666")
-        self.plot_status.pack(side="left", padx=(14, 0))
+        # How many of a trace's samples are drawn, for the tabs that draw them
+        # against time or each other. What is computed - spectra, the ledgers -
+        # always takes every sample, so the box is grey there.
+        thin = self.plot_thin_widgets = [ttk.Label(row2, text="Draw 1 in")]
+        thin[-1].pack(side="left", padx=(18, 0))
+        self.plot_thin = tk.StringVar()
+        e = ttk.Entry(row2, textvariable=self.plot_thin, width=5)
+        e.pack(side="left", padx=(4, 4))
+        e.bind("<Return>", lambda _e: self.do_plot_redraw())
+        thin.append(e)
+        thin.append(ttk.Label(row2, text="samples"))
+        thin[-1].pack(side="left")
+        self.plot_thin_hint = ttk.Label(row2, foreground="#666",
+                                        text="(blank = auto, 1 = all)")
+        self.plot_thin_hint.pack(side="left", padx=(6, 0))
 
-        _ctl, self.fig_wave = self._fig_tab("Waveforms", self._plot_waveforms)
+        row3 = ttk.Frame(bar)
+        row3.pack(fill="x", padx=6, pady=(0, 4))
+        self.plot_status_colour = "#666"      # put back when the bar is live
+        self.plot_status = ttk.Label(row3, text=PLOT_HINT, foreground="#666")
+        self.plot_status.pack(side="left")
+
+        ctl, self.fig_wave = self._fig_tab("Waveforms", self._plot_waveforms)
+        self.plot_thin_tabs = {ctl.master}    # the tabs that draw samples
 
         ctl, self.fig_spec = self._fig_tab("Spectrum", self._plot_spectrum)
         ttk.Label(ctl, text="Window:").pack(side="left")
@@ -2478,6 +2693,7 @@ class App:
                        "V/sqrt(Hz) a noise floor").pack(side="left", padx=(12, 0))
 
         ctl, self.fig_diff = self._fig_tab("Difference", self._plot_difference)
+        self.plot_thin_tabs.add(ctl.master)
         ttk.Label(ctl, text="Reference:").pack(side="left")
         self.diff_ref = tk.StringVar()
         self.diff_ref_box = ttk.Combobox(ctl, textvariable=self.diff_ref,
@@ -2491,6 +2707,7 @@ class App:
 
         ctl, self.fig_xy = self._fig_tab("XY", self._plot_xy)
         self.plot_no_show = {ctl.master}      # its channels are the two below
+        self.plot_thin_tabs.add(ctl.master)
         self.xy_x,self.xy_y = tk.StringVar(value="CH1"), tk.StringVar(value="CH2")
         for text, var in (("X:", self.xy_x), ("Y:", self.xy_y)):
             ttk.Label(ctl, text=text).pack(side="left",
@@ -2608,15 +2825,21 @@ class App:
 
     def _sync_plot_bar(self):
         """Grey out what the tab on show does not read: all of the bar on
-        Screenshot, and the Show ticks on XY, which picks its two channels
-        itself. Clear is live only with something to clear."""
+        Screenshot; the Show ticks on XY, which picks its two channels itself;
+        and 'Draw 1 in' wherever samples are computed from rather than drawn.
+        Clear is live only with something to clear."""
         tab = self._current_tab()
         live = tab in self.plot_tabs
         shows = live and tab not in self.plot_no_show
+        thins = tab in self.plot_thin_tabs
         for w in self.plot_sel_widgets:
             w.configure(state="normal" if live else "disabled")
         for w in self.plot_show_widgets:
             w.configure(state="normal" if shows else "disabled")
+        for w in self.plot_thin_widgets:
+            w.configure(state="normal" if thins else "disabled")
+        self.plot_thin_hint.configure(state="normal" if thins else "disabled",
+                                      foreground="#666" if thins else "")
         self.cmp_clear_btn.configure(
             state="normal" if live and (self.plot_cmp.get().strip()
                                         or self.cmp_paths) else "disabled")
@@ -2641,6 +2864,7 @@ class App:
         """Redraw, and let a warning that was said once be said again: the
         boxes may have been edited to answer it."""
         self.plot_notes_seen.clear()
+        self.plot_thin_warned = ""
         self.refresh_plots()
 
     def _draw_tab(self, tab):
@@ -2670,7 +2894,7 @@ class App:
         notes, groups = [], []
         files = capture_files(outdir, prefix)
         if not files:
-            notes.append(f"{prefix}: no {prefix}_*.csv in {outdir}")
+            notes.append(f"{prefix}: no {prefix}_* capture in {outdir}")
         sub = []
         caps = self._load_runs(select_runs(files, self.plot_runs.get(), sub),
                                prefix, notes)
@@ -2688,7 +2912,7 @@ class App:
                 folder, pre = (entry[1], entry[2]) if entry else (outdir, key)
                 cfiles = capture_files(folder, pre)
                 if not cfiles:
-                    notes.append(f"{key}: no {pre}_*.csv in {folder}")
+                    notes.append(f"{key}: no {pre}_* capture in {folder}")
                     continue
                 sub = []
                 caps = self._load_runs(select_runs(cfiles, spec, sub), key, notes)
@@ -2775,7 +2999,7 @@ class App:
         paths = filedialog.askopenfilenames(
             title="Pick captures to compare",
             initialdir=self.outdir.get() if os.path.isdir(self.outdir.get()) else ".",
-            filetypes=[("Capture CSV", "*.csv"), ("All files", "*.*")],
+            filetypes=[("Captures", "*.npz *.csv"), ("All files", "*.*")],
             parent=self.root)
         if not paths:
             return
@@ -2830,7 +3054,7 @@ class App:
         taken = set(self.cmp_paths) | {self.safe_prefix()}
         try:
             taken |= {split_capture_name(n)[0] for n in os.listdir(outdir)
-                      if n.lower().endswith(".csv")}
+                      if n.lower().endswith(CAPTURE_EXTS)}
         except OSError:
             pass
         if want not in taken:
@@ -2932,6 +3156,47 @@ class App:
                     color="#999999", ha="left",
                     va="top" if loc == "nw" else "bottom")
 
+    def _thin_step(self, n):
+        """The 'Draw 1 in' box for a trace of `n` samples: blank = auto, the
+        step that keeps it to PLOT_AUTO_PTS drawn; a number = that step
+        whatever the length; 1 = every sample."""
+        txt = self.plot_thin.get().strip()
+        if txt:
+            try:
+                step = int(float(txt))
+                if step >= 1:
+                    return step
+            except (ValueError, OverflowError):
+                pass
+            if txt != self.plot_thin_warned:
+                self.plot_thin_warned = txt
+                self.log(f"plot: 'Draw 1 in {txt}' is not a whole number of 1 "
+                         "or more - drawing as if the box were blank")
+        return max(1, -(-n // PLOT_AUTO_PTS))
+
+    def _thinned(self, x, y, steps, envelope=True):
+        """x and y as the 'Draw 1 in' box has them drawn, the step used added
+        to `steps` for the figure's note. Against time a trace keeps its
+        lowest and highest sample of each run (thin_index); one channel
+        against another has no envelope to keep and takes every step-th."""
+        step = self._thin_step(len(y))
+        if step <= 1:
+            return x, y
+        steps.add(step)
+        i = thin_index(y, step) if envelope else slice(None, None, step)
+        return x[i], y[i]
+
+    def _thin_note(self, steps, envelope=True):
+        """What the figure says about it, so a saved PNG carries the fact."""
+        if not steps:
+            return ""
+        lo, hi = min(steps), max(steps)
+        text = f"1 in {lo if lo == hi else f'{lo} to {hi}'} samples drawn"
+        if envelope:
+            text += (f": the lowest and highest of each {2 * lo}" if lo == hi
+                     else ": the lowest and highest of each run")
+        return text
+
     def _plot_waveforms(self, groups):
         fig = self.fig_wave
         if fig is None:
@@ -2944,16 +3209,20 @@ class App:
         span = max((cap.t[-1] - cap.t[0] for cap, *_ in traces if len(cap.t) > 1),
                    default=1.0)
         scale, unit = time_unit(span)
+        thinned = set()
         for ax, ch in zip(axes, chans):
             n = 0
             for cap, col, lw, z in traces:
                 if ch in cap.chan:
-                    ax.plot(cap.t * scale, cap.v(ch), color=col, lw=lw,
+                    x, y = self._thinned(cap.t, cap.v(ch), thinned)
+                    ax.plot(x * scale, y, color=col, lw=lw,
                             zorder=z, label=cap.label)
                     n += 1
             ax.set_ylabel(self._ch_label(ch, traces))
             ax.grid(True, alpha=0.3)
             self._legend(ax, n)
+        if thinned:
+            self._plot_note(axes[0], self._thin_note(thinned))
         axes[-1].set_xlabel(f"time ({unit})")
         fig.suptitle(self._plot_title(groups), fontsize=8)
         self._finish(fig)
@@ -3015,7 +3284,7 @@ class App:
         if not axes:
             return self._finish(fig)
         scale, unit = time_unit(ref.t[-1] - ref.t[0] if len(ref.t) > 1 else 1.0)
-        regridded = []
+        regridded, thinned = [], set()
         for ax, ch in zip(axes, chans):
             n = 0
             for cap, col, lw, z in traces:
@@ -3027,17 +3296,24 @@ class App:
                     other = np.interp(ref.t, cap.t, other)
                     if cap.label not in regridded:
                         regridded.append(cap.label)
-                ax.plot(ref.t * scale, other - ref.v(ch), color=col, lw=lw,
+                # subtracted sample for sample, and only then thinned
+                x, y = self._thinned(ref.t, other - ref.v(ch), thinned)
+                ax.plot(x * scale, y, color=col, lw=lw,
                         zorder=z, label=f"{cap.label} - {ref.label}")
                 n += 1
             ax.axhline(0, color="#999999", lw=0.6)
             ax.set_ylabel(f"CH{ch} difference (V)")
             ax.grid(True, alpha=0.3)
             self._legend(ax, n)
+        notes = []
         if regridded:
-            self._plot_note(axes[0], "interpolated onto the reference's time base: "
-                            + ", ".join(regridded[:4])
-                            + (" ..." if len(regridded) > 4 else ""))
+            notes.append("interpolated onto the reference's time base: "
+                         + ", ".join(regridded[:4])
+                         + (" ..." if len(regridded) > 4 else ""))
+        if thinned:
+            notes.append(self._thin_note(thinned))
+        if notes:
+            self._plot_note(axes[0], "\n".join(notes))
         axes[-1].set_xlabel(f"time ({unit})")
         fig.suptitle(elide(f"{self._plot_title(groups)}   -   minus {ref.label}", 130),
                      fontsize=8)
@@ -3057,9 +3333,13 @@ class App:
         if not axes:
             return self._finish(fig)
         ax = axes[0]
+        thinned = set()
         for cap, col, lw, z in usable:
-            ax.plot(cap.v(x), cap.v(y), color=col, lw=0.8 * lw, zorder=z,
+            vx, vy = self._thinned(cap.v(x), cap.v(y), thinned, envelope=False)
+            ax.plot(vx, vy, color=col, lw=0.8 * lw, zorder=z,
                     alpha=0.9, label=cap.label)
+        if thinned:
+            self._plot_note(ax, self._thin_note(thinned, envelope=False))
         ax.set_xlabel(self._ch_label(x, usable))
         ax.set_ylabel(self._ch_label(y, usable))
         ax.grid(True, alpha=0.3)
@@ -3494,7 +3774,8 @@ class App:
             return
         width = max(3, len(str(start + count - 1)))
         first = self.first_free(start, width, count)
-        name = f"{self.safe_prefix()}_{first:0{width}d}.csv"
+        name = (f"{self.safe_prefix()}_{first:0{width}d}"
+                f".{self.data_fmt.get().lower()}")
         # The First label box stays where it was put, so when a previous run has
         # already taken those labels the preview is the only thing that says the
         # sequence will start further along.
@@ -3503,7 +3784,7 @@ class App:
                           f"{start:0{width}d} would land on files already there)")
 
     def do_average(self):
-        """Average the current prefix's numbered runs into one CSV -- a
+        """Average the current prefix's numbered runs into one file -- a
         small dialog picks the label range, prefilled with what is on disk."""
         outdir, prefix = self.outdir.get(), self.safe_prefix()
         files = sequence_files(outdir, prefix)
@@ -3511,7 +3792,7 @@ class App:
             return messagebox.showerror(
                 "Average sequence",
                 f"{prefix} has {len(files)} numbered run(s) in\n{outdir}\n\n"
-                f"An average needs at least two ({prefix}_NNN.csv).")
+                f"An average needs at least two ({prefix}_NNN.csv/.npz).")
         labels = list(files)
         dlg = tk.Toplevel(self.root)
         dlg.title("Average sequence")
@@ -3533,7 +3814,8 @@ class App:
         ttk.Entry(fr, textvariable=v_last, width=8).grid(row=1, column=3,
                                                          sticky="w", pady=(8, 0))
         ttk.Label(fr, foreground="#666", justify="left", text=(
-            "Writes <prefix>_avg_<from>-<to>.csv beside the runs, plus a .txt\n"
+            f"Writes <prefix>_avg_<from>-<to>.{self.data_fmt.get().lower()} "
+            "beside the runs, plus a .txt\n"
             "made from the first run's, headed by what was averaged. Runs must\n"
             "share columns, point count and time base; a gap is skipped.")).grid(
             row=2, column=0, columnspan=4, sticky="w", pady=(8, 0))
@@ -3548,7 +3830,8 @@ class App:
             dlg.destroy()
             try:
                 path, used = average_sequence(outdir, prefix, first, last,
-                                              log=self.log)
+                                              log=self.log,
+                                              fmt=self.data_fmt.get())
             except (ValueError, OSError) as e:
                 self.log(f"Average sequence: {e}")
                 return messagebox.showerror("Average sequence", str(e))
@@ -3647,7 +3930,7 @@ class App:
         self.run_sequence_step()
 
     def first_free(self, start, width, count=1):
-        """First label from which `count` consecutive CSVs are all free, so a
+        """First label from which `count` consecutive captures are all free, so a
         repeated sequence adds to the series instead of overwriting it. This,
         rather than winding the First label box on, is what stacks one sequence
         on the next.
@@ -3657,8 +3940,8 @@ class App:
         bad run deleted - then started in the hole and wrote straight over
         everything after it."""
         outdir, prefix = self.outdir.get(), self.safe_prefix()
-        taken = lambda i: os.path.exists(
-            os.path.join(outdir, f"{prefix}_{i:0{width}d}.csv"))
+        taken = lambda i: capture_exists(
+            os.path.join(outdir, f"{prefix}_{i:0{width}d}"))
         i = start
         while True:
             clash = next((j for j in range(i, i + max(1, count)) if taken(j)), None)

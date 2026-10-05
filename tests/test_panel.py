@@ -1,10 +1,10 @@
 """Build the real window with no scope attached and exercise the paths that
 run through the profile.
 
-mainloop() is never entered, so the after() that fires do_connect never runs and
-nothing here opens a VISA session. The connect tests use a fake resource manager
-instead, which is the only way to check the matching logic without owning one of
-every scope.
+App.do_connect is replaced before any App is built, so nothing here opens a
+VISA session - see the note where that is done. The connect tests use a fake
+resource manager instead, which is the only way to check the matching logic
+without owning one of every scope.
 
 Needs a desktop session for Tk, but no instrument.
 
@@ -15,6 +15,7 @@ import inspect
 import os
 import sys
 import tempfile
+import time
 import tkinter as tk
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -40,6 +41,19 @@ spec.loader.exec_module(scope_grab)
 _SANDBOX = os.path.join(tempfile.mkdtemp(prefix="scopegrab-test-"),
                         "config.json")
 scope_grab.CONFIG_PATH = _SANDBOX
+
+# And keep it off the bench, also BEFORE any App exists.
+#
+# App schedules do_connect 300 ms after it is built. While this test never
+# called update() that timer never fired, and "mainloop is never entered" was
+# all the protection there was. The tab checks do call update(), the timer
+# fires, and the real do_connect opens whatever scope is plugged in, asks its
+# *IDN? and reads every setting - from a second process, in the middle of
+# whatever the panel on the bench is doing with it. Replaced here rather than
+# left to each check to remember, and panel_checks ends by confirming that
+# the timer did fire and that nothing was opened.
+_CONNECTS = []
+scope_grab.App.do_connect = lambda self: _CONNECTS.append(self)
 
 FAILS = []
 
@@ -178,8 +192,115 @@ def panel_checks(prof):
         turn_to("Screenshot")
         check("and grey again on Screenshot",
               str(app.cmp_clear_btn.cget("state")) == "disabled")
+        app.plot_cmp.set("")
+
+        print("\n'Draw 1 in' is live only where samples are drawn")
+        for name in [app.nb.tab(t, "text") for t in app.nb.tabs()]:
+            turn_to(name)
+            want = ("normal" if name in ("Waveforms", "Difference", "XY")
+                    else "disabled")
+            got = {str(w.cget("state")) for w in app.plot_thin_widgets}
+            check(f"{name}: {want}", got == {want}, str(got))
+
+        print("\nand it thins what is drawn, not what is there")
+        thin_checks(app, root, turn_to)
+
+        print("\nnone of which reached an instrument")
+        deadline = time.time() + 2.0      # the timer is 300 ms; be sure of it
+        while not _CONNECTS and time.time() < deadline:
+            root.update()
+            time.sleep(0.02)
+        check("the connect timer fired into the stand-in", _CONNECTS == [app],
+              f"{len(_CONNECTS)} call(s)")
+        check("no VISA session was opened",
+              app.scope.rm is None and app.scope.inst is None)
     finally:
         root.destroy()
+
+
+def thin_checks(app, root, turn_to):
+    """The plot bar's 'Draw 1 in' box, on a record with a spike one sample
+    wide and a ripple faster than any thinned grid - the two things that
+    drawing every n-th sample would lose or turn into something else."""
+    np = scope_grab.np
+    n = 62500
+    t = np.arange(n) * 1e-7
+    v = np.sin(2 * np.pi * 400 * t) + 0.2 * np.sin(2 * np.pi * 1.9e6 * t)
+    v[31337] = 5.0
+    i = scope_grab.thin_index(v, 13)
+    check("1 in 13 draws about a thirteenth",
+          n / 13 - 2 <= len(i) <= n / 13 + 6, f"{len(i)} of {n}")
+    check("in time order, no sample twice",
+          bool(np.all(np.diff(i) > 0)))
+    check("both ends kept", i[0] == 0 and i[-1] == n - 1)
+    check("the one-sample spike survives", 31337 in i)
+    lo = np.minimum.reduceat(v, np.arange(0, n, 26))
+    hi = np.maximum.reduceat(v, np.arange(0, n, 26))
+    kept = set(v[i])
+    check("every run of 26 keeps its lowest and its highest",
+          all(x in kept for x in lo) and all(x in kept for x in hi))
+    check("1 in 1 is every sample",
+          len(scope_grab.thin_index(v, 1)) == n)
+    check("a step longer than the record still spans it",
+          list(scope_grab.thin_index(v[:10], 500)) ==
+          sorted({0, 9, int(v[:10].argmin()), int(v[:10].argmax())}))
+
+    for text, want in (("", 7), ("1", 1), ("13", 13), ("4.0", 4),
+                       ("0", 7), ("-3", 7), ("lots", 7)):
+        app.plot_thin.set(text)
+        check(f"box '{text}' on {n} points is a step of {want}",
+              app._thin_step(n) == want, str(app._thin_step(n)))
+    app.plot_thin.set("")
+    check("auto leaves a short record alone", app._thin_step(5000) == 1)
+
+    if scope_grab.Figure is None:
+        print("  (matplotlib is not installed: the drawing itself not checked)")
+        return
+    folder = tempfile.mkdtemp(prefix="scopegrab-thin-")
+    np.savetxt(os.path.join(folder, "thin_001.csv"),
+               np.column_stack([t, v, 2 * v]), delimiter=",", comments="",
+               header="time_s,CH1_V,CH2_V", fmt="%.9g")
+    app.outdir.set(folder)
+    app.prefix.set("thin")
+
+    def drawn(fig, pane=0):
+        ax = fig.axes[pane]
+        line = ax.lines[0]
+        notes = " ".join(a.get_text() for a in ax.texts)
+        return len(line.get_xdata()), line.get_ydata(), notes
+
+    for box, tab, fig, points in (("", "Waveforms", app.fig_wave, n // 7),
+                                  ("13", "Waveforms", app.fig_wave, n // 13),
+                                  ("13", "XY", app.fig_xy, n // 13)):
+        app.plot_thin.set(box)
+        app.refresh_plots()
+        turn_to(tab)
+        count, y, notes = drawn(fig)
+        step = box or "7"
+        check(f"{tab}, box '{box}': about {points} points drawn",
+              abs(count - points) <= 8, str(count))
+        check(f"{tab}, box '{box}': the figure says so",
+              f"1 in {step} samples drawn" in notes, notes)
+    app.plot_thin.set("13")
+    app.refresh_plots()
+    turn_to("Waveforms")
+    check("the spike is in what Waveforms drew",
+          float(drawn(app.fig_wave)[1].max()) == 5.0)
+    app.plot_thin.set("1")
+    app.refresh_plots()
+    turn_to("Waveforms")
+    count, _y, notes = drawn(app.fig_wave)
+    check("box '1': every sample, and no note", count == n and not notes,
+          f"{count} {notes!r}")
+    app.plot_thin.set("50")
+    app.refresh_plots()
+    turn_to("Statistics")
+    rows = [app.stats_tv.item(r, "values") for r in app.stats_tv.get_children()]
+    check("Statistics still counts every sample",
+          bool(rows) and all(str(r[4]) == str(n) for r in rows), str(rows[:1]))
+    turn_to("Spectrum")
+    check("Spectrum still draws every bin",
+          len(app.fig_spec.axes[0].lines[0].get_xdata()) == n // 2)
 
 
 def profile_checks(prof):

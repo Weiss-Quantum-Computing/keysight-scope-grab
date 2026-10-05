@@ -11,7 +11,7 @@ Press GRAB (or the space bar) and you get, in your chosen folder:
 
 | File | Contents |
 |------|----------|
-| `<prefix>_<timestamp>.csv` | Waveform samples: `time_s` plus one column per selected channel, headed `CH<n>_V`, or `CH<n>_<name>_V` for a channel you have named |
+| `<prefix>_<timestamp>.npz` or `.csv` | Waveform samples: `time_s` plus one column per selected channel, headed `CH<n>_V`, or `CH<n>_<name>_V` for a channel you have named. NPZ (the default) is the scope's own codes, about 20x smaller; CSV is text - see [Data format](#data-format-npz-or-csv) |
 | `<prefix>_<timestamp>.png` | Screenshot of the scope display |
 | `<prefix>_<timestamp>.txt` | Acquisition metadata: sample rate, timebase, acquisition and trigger settings, and per-channel settings |
 
@@ -50,7 +50,7 @@ profile would have handled, the error says which - having the wrong model
 selected otherwise looks exactly like an unplugged cable.
 
 - **Channels** - tick the channels to capture and optionally name each one. Each
-  ticked channel becomes a column in the CSV.
+  ticked channel becomes a column in the data file.
 - **Save to** - output folder. Defaults to `~/Desktop/scope_data`.
 - **Filename prefix** - prepended to every file. Surrounding whitespace is trimmed and
   characters illegal in filenames are replaced with `_`.
@@ -72,6 +72,51 @@ selected otherwise looks exactly like an unplugged cable.
 - **Sequence** - a fixed number of runs with incrementing labels, see below.
 - **save screenshot?** - whether each grab also writes the PNG. The preview only
   updates when this is on, since it displays the file that was written.
+- **Data:** - NPZ or CSV, what the samples are saved as. See below.
+
+## Data format: NPZ or CSV
+
+The **Data** box beside *save screenshot?* picks how each capture's samples are
+written. The `.txt` sidecar and the PNG are the same either way.
+
+- **NPZ** (default) stores what the scope sent: each channel's integer codes and
+  the preamble numbers that turn them into volts, in a compressed numpy archive.
+  A 500k-point four-channel HRES record is about **1.5 MB** against **35.6 MB** as
+  CSV (MEASURED on a capture converted from the CSV - a fresh grab stores the
+  MSO-X's WORD codes directly and has not been sized on the bench yet). Nothing is
+  rounded: the volts rebuild bit for bit as the panel computed them at grab time,
+  which is also exactly what EOM-ILC's bench loop gets from `scope.waveform()`.
+- **CSV** is decimal text, rounded to seven digits. Use it when a file has to open
+  in Excel or be replayed on one of the AWG panels, which read CSV only.
+
+Everything that reads captures reads both: the plot tabs, Compare and **Add
+files...**, **Average sequence...** (an average is written in the format the box
+is set to, and can mix runs of both), and EOM-ILC's Captures glob and
+native-rate spectrum (`eomilc/scope.py`'s `load()`; make the glob end in `*.npz`).
+A folder can hold both; numbering counts either as taken, so switching the box
+mid-series cannot overwrite a run, and a run present in both formats is read
+from its NPZ.
+
+From any other Python:
+
+```python
+import scope_grab                      # or importlib by path
+cols, data = scope_grab.load_capture("run_001.npz")   # data[:, 0] is time_s
+```
+
+or with numpy alone - the layout is plain arrays, documented under *capture
+files* near the top of `scope_grab.py`, and the reader is fifteen lines.
+
+**Converting old captures.** `tools/csv_to_npz.py FOLDER --write --delete`
+converts a folder of CSVs in place. A CSV no longer holds the codes, but every
+value in a channel sits on the scope's code lattice to within the CSV's
+rounding, so the tool recovers the lattice from the values, stores codes, reads
+the NPZ back and compares every value with the CSV's - it has to agree to half
+a unit in the last printed digit - and only then removes the CSV. A channel
+that is not on a lattice (an averaged file) is stored as float64 instead. Run
+without `--write` for a dry run; files modified in the last 30 minutes are
+skipped, and `--exclude NAME` skips a subfolder the bench is writing into. Each
+run leaves a `csv_to_npz_<stamp>.log` in the folder listing every file.
 
 ## Channel names
 
@@ -126,7 +171,8 @@ PNG. The tables save as CSV.
 
 The bar above the tabs decides. It is there on every tab, so nothing moves when
 turning between them, and whatever the tab on show does not read is greyed out:
-all of it on Screenshot, the Show ticks on XY.
+all of it on Screenshot, the Show ticks on XY, Draw 1 in on the tabs that
+compute from the samples rather than draw them.
 
 **Runs** picks captures of the current prefix from the output folder. Blank is the newest file; otherwise `1-10`, `3 7 9`, `last3`,
 `avg` (the file Average sequence... wrote), `all`, or a run exactly as it appears
@@ -149,6 +195,22 @@ empties the box and the picks.
 way the screenshot pane does: with Runs blank, each grab redraws the newest. Only
 the tab on show is drawn; the others draw when you turn to them, so a fast sequence
 pays for one figure per run, not five.
+
+**Draw 1 in** sets how many of a trace's samples are drawn, so long records do
+not slow the window down. Blank is auto: a trace longer than 10000 points is
+thinned to about that many, and a shorter one is left alone. A number is that
+step whatever the length, and `1` draws every sample. Against time - Waveforms
+and Difference - what is kept is the lowest and the highest sample of each run,
+so every point drawn is a real one, a one-sample spike still shows, and a fast
+ripple stays a band instead of turning into a slow beat; at full view the
+figure looks the same as the whole record. XY takes every n-th sample. A
+thinned figure says so in its corner, and a saved PNG carries that. Zoomed far
+in, a thinned trace runs out of points: put `1` in the box and redraw. Nothing
+that is computed is thinned - spectra, differences before they are drawn,
+Statistics and Measurements all use every sample - so the box is greyed out on
+the tabs that only compute. Measured on ramps with noise: ten 62500-point runs
+on four channels redraw in 1.4 s instead of 4.8, three 1 Mpt runs in 0.7 s
+instead of 5.4.
 
 A compare capture on a different grid - another point count or sample rate - is
 drawn on its own axes and noted in the log: its spectrum then has its own bin
@@ -328,8 +390,8 @@ prefix's numbered runs from the output folder and writes
 <prefix>_avg_<first>-<last>.txt
 ```
 
-beside them: the CSV is the per-channel mean on the first run's time base, in
-the same columns and format as a run, and the `.txt` is the first run's,
+beside them (`.npz` when the Data box says NPZ): the per-channel mean on the
+first run's time base, in the same columns as a run, and the `.txt` is the first run's,
 headed by what was averaged (`averaged from : 64 runs, labels 001-064`). A
 small dialog picks the label range, prefilled with the whole series. Runs have
 to share columns, point count and time base - a sequence taken through one
@@ -358,15 +420,16 @@ good default: it takes the code-to-code variation as well, and 64 runs is
 still 21 phases per code.
 
 Nothing about the runs themselves changes - the scope's preamble carries the
-offset, so every CSV is in true volts - only their mean gains. The offsets are
+offset, so every run is in true volts - only their mean gains. The offsets are
 put back when the sequence ends, whether it finishes or is stopped. The code
 size is `ADC_CODE_PER_VDIV` at the top of `scope_grab.py`, measured for the
 MSO-X 2014A; another scope has another.
 
 ### How short can the interval be?
 
-The limit is usually writing the CSV rather than the USB transfer. Measured with
-`numpy.savetxt` on this machine:
+With CSV the limit is usually writing the file rather than the USB transfer
+(an NPZ writes in well under a second). Measured with `numpy.savetxt` on this
+machine:
 
 | Points | Columns | CSV write | File size |
 |-------:|--------:|----------:|----------:|
@@ -384,7 +447,7 @@ in a long record.
 So a 1 s interval is only realistic for short records. Ask for it anyway if you
 like - the sequence will simply run as fast as it can and tell you it could not
 keep up. Note also the disk cost: 100 runs of a 4-channel 500k-point capture is
-about 6 GB.
+about 3.5 GB as CSV, about 150 MB as NPZ.
 
 ## Scope settings
 
@@ -643,8 +706,8 @@ again.
 The scope model, the output folder, the setups folder and setup prefix, filename
 prefix, channel names, which
 channels are ticked, the trigger wait, the transfer point count, the three
-sequence boxes - runs, interval and first label - the auto-grab interval and
-whether screenshots are saved are written to
+sequence boxes - runs, interval and first label - the auto-grab interval,
+whether screenshots are saved and the Data format are written to
 
 ```
 %APPDATA%\ScopeGrab\config.json
@@ -712,7 +775,7 @@ A profile supplies:
 | **Settings tables** | timebase, trigger and per-channel rows - the panel is laid out from these, and so are the setup `.txt` and the metadata file |
 | **Named roots** | acquisition type, average count, per-channel display flag, hit count; the few things the capture path has to ask for by name rather than find in a table |
 | **Metadata layout** | which rows the `.txt` carries, in file order |
-| **Behaviour** | `running`, `accumulate`, `read_waveform`, `screenshot`, `transfer_plan` - the operations two scopes *do* differently rather than merely spell differently |
+| **Behaviour** | `running`, `accumulate`, `read_record` (the codes and preamble, as a `Record`; `read_waveform` is derived from it), `screenshot`, `transfer_plan` - the operations two scopes *do* differently rather than merely spell differently |
 
 The base class deliberately holds almost no defaults. With one profile written,
 anything put there would be a guess about what a second scope shares; what turns
