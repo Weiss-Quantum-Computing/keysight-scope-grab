@@ -188,6 +188,18 @@ def refused_checks():
         sg.USB_PROBE = lambda res: {}
         msg = s._nothing_found([], [(scope, ncic)])
         check("no answer from Windows falls back to the old message", "already has it open" in msg)
+        sg.USB_PROBE = lambda res: {scope: ("absent", "", ""), rigol: ("absent", "", "")}
+        msg = s._nothing_found([], [(scope, ncic), (rigol, ncic)])
+        check("nothing plugged in is said as such, not as another program",
+              "does not see it plugged in" in msg and "Power-cycle" in msg and "already has it open" not in msg)
+        note = "Unknown USB Device (Device Descriptor Request Failed) (Code 43) now sits on the port it was last on, Port_#0002.Hub_#0005"
+        sg.USB_PROBE = lambda res: {scope: ("absent", "43", note), rigol: ("absent", "", "")}
+        msg = s._nothing_found([], [(scope, ncic), (rigol, ncic)])
+        check("...naming the failed device on the scope's port when there is one", note in msg and "Code 43" in msg)
+        sg.USB_PROBE = lambda res: {scope: ("absent", "", ""), rigol: ("ok", "", "x")}
+        msg = s._nothing_found([], [(scope, ncic), (rigol, ncic)])
+        check("one absent, one present and refusing: the present one is 'held', the absent one not listed",
+              "already has it open" in msg and rigol in msg and scope not in msg)
         sg.USB_PROBE = lambda res: (_ for _ in ()).throw(AssertionError("asked"))
         s._nothing_found(["KEYSIGHT,OTHER"], [])
         check("Windows is not asked when nothing was refused", True)

@@ -411,7 +411,59 @@ def usb_device_states(resources, timeout=15):
         prev = found.get(key)
         if prev is None or (prev[0] == "error" and ok):
             found[key] = ("ok" if ok else "error", code.strip(), name.strip())
-    return {r: found.get(v, ("absent", "", "")) for r, v in ids.items()}
+    states = {r: found.get(v, ("absent", "", "")) for r, v in ids.items()}
+    missing = {v for r, v in ids.items() if states[r][0] == "absent"}
+    if missing:
+        # A device Windows does not see at all: find the port it was last on
+        # (its leftover, non-present entries remember it) and whether that port
+        # now holds a device that could not even say what it is -- "Unknown
+        # USB Device (Device Descriptor Request Failed)", Code 43. Measured 13
+        # Oct 2026: that is what the MSO-X looks like when its USB interface
+        # has hung; nothing short of a power cycle brings it back.
+        for key, where in usb_port_failures(missing, timeout).items():
+            for r, v in ids.items():
+                if v == key:
+                    states[r] = ("absent", where[0], where[1])
+    return states
+
+
+def usb_port_failures(vid_pids, timeout=15):
+    """For each VID_xxxx&PID_yyyy Windows does not see: {key: (problem code,
+    note)} when the port its leftover entries name now holds a present device
+    in an error state (an 'Unknown USB Device'), else nothing for it."""
+    pats = " -or ".join(f"$_.InstanceId -like 'USB\\{v}\\*'" for v in vid_pids)
+    cmd = ("$loc = { param($i) (Get-PnpDeviceProperty -InstanceId $i -KeyName "
+           "DEVPKEY_Device_LocationInfo -ErrorAction SilentlyContinue).Data }; "
+           "Get-PnpDevice | Where-Object { " + pats + " } | ForEach-Object { "
+           "\"ghost|$($_.InstanceId)|$(& $loc $_.InstanceId)\" }; "
+           "Get-PnpDevice -PresentOnly | Where-Object { $_.Status -ne 'OK' -and "
+           "$_.InstanceId -like 'USB\\VID_*' } | ForEach-Object { $c = (Get-PnpDeviceProperty "
+           "-InstanceId $_.InstanceId -KeyName DEVPKEY_Device_ProblemCode -ErrorAction "
+           "SilentlyContinue).Data; \"bad|$($_.InstanceId)|$(& $loc $_.InstanceId)|$c|$($_.FriendlyName)\" }")
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
+            capture_output=True, text=True, timeout=timeout,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+    except Exception:
+        return {}
+    ports, bad = {}, {}
+    for line in out.splitlines():
+        parts = line.strip().split("|")
+        if parts[0] == "ghost" and len(parts) == 3 and parts[2]:
+            key = parts[1].upper().split("\\")[1] if "\\" in parts[1] else ""
+            ports.setdefault(key, set()).add(parts[2].strip())
+        elif parts[0] == "bad" and len(parts) == 5 and parts[2]:
+            bad[parts[2].strip()] = (parts[3].strip(), parts[4].strip())
+    out = {}
+    for key, locs in ports.items():
+        for loc in sorted(locs):
+            if loc in bad:
+                code, name = bad[loc]
+                out[key] = (code, f"{name} (Code {code}) now sits on the port it was last on, {loc}")
+                break
+    return out
 
 
 # Replaceable in tests, which must not depend on what is plugged into the PC.
@@ -1100,6 +1152,20 @@ class Scope:
                         "(or power-cycle the scope), then press Connect. If "
                         "Device Manager still shows the error, Disable and "
                         "Enable the device there. A reboot is not needed.")
+            if absent and len(absent) == len(busy):
+                # Windows sees none of them: the cable, the port or the scope's
+                # own USB interface, never another program (13 Oct 2026: the
+                # MSO-X's port held "Unknown USB Device (Device Descriptor
+                # Request Failed)", Code 43, after it stopped answering).
+                notes = [f"  {r}" + (f"\n    {states[r][2]}" if states[r][2] else "")
+                         for r in absent]
+                return ("VISA still lists the instrument, but Windows does not see "
+                        "it plugged in - no other program is holding it:\n"
+                        + "\n".join(notes)
+                        + "\n\nThe scope's USB interface is not answering the PC. "
+                        "Power-cycle the scope (unplugging the cable alone may not "
+                        "reset it), or try another cable or port, then press "
+                        "Connect. A reboot is not needed.")
             busy = [r for r in busy if r not in absent] or busy
         if busy:
             return ("Found the instrument, but something else already has it "
