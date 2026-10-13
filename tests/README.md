@@ -12,7 +12,7 @@ nothing opens a VISA session.
 | | |
 |---|---|
 | `test_output.py` | The metadata `.txt` and the setup `.txt` against golden copies |
-| `test_panel.py` | The window, the profile wiring, and the connect logic against a fake VISA layer |
+| `test_panel.py` | The window, the profile wiring, the plot bar and the shared plot panel (thinning, a zoom held across a redraw, Home, Save's proposed name, the window without `labplot.py`), and the connect logic against a fake VISA layer |
 | `test_capture_files.py` | NPZ and CSV written and read back (NPZ bit-exact against `Scope.waveform()`), folders holding both, and the grab worker writing each format against a fake scope |
 | `cases.py` | The settings snapshot and the metadata cases both of the above are built from |
 | `test_probe.py` | `tools/probe_scope.py` driven against mock instruments |

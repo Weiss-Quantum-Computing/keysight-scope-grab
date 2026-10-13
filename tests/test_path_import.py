@@ -48,6 +48,16 @@ PROBE = textwrap.dedent("""
     print("LOADED")
     print("PROFILES", len(mod.scope_profiles.PROFILES))
     print("HAS_APP", hasattr(mod, "App") and hasattr(mod, "Scope"))
+    # labplot.py is found the same way, beside this file; a missing copy
+    # must leave the attribute None rather than fail the import.
+    print("LABPLOT", mod.labplot is not None and
+          os.path.dirname(os.path.abspath(mod.labplot.__file__)) ==
+          os.path.dirname(os.path.abspath(path)))
+    print("NAMES", all(hasattr(mod, n) for n in (
+        "pyvisa", "scope_profiles", "load_capture", "write_npz",
+        "write_capture", "setting_roots", "safe_column", "split_capture_name",
+        "select_runs", "capture_files", "CMP_COLOURS", "CMP_ZORDER",
+        "blend_white", "LEGEND_MAX", "thin_index", "time_unit")))
     # Importing must not have built a window or opened an instrument.
     print("NO_TK_ROOT", "_default_root" not in dir(mod.tk) or
           getattr(mod.tk, "_default_root", None) is None)
@@ -70,6 +80,8 @@ def main():
     check("scope_profiles came with it", "PROFILES 2" in out,
           [l for l in out.split("\n") if l.startswith("PROFILES")][0])
     check("Scope and App are both there", "HAS_APP True" in out)
+    check("labplot came with it, from beside scope_grab.py", "LABPLOT True" in out)
+    check("the names the hosts and tests use are all there", "NAMES True" in out)
     check("importing built no Tk window", "NO_TK_ROOT True" in out)
 
     # The same file, imported the ordinary way, must still work - that is how

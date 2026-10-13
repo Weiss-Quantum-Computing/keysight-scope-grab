@@ -17,6 +17,7 @@ import sys
 import tempfile
 import time
 import tkinter as tk
+from tkinter import ttk
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
@@ -221,7 +222,12 @@ def panel_checks(prof):
 def thin_checks(app, root, turn_to):
     """The plot bar's 'Draw 1 in' box, on a record with a spike one sample
     wide and a ripple faster than any thinned grid - the two things that
-    drawing every n-th sample would lose or turn into something else."""
+    drawing every n-th sample would lose or turn into something else.
+
+    The thinning is labplot.thin's: the lowest and highest of each run of
+    2*step, the two ends, and the partial run at the end kept whole (up to
+    2*step - 1 samples more than one in step), which is the slack allowed
+    on the counts below."""
     np = scope_grab.np
     n = 62500
     t = np.arange(n) * 1e-7
@@ -229,7 +235,7 @@ def thin_checks(app, root, turn_to):
     v[31337] = 5.0
     i = scope_grab.thin_index(v, 13)
     check("1 in 13 draws about a thirteenth",
-          n / 13 - 2 <= len(i) <= n / 13 + 6, f"{len(i)} of {n}")
+          n / 13 - 2 <= len(i) <= n / 13 + 2 * 13 + 2, f"{len(i)} of {n}")
     check("in time order, no sample twice",
           bool(np.all(np.diff(i) > 0)))
     check("both ends kept", i[0] == 0 and i[-1] == n - 1)
@@ -241,9 +247,11 @@ def thin_checks(app, root, turn_to):
           all(x in kept for x in lo) and all(x in kept for x in hi))
     check("1 in 1 is every sample",
           len(scope_grab.thin_index(v, 1)) == n)
+    short = scope_grab.thin_index(v[:10], 500)
     check("a step longer than the record still spans it",
-          list(scope_grab.thin_index(v[:10], 500)) ==
-          sorted({0, 9, int(v[:10].argmin()), int(v[:10].argmax())}))
+          short[0] == 0 and short[-1] == 9 and bool(np.all(np.diff(short) > 0))
+          and {int(v[:10].argmin()), int(v[:10].argmax())} <= set(short),
+          str(list(short)))
 
     for text, want in (("", 7), ("1", 1), ("13", 13), ("4.0", 4),
                        ("0", 7), ("-3", 7), ("lots", 7)):
@@ -252,8 +260,16 @@ def thin_checks(app, root, turn_to):
               app._thin_step(n) == want, str(app._thin_step(n)))
     app.plot_thin.set("")
     check("auto leaves a short record alone", app._thin_step(5000) == 1)
+    check("the box becomes labplot.thin's point budget",
+          app._thin_max_pts(n) == 8929 and app._thin_max_pts(5000) is None,
+          str((app._thin_max_pts(n), app._thin_max_pts(5000))))
+    app.plot_thin.set("13")
+    check("a step of 13 is a budget labplot steps by 13",
+          app._thin_max_pts(n) == 4808 and
+          scope_grab.labplot.thin_step(n, app._thin_max_pts(n)) == 13)
+    app.plot_thin.set("")
 
-    if scope_grab.Figure is None:
+    if not scope_grab.HAVE_MPL:
         print("  (matplotlib is not installed: the drawing itself not checked)")
         return
     folder = tempfile.mkdtemp(prefix="scopegrab-thin-")
@@ -278,7 +294,7 @@ def thin_checks(app, root, turn_to):
         count, y, notes = drawn(fig)
         step = box or "7"
         check(f"{tab}, box '{box}': about {points} points drawn",
-              abs(count - points) <= 8, str(count))
+              -4 <= count - points <= 2 * int(step) + 2, str(count))
         check(f"{tab}, box '{box}': the figure says so",
               f"1 in {step} samples drawn" in notes, notes)
     app.plot_thin.set("13")
@@ -301,6 +317,130 @@ def thin_checks(app, root, turn_to):
     turn_to("Spectrum")
     check("Spectrum still draws every bin",
           len(app.fig_spec.axes[0].lines[0].get_xdata()) == n // 2)
+
+    print("\nthe shared panel: a zoom is held across a redraw, Home lets go")
+    view_checks(app, root, turn_to, folder)
+
+
+def view_checks(app, root, turn_to, folder):
+    """What labplot.PlotPanel gives every figure tab, checked on this window
+    rather than trusted: zoom_at (the wheel's path) locks the view, a
+    refresh_plots() redraw keeps it, home() releases it, and Save proposes
+    <prefix>_<tab> in the output folder."""
+    np = scope_grab.np
+    labplot = scope_grab.labplot
+    app.plot_thin.set("")
+    app.refresh_plots()
+    turn_to("Waveforms")
+    panel = app.book["waveforms"]
+    check("the Waveforms tab is a labplot panel",
+          isinstance(panel, labplot.PlotPanel))
+    check("drawn on the figure the tab holds", panel.fig is app.fig_wave)
+    check("every figure tab is in the book, by key",
+          set(app.book.panels) == {"waveforms", "spectrum", "difference", "xy"}
+          and app.book.current_key() == "waveforms", str(list(app.book.panels)))
+    check("the view starts free",
+          not panel.view_locked and panel.view_note.cget("text") == "")
+    ax = panel.fig.axes[0]
+    x0, y0 = ax.get_xlim(), ax.get_ylim()
+    cx, cy = sum(x0) / 2, sum(y0) / 2
+    panel.zoom_at(ax, cx, cy, 0.5)
+    x1, y1 = ax.get_xlim(), ax.get_ylim()
+    check("zoom_at halves both ranges about the cursor",
+          np.isclose(x1[1] - x1[0], 0.5 * (x0[1] - x0[0])) and
+          np.isclose(y1[1] - y1[0], 0.5 * (y0[1] - y0[0])) and
+          np.isclose(sum(x1) / 2, cx), f"{x0} -> {x1}")
+    check("and the view is held, and says so",
+          panel.view_locked and
+          panel.view_note.cget("text") == "zoomed - Home to auto-scale",
+          repr(panel.view_note.cget("text")))
+    panel.zoom_at(ax, cx, cy, 0.5, key="shift")
+    x2, y2 = ax.get_xlim(), ax.get_ylim()
+    check("shift keeps the x range",
+          x2 == x1 and np.isclose(y2[1] - y2[0], 0.5 * (y1[1] - y1[0])))
+    panel.zoom_at(ax, cx, cy, 0.5, key="control")
+    x3, y3 = ax.get_xlim(), ax.get_ylim()
+    check("ctrl keeps the y range",
+          y3 == y2 and np.isclose(x3[1] - x3[0], 0.5 * (x2[1] - x2[0])))
+    app.refresh_plots()
+    root.update()
+    ax = panel.fig.axes[0]
+    check("refresh_plots() redrew on fresh axes",
+          ax is not panel.fig.axes[0] or len(ax.lines) == 1)
+    check("and kept the zoomed view",
+          np.allclose(ax.get_xlim(), x3) and np.allclose(ax.get_ylim(), y3)
+          and panel.view_locked, f"{ax.get_xlim()} vs {x3}")
+    panel.home()
+    root.update()
+    ax = panel.fig.axes[0]
+    check("home() releases it",
+          not panel.view_locked and panel.view_note.cget("text") == "")
+    check("and auto-scales again",
+          np.allclose(ax.get_xlim(), x0) and np.allclose(ax.get_ylim(), y0),
+          f"{ax.get_xlim()} vs {x0}")
+
+    check("Save proposes <prefix>_<tab>",
+          panel.proposed_name() == "thin_waveforms" and
+          app.book["xy"].proposed_name() == "thin_xy",
+          panel.proposed_name())
+    check("in the output folder",
+          scope_grab.same_path(panel.proposed_dir(), folder),
+          panel.proposed_dir())
+    path = os.path.join(folder, "thin_waveforms.png")
+    saved = panel.save_figure(path)
+    check("and writes a PNG",
+          saved == path and os.path.getsize(path) > 1000 and
+          panel.last_saved == path)
+
+
+def no_labplot_checks(prof):
+    """With labplot.py missing the window still builds: the figure tabs say
+    what is missing, the ledgers and the plot bar work as before. Monkeypatch
+    the module attributes BEFORE building, the way _fig_tab reads them."""
+    print("\nwithout labplot.py the figure tabs say so and the rest works")
+    saved = scope_grab.labplot, scope_grab.HAVE_MPL
+    scope_grab.labplot, scope_grab.HAVE_MPL = None, False
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        app = scope_grab.App(root)
+        root.geometry("+6000+200")
+        check("no book and no figures",
+              app.book is None and app.fig_wave is None and
+              app.fig_spec is None and app.fig_diff is None and
+              app.fig_xy is None)
+        tabs = {app.nb.tab(t, "text"): t for t in app.nb.tabs()}
+        check("the tabs are all still there",
+              list(tabs) == ["Screenshot", "Waveforms", "Spectrum",
+                             "Difference", "XY", "Statistics", "Measurements"],
+              str(list(tabs)))
+        for name in ("Waveforms", "Spectrum", "Difference", "XY"):
+            frame = root.nametowidget(tabs[name])
+            texts = [str(w.cget("text")) for w in frame.winfo_children()
+                     if isinstance(w, ttk.Label)]
+            check(f"{name} says labplot.py is missing",
+                  any("labplot.py missing beside scope_grab.py" in t
+                      for t in texts), str(texts)[:80])
+        app.nb.select(tabs["Waveforms"])
+        root.update()
+        check("the plot bar is live on it",
+              {str(w.cget("state")) for w in app.plot_sel_widgets} == {"normal"})
+        app.nb.select(tabs["XY"])
+        root.update()
+        check("XY still greys the Show ticks",
+              {str(w.cget("state")) for w in app.plot_show_widgets} == {"disabled"})
+        app.refresh_plots()
+        root.update()
+        check("refresh_plots() survives", True)
+        check("the colour aliases are still there",
+              len(scope_grab.CMP_COLOURS) >= 6 and scope_grab.LEGEND_MAX > 0
+              and scope_grab.blend_white("#ff0000", 0.5) == "#ff0000")
+        check("thin_index still spans the record",
+              list(scope_grab.thin_index(scope_grab.np.arange(10), 4)) ==
+              [0, 4, 8, 9])
+    finally:
+        root.destroy()
+        scope_grab.labplot, scope_grab.HAVE_MPL = saved
 
 
 def profile_checks(prof):
@@ -401,6 +541,7 @@ def main():
     print("=== msox2014a ===")
     prof = scope_profiles.PROFILES["msox2014a"]
     panel_checks(prof)
+    no_labplot_checks(prof)
     profile_checks(prof)
     connect_checks(prof)
 

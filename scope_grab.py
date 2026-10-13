@@ -51,31 +51,45 @@ try:
 except ImportError:                       # without pillow: Tk's integer subsample
     Image = ImageTk = None
 
-# The plot tabs. Capture works without matplotlib - the tabs then say what to
-# install - and the ledgers (Statistics, Measurements) never needed it.
+# The figure tabs draw through labplot.py, the lab's shared plot panel
+# (vendored beside this file from Weiss-Quantum-Computing/lab-plot and found
+# through the sys.path entry above - the same by-path trap as scope_profiles).
+# It imports without matplotlib, HAVE_MPL then says so, and capture works
+# without either: the figure tabs say what is missing and the ledgers
+# (Statistics, Measurements) never needed them.
 try:
-    import matplotlib
-    import matplotlib.colors as mcolors
-    from matplotlib.figure import Figure
-    from matplotlib.backends.backend_tkagg import (FigureCanvasTkAgg,
-                                                   NavigationToolbar2Tk)
+    import labplot  # noqa: E402
 except ImportError:
-    matplotlib = mcolors = Figure = FigureCanvasTkAgg = NavigationToolbar2Tk = None
+    labplot = None
+HAVE_MPL = bool(labplot is not None and labplot.HAVE_MPL)
 NO_MPL = ("matplotlib is not installed, so this tab cannot draw.\n"
           "pip install matplotlib   - the Statistics and Measurements tabs work "
           "without it.")
+NO_LABPLOT = ("labplot.py missing beside scope_grab.py, so this tab cannot "
+              "draw.\nIt is vendored from Weiss-Quantum-Computing/lab-plot - "
+              "the Statistics and Measurements tabs work without it.")
 
-# Plot colours, the ILC panel's scheme: the current prefix's runs ride a viridis
-# ramp, oldest dark to newest yellow, and each compare key takes one of these -
-# hues that sit far from that ramp - with its older runs blended toward white.
-# Compare traces draw under the current prefix's (CMP_ZORDER: below a line's
-# default 2, above the grid's 1.5).
-CMP_COLOURS = ["#ff7f0e", "#e377c2", "#8c564b", "#d62728", "#17becf", "#7f7f7f"]
-CMP_ZORDER = 1.8
-# Traces per pane past which the legend is left off - a 64-run sequence is a
-# ramp of colour, not a list of names.
-LEGEND_MAX = 12
-# Points per trace past which a blank 'Draw 1 in' box starts thinning. A pane is
+# Plot colours are labplot's, the ILC panel's scheme: the current prefix's runs
+# ride a viridis ramp (labplot.ramp), oldest dark to newest yellow, and each
+# compare key takes one of CMP_COLOURS - hues that sit far from that ramp - with
+# its older runs blended toward white. Compare traces draw under the current
+# prefix's (CMP_ZORDER: below a line's default 2, above the grid's 1.5), and
+# past LEGEND_MAX traces per pane the legend is left off - a 64-run sequence is
+# a ramp of colour, not a list of names. The names stay at module level for
+# the tests and the hosts that read them; the fallbacks only exist for a tree
+# without labplot, where nothing draws.
+if labplot is not None:
+    CMP_COLOURS = labplot.CMP_COLOURS
+    CMP_ZORDER = labplot.CMP_ZORDER
+    LEGEND_MAX = labplot.LEGEND_MAX
+else:
+    CMP_COLOURS = ["#ff7f0e", "#e377c2", "#8c564b", "#17becf", "#7f7f7f",
+                   "#bcbd22"]
+    CMP_ZORDER = 1.8
+    LEGEND_MAX = 12
+# Points per trace past which a blank 'Draw 1 in' box starts thinning - the
+# point budget handed to labplot.thin, which keeps the lowest and highest
+# sample of each run so the envelope survives the decimation. A pane is
 # some 600 pixels wide and a column of them can show a trace's lowest and
 # highest sample and nothing between, so this is exact unzoomed and to about an
 # 8x zoom. Measured in the window on synthetic ramps: ten 62500-point runs on
@@ -733,25 +747,24 @@ def spectrum(t, v, window="hann", units="rms"):
 
 
 def thin_index(v, step):
-    """Which samples of `v` to draw when only 1 in `step` is: the lowest and
-    the highest of each run of 2*step, in time order, and the two ends.
+    """Which samples of `v` to draw when only 1 in `step` is: labplot.thin's
+    envelope as indices - the lowest and the highest of each run of 2*step,
+    in time order, the two ends, and whatever partial run is left at the end.
 
     Every point drawn is a real sample, and the trace keeps its envelope - a
     one-sample spike still shows, and a ripple faster than the thinned grid
     stays a band rather than turning into a slow beat that is not in the data,
-    which is what drawing every step-th sample does to it."""
+    which is what drawing every step-th sample does to it. The tabs call
+    labplot.thin themselves; this is its index form, kept for the tests.
+    labplot.thin takes a point budget and steps by ceil(n / budget), so a
+    step of N is a budget of ceil(n / N)."""
     n = len(v)
     if step <= 1 or n < 3:
         return np.arange(n)
-    run = 2 * step
-    m = n // run * run
-    blocks = v[:m].reshape(-1, run)
-    base = np.arange(0, m, run)
-    idx = [base + blocks.argmin(axis=1), base + blocks.argmax(axis=1),
-           np.array([0, n - 1])]
-    if m < n:                       # what is left over is a short run of its own
-        idx.append(m + np.array([v[m:].argmin(), v[m:].argmax()]))
-    return np.unique(np.concatenate(idx))
+    if labplot is None:             # nothing draws without it; keep the ends
+        return np.unique(np.concatenate([np.arange(0, n, step), [n - 1]]))
+    idx, _, _ = labplot.thin(np.arange(n), np.asarray(v), -(-n // step))
+    return idx
 
 
 def _top_base(v, vmax, vmin):
@@ -926,9 +939,11 @@ def key_safe(text):
 
 def blend_white(colour, frac):
     """`colour` moved `frac` of the way to white: how a compare key's older
-    runs fade behind its newest."""
-    r, g, b = mcolors.to_rgb(colour)
-    return (r + (1 - r) * frac, g + (1 - g) * frac, b + (1 - b) * frac)
+    runs fade behind its newest. labplot's; without it nothing draws and the
+    colour comes back as it was."""
+    if labplot is None:
+        return colour
+    return labplot.blend_white(colour, frac)
 
 
 PLOT_HINT = ("Runs: blank = newest, or  1-10  last3  avg  all.   "
@@ -1476,8 +1491,10 @@ class App:
         # time; the tabs redraw lazily - a capture marks every tab dirty and
         # only the one on show is drawn, the others when they are turned to.
         self.plot_cache = {}      # path -> (mtime, Capture)
-        self.plot_tabs = {}       # tab frame -> its draw function
-        self.plot_dirty = set()
+        self.plot_tabs = {}       # data tab frame -> its key ("waveforms", "statistics", ...)
+        self.plot_fills = {}      # ledger key -> fill(groups); the figures draw through the book
+        self.plot_dirty = set()   # ledger keys not filled since the last refresh
+        self.book = None          # labplot.PlotBook of the figure tabs; None without labplot/matplotlib
         self.plot_groups = None   # what the boxes last resolved to
         self.plot_notes_seen = set()
         self.plot_thin_warned = ""   # a 'Draw 1 in' entry already complained of
@@ -1508,6 +1525,8 @@ class App:
         self.setup_prefix = tk.StringVar(value="setup")
 
         root.title(f"Scope Grab - {self.prof.name}")
+        if HAVE_MPL:
+            labplot.apply_style()         # the lab's figure style, once
         # Tall enough for the screenshot preview, but never taller than the
         # screen - otherwise the log ends up behind the taskbar.
         win_w = min(1200, root.winfo_screenwidth() - 80)
@@ -2836,10 +2855,12 @@ class App:
         self.plot_status = ttk.Label(row3, text=PLOT_HINT, foreground="#666")
         self.plot_status.pack(side="left")
 
-        ctl, self.fig_wave = self._fig_tab("Waveforms", self._plot_waveforms)
-        self.plot_thin_tabs = {ctl.master}    # the tabs that draw samples
+        tab, ctl, self.fig_wave = self._fig_tab("waveforms", "Waveforms",
+                                                self._plot_waveforms)
+        self.plot_thin_tabs = {tab}           # the tabs that draw samples
 
-        ctl, self.fig_spec = self._fig_tab("Spectrum", self._plot_spectrum)
+        _tab, ctl, self.fig_spec = self._fig_tab("spectrum", "Spectrum",
+                                                 self._plot_spectrum)
         ttk.Label(ctl, text="Window:").pack(side="left")
         self.spec_window = tk.StringVar(value="hann")
         cb = ttk.Combobox(ctl, textvariable=self.spec_window,
@@ -2856,8 +2877,9 @@ class App:
                   text="mean removed; V rms is the height of a line, "
                        "V/sqrt(Hz) a noise floor").pack(side="left", padx=(12, 0))
 
-        ctl, self.fig_diff = self._fig_tab("Difference", self._plot_difference)
-        self.plot_thin_tabs.add(ctl.master)
+        tab, ctl, self.fig_diff = self._fig_tab("difference", "Difference",
+                                                self._plot_difference)
+        self.plot_thin_tabs.add(tab)
         ttk.Label(ctl, text="Reference:").pack(side="left")
         self.diff_ref = tk.StringVar()
         self.diff_ref_box = ttk.Combobox(ctl, textvariable=self.diff_ref,
@@ -2869,9 +2891,9 @@ class App:
                   text="every other selected capture minus this one, on its "
                        "time base").pack(side="left", padx=(12, 0))
 
-        ctl, self.fig_xy = self._fig_tab("XY", self._plot_xy)
-        self.plot_no_show = {ctl.master}      # its channels are the two below
-        self.plot_thin_tabs.add(ctl.master)
+        tab, ctl, self.fig_xy = self._fig_tab("xy", "XY", self._plot_xy)
+        self.plot_no_show = {tab}             # its channels are the two below
+        self.plot_thin_tabs.add(tab)
         self.xy_x,self.xy_y = tk.StringVar(value="CH1"), tk.StringVar(value="CH2")
         for text, var in (("X:", self.xy_x), ("Y:", self.xy_y)):
             ttk.Label(ctl, text=text).pack(side="left",
@@ -2917,33 +2939,42 @@ class App:
                                     justify="left", wraplength=700)
         self.scope_meas.pack(anchor="w", pady=(2, 0))
 
-        self.nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+        # add="+": the book bound its own lazy draw to the same event when it
+        # was made, and a plain bind would replace it.
+        self.nb.bind("<<NotebookTabChanged>>", self._on_tab_changed, add="+")
         self._sync_plot_bar()
 
-    def _fig_tab(self, name, draw):
-        """A tab holding a matplotlib figure with the zoom/pan toolbar, plus a
-        strip above it for that tab's own knobs. Returns (strip, figure); the
-        figure carries its canvas and toolbar as _canvas and _toolbar the way
-        the ILC panel's do. Without matplotlib the tab says so and draws
-        nothing, but still counts as a data tab so the bar is live."""
-        frame = ttk.Frame(self.nb)
-        self.nb.add(frame, text=name)
-        ctl = ttk.Frame(frame)
+    def _fig_tab(self, key, name, draw):
+        """A tab holding a figure on the lab's shared panel (labplot.PlotPanel,
+        kept in self.book under `key`): the toolbar, the view held across a
+        redraw once zoomed, wheel zoom, right-click copy and Save - which
+        proposes <prefix>_<key> in the output folder - all come from it.
+        Returns (tab frame, strip above the figure for the tab's own knobs,
+        figure). `draw(fig, groups)` is reached through _draw_tab, which
+        resolves the plot bar once per refresh. Without labplot or matplotlib
+        the tab says which is missing and draws nothing, but still counts as a
+        data tab so the bar is live and the status line keeps up."""
+        if self.book is None and HAVE_MPL:
+            self.book = labplot.PlotBook(self.nb)
+        if self.book is None:
+            frame = ttk.Frame(self.nb)
+            self.nb.add(frame, text=name)
+            ctl = ttk.Frame(frame)
+            ctl.pack(fill="x", padx=4, pady=(4, 0))
+            ttk.Label(frame, text=NO_LABPLOT if labplot is None else NO_MPL,
+                      foreground="#a00", justify="left").pack(anchor="w",
+                                                             padx=8, pady=12)
+            self.plot_tabs[frame] = key
+            return frame, ctl, None
+        panel = self.book.add(
+            key, name,
+            draw=lambda fig, key=key, draw=draw: self._draw_tab(key, fig, draw),
+            save_name=lambda key=key: f"{self.safe_prefix()}_{key}",
+            save_dir=lambda: self.outdir.get(), on_status=self.log)
+        ctl = ttk.Frame(panel.controls)
         ctl.pack(fill="x", padx=4, pady=(4, 0))
-        self.plot_dirty.add(frame)
-        if Figure is None:
-            ttk.Label(frame, text=NO_MPL, foreground="#a00",
-                      justify="left").pack(anchor="w", padx=8, pady=12)
-            self.plot_tabs[frame] = lambda groups: None
-            return ctl, None
-        matplotlib.rcParams["font.size"] = 8
-        fig = Figure(figsize=(6.4, 4.6), dpi=100, constrained_layout=True)
-        canvas = FigureCanvasTkAgg(fig, master=frame)
-        toolbar = NavigationToolbar2Tk(canvas, frame)   # packs itself, bottom
-        canvas.get_tk_widget().pack(fill="both", expand=True)
-        fig._canvas, fig._toolbar = canvas, toolbar
-        self.plot_tabs[frame] = draw
-        return ctl, fig
+        self.plot_tabs[panel.tab] = key
+        return panel.tab, ctl, panel.fig
 
     def _table_tab(self, name, heads, widths, fill, note):
         """A tab holding a ledger, saveable as CSV the way the figures save as
@@ -2971,8 +3002,10 @@ class App:
         ttk.Button(ctl, text="Save CSV...",
                    command=lambda: self._save_table(tv, heads, name)).pack(
             side="right")
-        self.plot_tabs[frame] = fill
-        self.plot_dirty.add(frame)
+        key = name.lower()
+        self.plot_tabs[frame] = key
+        self.plot_fills[key] = fill
+        self.plot_dirty.add(key)
         return ctl, tv
 
     def _current_tab(self):
@@ -2982,10 +3015,24 @@ class App:
             return None
 
     def _on_tab_changed(self, _event=None):
-        tab = self._current_tab()
-        if tab in self.plot_tabs and tab in self.plot_dirty:
-            self._draw_tab(tab)
+        self._draw_current()
         self._sync_plot_bar()
+
+    def _draw_current(self):
+        """Draw the tab on show if it is stale: a figure through the book,
+        which draws only the panel on show and keeps a zoomed view; a ledger
+        through its fill. A figure tab with nothing to draw on (no labplot or
+        matplotlib) still resolves the bar, so the status line keeps up."""
+        key = self.plot_tabs.get(self._current_tab())
+        if key is None:
+            return
+        if key in self.plot_fills:
+            if key in self.plot_dirty:
+                self._fill_tab(key)
+        elif self.book is not None and key in self.book:
+            self.book.draw_visible()
+        else:
+            self._plot_groups_now()
 
     def _sync_plot_bar(self):
         """Grey out what the tab on show does not read: all of the bar on
@@ -3018,11 +3065,11 @@ class App:
         changed, a box or a tick - so every data tab is stale. Only the one on
         show is drawn now; the rest draw when they are turned to, so a fast
         sequence is not paying for four figures per run."""
-        self.plot_dirty = set(self.plot_tabs)
         self.plot_groups = None
-        tab = self._current_tab()
-        if tab in self.plot_tabs:
-            self._draw_tab(tab)
+        self.plot_dirty = set(self.plot_fills)
+        if self.book is not None:
+            self.book.mark_dirty()
+        self._draw_current()
 
     def do_plot_redraw(self):
         """Redraw, and let a warning that was said once be said again: the
@@ -3031,7 +3078,10 @@ class App:
         self.plot_thin_warned = ""
         self.refresh_plots()
 
-    def _draw_tab(self, tab):
+    def _plot_groups_now(self):
+        """The plot bar, resolved once per refresh: what the boxes picked,
+        with what did not resolve said once in the log and on the status
+        line."""
         if self.plot_groups is None:
             groups, notes = self._resolve_plot_selection()
             self.plot_groups = groups
@@ -3040,11 +3090,26 @@ class App:
                     self.plot_notes_seen.add(note)
                     self.log(f"plot: {note}")
             self._refresh_plot_status(groups, notes)
+        return self.plot_groups
+
+    def _draw_tab(self, key, fig, draw):
+        """A figure panel's draw function: `draw(fig, groups)` on what the bar
+        resolved. An error is logged rather than raised, so the panel still
+        finishes its redraw - toolbar stack, held view - and the window stays
+        up."""
+        groups = self._plot_groups_now()
         try:
-            self.plot_tabs[tab](self.plot_groups)
+            draw(fig, groups)
         except Exception as exc:
             self.log(f"plot: ERROR {exc}")
-        self.plot_dirty.discard(tab)
+
+    def _fill_tab(self, key):
+        groups = self._plot_groups_now()
+        try:
+            self.plot_fills[key](groups)
+        except Exception as exc:
+            self.log(f"plot: ERROR {exc}")
+        self.plot_dirty.discard(key)
 
     def _resolve_plot_selection(self):
         """The two boxes -> ([(key, [Capture], primary)], notes).
@@ -3264,9 +3329,9 @@ class App:
             if not primary:
                 continue
             n = len(caps)
+            cols = labplot.ramp(n) if labplot is not None else ["#1f77b4"] * n
             for idx, cap in enumerate(caps):
-                col = matplotlib.colormaps["viridis"](0.1 + 0.75 * idx / max(n - 1, 1))
-                out.append((cap, col, 1.3 if idx == n - 1 else 0.8,
+                out.append((cap, cols[idx], 1.3 if idx == n - 1 else 0.8,
                             2.2 if idx == n - 1 else 2.0))
         return out
 
@@ -3295,81 +3360,77 @@ class App:
         return elide(f"{folder}   |   " + ";   ".join(parts), 120)
 
     def _panes(self, fig, n, sharex=True):
-        """`n` stacked axes on a cleared figure, or a placeholder for none."""
-        fig.clear()
+        """`n` stacked axes on a cleared figure, or a placeholder for none.
+        The panel does the rest of what a redraw needs - draw_idle, the
+        toolbar's fresh stack, the held view - once the draw function
+        returns."""
         if n == 0:
-            ax = fig.add_subplot(111)
-            ax.text(0.5, 0.5, "nothing to draw - see the plot bar and the log",
-                    ha="center", va="center", color="#999", transform=ax.transAxes)
-            ax.set_axis_off()
+            labplot.placeholder(fig, "nothing to draw - see the plot bar and "
+                                     "the log")
             return []
+        fig.clear()
         return list(np.atleast_1d(fig.subplots(n, 1, sharex=sharex)))
 
-    def _finish(self, fig):
-        fig._canvas.draw_idle()
-        fig._toolbar.update()       # the axes are new: the zoom stack was theirs
-
-    def _legend(self, ax, count, loc="best"):
-        if 0 < count <= LEGEND_MAX:
-            ax.legend(loc=loc, fontsize=7, ncols=2 if count > 6 else 1)
-
-    def _plot_note(self, ax, text, loc="nw"):
-        """Method notes, small and grey, in a corner the data leaves empty."""
-        xy = (0.01, 0.99) if loc == "nw" else (0.01, 0.01)
-        ax.annotate(text, xy, xycoords="axes fraction", fontsize=6.5,
-                    color="#999999", ha="left",
-                    va="top" if loc == "nw" else "bottom")
+    def _thin_box(self):
+        """The 'Draw 1 in' box: a whole number of 1 or more, or None for
+        blank - and for anything else, said once."""
+        txt = self.plot_thin.get().strip()
+        if not txt:
+            return None
+        try:
+            step = int(float(txt))
+            if step >= 1:
+                return step
+        except (ValueError, OverflowError):
+            pass
+        if txt != self.plot_thin_warned:
+            self.plot_thin_warned = txt
+            self.log(f"plot: 'Draw 1 in {txt}' is not a whole number of 1 "
+                     "or more - drawing as if the box were blank")
+        return None
 
     def _thin_step(self, n):
         """The 'Draw 1 in' box for a trace of `n` samples: blank = auto, the
         step that keeps it to PLOT_AUTO_PTS drawn; a number = that step
         whatever the length; 1 = every sample."""
-        txt = self.plot_thin.get().strip()
-        if txt:
-            try:
-                step = int(float(txt))
-                if step >= 1:
-                    return step
-            except (ValueError, OverflowError):
-                pass
-            if txt != self.plot_thin_warned:
-                self.plot_thin_warned = txt
-                self.log(f"plot: 'Draw 1 in {txt}' is not a whole number of 1 "
-                         "or more - drawing as if the box were blank")
+        step = self._thin_box()
+        if step is not None:
+            return step
         return max(1, -(-n // PLOT_AUTO_PTS))
 
-    def _thinned(self, x, y, steps, envelope=True):
-        """x and y as the 'Draw 1 in' box has them drawn, the step used added
-        to `steps` for the figure's note. Against time a trace keeps its
-        lowest and highest sample of each run (thin_index); one channel
-        against another has no envelope to keep and takes every step-th."""
-        step = self._thin_step(len(y))
-        if step <= 1:
-            return x, y
-        steps.add(step)
-        i = thin_index(y, step) if envelope else slice(None, None, step)
-        return x[i], y[i]
+    def _thin_max_pts(self, n):
+        """The box as labplot.thin wants it: a point budget, stepped by
+        ceil(n / budget), so a step of N is a budget of ceil(n / N) and None
+        draws every sample."""
+        step = self._thin_step(n)
+        return None if step <= 1 else -(-n // step)
 
-    def _thin_note(self, steps, envelope=True):
+    def _thinned(self, x, y, steps):
+        """x and y as the 'Draw 1 in' box has them drawn - labplot.thin keeps
+        the lowest and highest sample of each run of 2*step, so every point
+        drawn is a real one and the envelope survives - with the step used
+        added to `steps` for the figure's note."""
+        x, y, step = labplot.thin(x, y, self._thin_max_pts(len(y)))
+        if step > 1:
+            steps.add(step)
+        return x, y
+
+    def _thin_note(self, steps, of=""):
         """What the figure says about it, so a saved PNG carries the fact."""
         if not steps:
             return ""
         lo, hi = min(steps), max(steps)
         text = f"1 in {lo if lo == hi else f'{lo} to {hi}'} samples drawn"
-        if envelope:
-            text += (f": the lowest and highest of each {2 * lo}" if lo == hi
-                     else ": the lowest and highest of each run")
+        text += (f": the lowest and highest {of}of each {2 * lo}" if lo == hi
+                 else f": the lowest and highest {of}of each run")
         return text
 
-    def _plot_waveforms(self, groups):
-        fig = self.fig_wave
-        if fig is None:
-            return
+    def _plot_waveforms(self, fig, groups):
         traces = self._traces(groups)
         chans = self._shown_channels(traces)
         axes = self._panes(fig, len(chans))
         if not axes:
-            return self._finish(fig)
+            return
         span = max((cap.t[-1] - cap.t[0] for cap, *_ in traces if len(cap.t) > 1),
                    default=1.0)
         scale, unit = time_unit(span)
@@ -3384,22 +3445,18 @@ class App:
                     n += 1
             ax.set_ylabel(self._ch_label(ch, traces))
             ax.grid(True, alpha=0.3)
-            self._legend(ax, n)
+            labplot.legend(ax, n)
         if thinned:
-            self._plot_note(axes[0], self._thin_note(thinned))
+            labplot.note(axes[0], self._thin_note(thinned))
         axes[-1].set_xlabel(f"time ({unit})")
         fig.suptitle(self._plot_title(groups), fontsize=8)
-        self._finish(fig)
 
-    def _plot_spectrum(self, groups):
-        fig = self.fig_spec
-        if fig is None:
-            return
+    def _plot_spectrum(self, fig, groups):
         traces = self._traces(groups)
         chans = self._shown_channels(traces)
         axes = self._panes(fig, len(chans))
         if not axes:
-            return self._finish(fig)
+            return
         window = self.spec_window.get() if self.spec_window.get() in WINDOWS else "hann"
         units = SPEC_UNITS.get(self.spec_units.get(), "rms")
         ulabel = "V rms" if units == "rms" else "V/sqrt(Hz)"
@@ -3416,21 +3473,17 @@ class App:
             ax.grid(True, which="both", alpha=0.3)
             # upper right: a falling spectrum leaves the lower left empty, and
             # that corner is the note's
-            self._legend(ax, n, loc="upper right")
+            labplot.legend(ax, n, loc="upper right")
             if bins:
                 width = fmt_si(min(bins), "Hz")
                 if max(bins) > 1.5 * min(bins):
                     width += f" - {fmt_si(max(bins), 'Hz')}"
-                self._plot_note(ax, f"{window} window, mean removed, bin {width}",
-                                loc="sw")
+                labplot.note(ax, f"{window} window, mean removed, bin {width}",
+                             where="bottom-left")
         axes[-1].set_xlabel("frequency (Hz)")
         fig.suptitle(self._plot_title(groups), fontsize=8)
-        self._finish(fig)
 
-    def _plot_difference(self, groups):
-        fig = self.fig_diff
-        if fig is None:
-            return
+    def _plot_difference(self, fig, groups):
         traces = self._traces(groups)
         labels = [cap.label for cap, *_ in traces]
         self.diff_ref_box.configure(values=labels)
@@ -3446,7 +3499,7 @@ class App:
                  if ref is not None and ch in ref.chan]
         axes = self._panes(fig, len(chans) if len(traces) > 1 else 0)
         if not axes:
-            return self._finish(fig)
+            return
         scale, unit = time_unit(ref.t[-1] - ref.t[0] if len(ref.t) > 1 else 1.0)
         regridded, thinned = [], set()
         for ax, ch in zip(axes, chans):
@@ -3468,7 +3521,7 @@ class App:
             ax.axhline(0, color="#999999", lw=0.6)
             ax.set_ylabel(f"CH{ch} difference (V)")
             ax.grid(True, alpha=0.3)
-            self._legend(ax, n)
+            labplot.legend(ax, n)
         notes = []
         if regridded:
             notes.append("interpolated onto the reference's time base: "
@@ -3477,16 +3530,12 @@ class App:
         if thinned:
             notes.append(self._thin_note(thinned))
         if notes:
-            self._plot_note(axes[0], "\n".join(notes))
+            labplot.note(axes[0], "\n".join(notes))
         axes[-1].set_xlabel(f"time ({unit})")
         fig.suptitle(elide(f"{self._plot_title(groups)}   -   minus {ref.label}", 130),
                      fontsize=8)
-        self._finish(fig)
 
-    def _plot_xy(self, groups):
-        fig = self.fig_xy
-        if fig is None:
-            return
+    def _plot_xy(self, fig, groups):
         traces = self._traces(groups)
         try:
             x, y = int(self.xy_x.get()[2:]), int(self.xy_y.get()[2:])
@@ -3495,21 +3544,22 @@ class App:
         usable = [tr for tr in traces if x in tr[0].chan and y in tr[0].chan]
         axes = self._panes(fig, 1 if usable else 0)
         if not axes:
-            return self._finish(fig)
+            return
         ax = axes[0]
         thinned = set()
         for cap, col, lw, z in usable:
-            vx, vy = self._thinned(cap.v(x), cap.v(y), thinned, envelope=False)
+            # the envelope is Y's: each run keeps the samples where Y was
+            # lowest and highest, with the X that went with them
+            vx, vy = self._thinned(cap.v(x), cap.v(y), thinned)
             ax.plot(vx, vy, color=col, lw=0.8 * lw, zorder=z,
                     alpha=0.9, label=cap.label)
         if thinned:
-            self._plot_note(ax, self._thin_note(thinned, envelope=False))
+            labplot.note(ax, self._thin_note(thinned, of="Y "))
         ax.set_xlabel(self._ch_label(x, usable))
         ax.set_ylabel(self._ch_label(y, usable))
         ax.grid(True, alpha=0.3)
-        self._legend(ax, len(usable))
+        labplot.legend(ax, len(usable))
         fig.suptitle(self._plot_title(groups), fontsize=8)
-        self._finish(fig)
 
     def _fill_stats(self, groups):
         tv = self.stats_tv

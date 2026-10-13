@@ -31,8 +31,11 @@ other prefixes and other days: see
 
 Pillow and matplotlib are both optional. Pillow only gives the screenshot preview a
 smoother rescale; without it the preview falls back to Tk's integer subsample.
-matplotlib draws the Waveforms, Spectrum, Difference and XY tabs; without it those
-tabs say so, and capture, the Statistics table and the Measurements table all work.
+matplotlib draws the Waveforms, Spectrum, Difference and XY tabs, through the
+`labplot.py` beside `scope_grab.py` (the lab's shared plot panel, vendored from
+Weiss-Quantum-Computing/lab-plot - refresh it from there, never edit it here);
+without either those tabs say so, and capture, the Statistics table and the
+Measurements table all work.
 
 ## Usage
 
@@ -164,8 +167,9 @@ data folder, and on captures from any folder.
 | **Statistics** | a row per capture per channel: points, dt, sample rate, V/div, offset, coupling, mean, rms, pk-pk |
 | **Measurements** | the scope's Snapshot All set, computed from the samples: Vpp, Vmax, Vmin, Vtop, Vbase, Vamp, Vavg, Vrms, Vrms AC, frequency, period, +width, -width, duty, rise, fall, overshoot, preshoot, X at max and min, area |
 
-The figures carry the usual matplotlib toolbar: zoom to a box, pan, home, save as
-PNG. The tables save as CSV.
+The figure tabs use the lab's shared plot panel (labplot.py, vendored from Weiss-Quantum-Computing/lab-plot). Toolbar: Home, Back, Forward, Pan, Zoom, Save. Once you zoom or pan (toolbar or mouse wheel) the view is held across redraws and a blue note says 'zoomed - Home to auto-scale'; Home releases it. The mouse wheel zooms about the cursor (Shift keeps the x range, Ctrl keeps the y range) and each step goes on the Back stack. Right-click copies the cursor position as x<TAB>y to the clipboard. Save proposes <prefix>_<tab> in the output folder and writes PNG at 150 dpi.
+
+The tables save as CSV.
 
 ### What is drawn
 
@@ -203,7 +207,8 @@ step whatever the length, and `1` draws every sample. Against time - Waveforms
 and Difference - what is kept is the lowest and the highest sample of each run,
 so every point drawn is a real one, a one-sample spike still shows, and a fast
 ripple stays a band instead of turning into a slow beat; at full view the
-figure looks the same as the whole record. XY takes every n-th sample. A
+figure looks the same as the whole record. XY keeps the samples where Y was
+lowest and highest in each run, with the X that went with them. A
 thinned figure says so in its corner, and a saved PNG carries that. Zoomed far
 in, a thinned trace runs out of points: put `1` in the box and redraw. Nothing
 that is computed is thinned - spectra, differences before they are drawn,
