@@ -452,9 +452,18 @@ class KeysightInfiniiVision(ScopeProfile):
         pre = w.query(":WAVeform:PREamble?").strip().split(",")
         xinc, xorig, xref = float(pre[4]), float(pre[5]), float(pre[6])
         yinc, yorig, yref = float(pre[7]), float(pre[8]), float(pre[9])
+        n_pre = int(float(pre[2]))
 
         raw = w.query_binary_values(":WAVeform:DATA?", datatype="H",
                                     container=np.array)
+        # A block that does not match its preamble is a bad read, not data: an
+        # empty block ends in the parser's ValueError, but a block cut short
+        # mid-transfer (14 Oct 2026, the 7-8 Oct dropped reads) would otherwise
+        # come back as a record whose time axis is right and whose tail is
+        # missing, and be averaged in. The caller's retry re-reads the same
+        # frozen acquisition.
+        if len(raw) != n_pre:
+            raise ValueError(f"CH{channel}: {len(raw)} points read, the preamble says {n_pre}")
         return Record((xinc, xorig, xref), codes=raw.astype(np.uint16),
                       y=(yinc, yref, yorig))
 

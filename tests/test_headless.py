@@ -211,9 +211,35 @@ def refused_checks():
     check("non-USB resources are not looked up", states == {})
 
 
+def read_checks():
+    print("\na waveform block that does not match its preamble (14 Oct 2026)")
+    prof = scope_profiles.PROFILES["msox2014a"]
+
+    class BinInst(FakeInst):
+        def __init__(self, n_block):
+            super().__init__({":WAVeform:PREamble": "0,0,2000,1,1e-6,0,0,0.001,0,128"})
+            self.n_block = n_block
+
+        def query_binary_values(self, text, datatype="H", container=None):
+            return np.arange(self.n_block, dtype=np.uint16)
+    s = sg.Scope(prof)
+    s.inst = BinInst(2000)
+    rec = prof.read_record(s, 1, "RAW", 2000)
+    check("a block of the preamble's length is a record", len(rec.codes) == 2000)
+    s.inst = BinInst(1200)
+    err = None
+    try:
+        prof.read_record(s, 1, "RAW", 2000)
+    except ValueError as exc:
+        err = str(exc)
+    check("a block cut short is a ValueError naming both counts, not a record",
+          err is not None and "1200 points read" in err and "preamble says 2000" in err, err)
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="scopegrab-headless-")
     refused_checks()
+    read_checks()
     settings_checks()
     dither_checks()
     write_checks(tmp)
