@@ -203,7 +203,7 @@ def grab_checks(tmp):
     app.scope = FakeScope(recs)
     real_prof = app.prof
     app.prof = type("P", (), {"meas_results": None, "wave_count": "count"})()
-    app.read_all_settings = lambda: {}
+    app.read_all_settings = lambda *a: {}
     app.report_averaging = lambda *a, **k: None
     app.save_png.set(False)
     app.rec_meas.set(False)

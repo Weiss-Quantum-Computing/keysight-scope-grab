@@ -190,6 +190,20 @@ def safe_column(name):
     return out.strip("_")
 
 
+def column_for(ch, name):
+    """CSV header for a channel. The channel number is kept even when named,
+    so a column stays traceable to the settings in the metadata file and two
+    channels sharing a name cannot collide."""
+    name = safe_column(name or "")
+    return f"CH{ch}_{name}_V" if name else f"CH{ch}_V"
+
+
+def short_idn(idn):
+    """Model and serial out of an *IDN? reply, for a status line."""
+    parts = [p.strip() for p in (idn or "").split(",")]
+    return " ".join(p for p in parts[1:3] if p) or (idn or "").strip()[:30]
+
+
 def free_base(base):
     """Add a suffix rather than overwrite a capture that is already there -
     in either format, so switching the Data box mid-folder cannot reuse a
@@ -1621,7 +1635,7 @@ class ScopeSlot:
 
     @property
     def connected(self):
-        return self.scope.inst is not None
+        return getattr(self.scope, "inst", None) is not None
 
     @property
     def busy(self):
@@ -1847,13 +1861,19 @@ class ScopeRegistry:
         with slot.lock:
             slot.scope.close()
 
-    def close(self):
-        """Close every scope, then the shared RM - the one place it closes."""
+    def close(self, timeout=None):
+        """Close every scope, then the shared RM - the one place it closes.
+        With a timeout, a scope whose worker is still inside a job after that
+        many seconds is closed anyway (the window is going away)."""
         for slot in self:
+            got = slot.lock.acquire(timeout=-1 if timeout is None else timeout)
             try:
-                self.disconnect(slot)
+                slot.scope.close()
             except Exception:
                 pass
+            finally:
+                if got:
+                    slot.lock.release()
             slot.stop()
         with self._rm_lock:
             if self._rm is not None:
@@ -1886,24 +1906,54 @@ class ScopeRegistry:
 # GUI
 # ---------------------------------------------------------------------------
 
+# Replaceable in tests: what the panel's registry makes its one shared
+# ResourceManager with. None is pyvisa's default VISA.
+RM_FACTORY = None
+
+
 class App:
+    # The scope on show and its profile. Everything in the panel that is one
+    # scope's - the settings rows, the channel boxes, the action buttons, the
+    # setups, the screenshot browser, the plot tabs' prefix - follows the
+    # ACTIVE slot of the registry. The setters are for tests that swap a fake
+    # in.
+    @property
+    def scope(self):
+        return self.active.scope
+
+    @scope.setter
+    def scope(self, value):
+        self.active.scope = value
+
+    @property
+    def prof(self):
+        return self.active.prof
+
+    @prof.setter
+    def prof(self, value):
+        self.active.prof = value
+
     def __init__(self, root):
         self.root = root
         self.msgs = queue.Queue()
-        # The profile has to be settled before anything else is built: the
+        # The scopes have to be settled before anything else is built: the
         # settings panel, the metadata layout and the screenshot box are all
-        # laid out from it. Remembered between sessions like the rest of the
-        # config, and read here directly rather than in load_config, which runs
-        # at the end of this method - long after the panel exists.
-        saved = read_config().get("model")
-        self.prof = scope_profiles.get_profile(saved)
-        if saved and saved != self.prof.key:
-            self.log(f"Config asks for a scope this version does not have "
-                     f"({saved}) - starting on {self.prof.name}.")
-        self.scope = Scope(self.prof)
-        # Set only by the scope selector; __main__ reads it after the
-        # window closes to decide whether to start a replacement.
-        self.relaunch = False
+        # laid out from the one on show. Remembered between sessions like the
+        # rest of the config, and read here directly rather than in
+        # load_config, which runs at the end of this method - long after the
+        # panel exists. An old single-scope config becomes one scope.
+        cfg0 = read_config()
+        self.registry, active = ScopeRegistry.from_config(cfg0, RM_FACTORY)
+        self.active = self.registry.get(active)
+        asked = [cfg0.get("model")] + [e.get("model") for e in
+                                       cfg0.get("scopes") or []
+                                       if isinstance(e, dict)]
+        for model in asked:
+            if model and model not in scope_profiles.PROFILES:
+                self.log(f"Config asks for a scope this version does not have "
+                         f"({model}) - left out.")
+        self.grab_pending = 0     # scopes still working on the current run
+        self.grab_results = []    # (slot, wrote) for each that has finished
         self.preview_w, self.preview_h = self.prof.preview_size
         self.busy = False
         self.auto_job = None
@@ -1929,6 +1979,7 @@ class App:
         self.seq_started = 0.0
         self.seq_t0 = 0.0
         self.seq_inflight = None  # label of the run currently being captured
+        self.seq_targets = []     # the scopes a running sequence captures from
         self.stop_flag = threading.Event()   # asks a waiting capture to give up
         self.grab_wrote = False              # did the last run produce files?
         self.seq_done = 0
@@ -1954,7 +2005,7 @@ class App:
         win_h = min(960, root.winfo_screenheight() - 120)
         root.geometry(f"{win_w}x{win_h}+40+20")
 
-        pad = dict(padx=8, pady=4)
+        pad = self.pad = dict(padx=8, pady=4)
 
         # Capture controls and scope settings on the left, screenshot preview
         # and log on the right.
@@ -1965,53 +2016,15 @@ class App:
         right = ttk.Frame(body)
         right.pack(side="left", fill="both", expand=True)
 
-        # --- connection row
-        top = ttk.Frame(left)
-        top.pack(fill="x", **pad)
-        self.status = ttk.Label(top, text="Not connected", foreground="#a00")
-        self.status.pack(side="left")
-        ttk.Button(top, text="Connect", command=self.do_connect).pack(side="right")
-        ttk.Button(top, text="Load/save setups...",
-                   command=self.do_setups).pack(side="right", padx=(0, 6))
-        # Which scope this panel is for. Everything below is laid out from the
-        # profile - the settings rows, the channel list, the metadata file, the
-        # screenshot box - so this cannot be switched in place without building
-        # the whole window again. It restarts instead, which is honest and takes
-        # a second; swapping scopes is a rare, deliberate act.
-        self.model_names = {p.name: key
-                            for key, p in sorted(scope_profiles.PROFILES.items())}
-        self.model_var = tk.StringVar(value=self.prof.name)
-        self.model_box = ttk.Combobox(
-            top, textvariable=self.model_var, state="readonly", width=16,
-            values=sorted(self.model_names))
-        self.model_box.pack(side="right", padx=(0, 6))
-        self.model_box.bind("<<ComboboxSelected>>", self.on_model_picked)
-        ttk.Label(top, text="Scope:").pack(side="right", padx=(8, 3))
+        # --- the scopes: one row each, any number open at once
+        self.build_scopes(left, pad)
 
-        # --- channels
-        chf = ttk.LabelFrame(left, text="Channels")
-        chf.pack(fill="x", **pad)
+        # --- channels (the active scope's; rebuilt when another is shown)
+        self.ch_holder = ttk.Frame(left)
+        self.ch_holder.pack(fill="x")
         self.ch_vars = {}
         self.ch_names = {}
-        ttk.Label(chf, text="capture").grid(row=0, column=0, padx=(8, 4))
-        ttk.Label(chf, text="name").grid(row=0, column=1, sticky="w", padx=4)
-        ttk.Label(chf, text="CSV column").grid(row=0, column=2, sticky="w", padx=4)
-        for i, ch in enumerate(self.prof.channels):
-            v = tk.BooleanVar(value=(ch == self.prof.channels[0]))
-            ttk.Checkbutton(chf, text=f"CH{ch}", variable=v).grid(
-                row=i + 1, column=0, sticky="w", padx=(8, 4), pady=1)
-            self.ch_vars[ch] = v
-            name = tk.StringVar()
-            self.ch_names[ch] = name
-            ttk.Entry(chf, textvariable=name, width=18).grid(
-                row=i + 1, column=1, sticky="w", padx=4, pady=1)
-            # Show the header the name will actually produce, so the sanitising
-            # is never a surprise after the fact.
-            shown = tk.StringVar(value=f"CH{ch}_V")
-            ttk.Label(chf, textvariable=shown, foreground="#666").grid(
-                row=i + 1, column=2, sticky="w", padx=4, pady=1)
-            name.trace_add("write",
-                           lambda *_, c=ch, s=shown: s.set(self.column_name(c)))
+        self.build_channels(self.ch_holder, pad)
 
         # --- output folder + prefix
         of = ttk.LabelFrame(left, text="Save to")
@@ -2041,18 +2054,10 @@ class App:
 
         # The scope's own front-panel buttons, next to the one that captures:
         # these are things it does once rather than states it holds, so there is
-        # nothing to edit and nothing to apply.
-        cf = ttk.Frame(left)
-        cf.pack(fill="x", padx=8)
-        ttk.Label(cf, text="Scope:").pack(side="left", padx=(0, 4))
-        self.action_btns = []
-        for text, scpi, note, confirm, rewrites in self.prof.actions:
-            btn = ttk.Button(cf, text=text, width=max(6, len(text) + 1),
-                             state="disabled",
-                             command=lambda s=scpi, n=note, k=confirm, w=rewrites:
-                             self.do_action(s, n, k, w))
-            btn.pack(side="left", padx=(0, 4))
-            self.action_btns.append(btn)
+        # nothing to edit and nothing to apply. The active scope's.
+        self.act_holder = ttk.Frame(left)
+        self.act_holder.pack(fill="x", padx=8)
+        self.build_actions(self.act_holder)
 
         ef = ttk.Frame(left)
         ef.pack(fill="x", **pad)
@@ -2152,7 +2157,9 @@ class App:
         self.show_next_name()
 
         self.toggle_existing()
-        self.build_settings(left, pad)
+        self.set_holder = ttk.Frame(left)
+        self.set_holder.pack(fill="x")
+        self.build_settings(self.set_holder, pad)
 
         # --- the right column: a notebook of tabs, the log underneath.
         # The screenshot browser is the first tab; the rest draw and tabulate
@@ -2167,8 +2174,8 @@ class App:
         # --- last screenshot
         self.shot_frame = ttk.LabelFrame(shot_tab, text="Last screenshot")
         self.shot_frame.pack(fill="x", padx=4, pady=4)
-        box = tk.Frame(self.shot_frame, width=self.preview_w,
-                       height=self.preview_h)
+        box = self.preview_box = tk.Frame(self.shot_frame, width=self.preview_w,
+                                          height=self.preview_h)
         box.pack(padx=4, pady=4)
         box.pack_propagate(False)          # keep the box from shrinking to the label
         self.preview = ttk.Label(box, text="(no screenshot yet)", anchor="center")
@@ -2252,7 +2259,16 @@ class App:
             self.save_config()
 
     def current_cfg(self):
+        # The scope on show writes its channel boxes back to its slot first,
+        # so "scopes" carries them too.
+        self.stash_channels(self.active)
         return {
+            # Every scope, and which one is on show. The single-scope keys
+            # below (model, channel_names, channels) stay, mirroring the scope
+            # on show: the bench copy of Scope Grab reads this same file.
+            "scopes": self.registry.to_config(),
+            "active": self.active.id,
+            "grab_all": self.grab_all.get(),
             "model": self.prof.key,
             "outdir": self.outdir.get(),
             "setup_dir": self.setup_dir.get(),
@@ -2326,6 +2342,10 @@ class App:
         rec = cfg.get("record_measurements")
         if isinstance(rec, (bool, int)):
             self.rec_meas.set(bool(rec))
+        grab_all = cfg.get("grab_all")
+        if isinstance(grab_all, (bool, int)):
+            self.grab_all.set(bool(grab_all))
+            self.grab_btn.configure(text=self.grab_text())
         paths = cfg.get("cmp_paths")
         if isinstance(paths, dict):
             self.cmp_paths = {
@@ -2475,7 +2495,7 @@ class App:
             # when it was saved. The settings are that model's SCPI roots, so a
             # load onto another one is refused rather than half-applied.
             "model": self.prof.key,
-            "instrument": self.scope.idn,
+            "instrument": self.active.scope.idn,
             "read_stamp": self.read_stamp,
             "unapplied_edits": pending,
             "settings": settings,
@@ -2578,7 +2598,7 @@ class App:
         # only puts the send-it-now question over the thing being asked about.
         # A failed read keeps the window, since the next move is another file.
         self._setups_close()
-        if not self.scope.inst:
+        if not self.active.connected:
             self.log("  Not connected - once you are, press Apply changes and say "
                      "yes when it offers to send the lot.")
             return
@@ -2626,10 +2646,20 @@ class App:
             return
         self.step_shot(delta)
 
-    def safe_prefix(self):
+    def typed_prefix(self):
         p = "".join("_" if c in BAD_NAME_CHARS else c
                     for c in self.prefix.get()).strip()
         return p or "scope"
+
+    def slot_prefix(self, slot):
+        """The prefix `slot`'s files are written under (file_prefix: the typed
+        prefix, plus -<tag> for a scope with a file tag)."""
+        return file_prefix(self.typed_prefix(), safe_tag(slot.tag))
+
+    def safe_prefix(self):
+        """The prefix of the scope on show - what the screenshot browser, the
+        plot tabs, Average sequence and the next-name line look at."""
+        return self.slot_prefix(self.active)
 
     def safe_setup_prefix(self):
         p = "".join("_" if c in BAD_NAME_CHARS else c
@@ -2775,15 +2805,15 @@ class App:
         """CSV header for a channel. The channel number is kept even when named,
         so a column stays traceable to the settings in the metadata file and two
         channels sharing a name cannot collide."""
-        name = safe_column(self.ch_names[ch].get())
-        return f"CH{ch}_{name}_V" if name else f"CH{ch}_V"
+        return column_for(ch, self.ch_names[ch].get())
 
     def channels(self):
         return [ch for ch, v in self.ch_vars.items() if v.get()]
 
     def set_busy(self, busy):
         self.busy = busy
-        state = "disabled" if busy or self.seq_active or not self.scope.inst else "normal"
+        idle = not (busy or self.seq_active)
+        state = "normal" if idle and self.active.connected else "disabled"
         for btn in (self.read_btn, self.apply_btn, self.peek_btn, *self.action_btns):
             btn.configure(state=state)
         # Save and Load live in a window that is usually not open, and they only
@@ -2792,124 +2822,386 @@ class App:
         # fill the panel before it is. So they follow the busy flag alone.
         for btn in (self.setup_save_btn, self.setup_load_btn):
             if btn is not None and btn.winfo_exists():
-                btn.configure(state="disabled" if busy or self.seq_active
-                              else "normal")
-        self.avg_btn.configure(state="disabled" if busy or self.seq_active
-                               else "normal")
+                btn.configure(state="normal" if idle else "disabled")
+        self.avg_btn.configure(state="normal" if idle else "disabled")
+        can_grab = bool(self.grab_targets(quiet=True))
         # During a one-off grab the GRAB button becomes the way to call off a
         # long trigger wait. A sequence has its own Stop button instead.
         if busy and not self.seq_active:
             self.grab_btn.configure(text="Cancel wait", state="normal",
                                     command=self.cancel_grab)
         else:
-            self.grab_btn.configure(text="GRAB  (or press Space)", state=state,
-                                    command=self.do_grab)
-        # Switching scope restarts the program, so it is dead while a capture
-        # is running - that would abandon a VISA session and a half-written file.
-        self.model_box.configure(
-            state="disabled" if busy or self.seq_active else "readonly")
+            self.grab_btn.configure(text=self.grab_text(),
+                                    state="normal" if idle and can_grab
+                                    else "disabled", command=self.do_grab)
+        # Switching, connecting, adding and removing scopes wait for whatever
+        # is running: it holds a VISA session and has files half-written.
+        self.refresh_scope_rows(idle)
         # The sequence button stays live while a sequence runs, so it can stop it.
         self.seq_btn.configure(
-            state="normal" if self.scope.inst and (self.seq_active or not busy)
+            state="normal" if self.seq_active or (not busy and can_grab)
             else "disabled")
 
-    # -- actions ----------------------------------------------------------
+    # -- the scopes --------------------------------------------------------
+    #
+    # One row per configured scope, the polarimeter's hardware-box pattern:
+    # which one the panel shows, its address (blank = find it), its file tag,
+    # Connect/Disconnect, and what is connected. Any number can be open at
+    # once; each does its instrument I/O on its own thread (ScopeSlot). The
+    # panel shows one - its channels, settings and buttons - and switching
+    # rebuilds those in place. Nothing restarts.
 
-    def on_model_picked(self, _event=None):
-        """Switch the panel to another instrument, by restarting on it.
+    def build_scopes(self, left, pad):
+        f = self.scopes_frame = ttk.LabelFrame(left, text="Scopes")
+        f.pack(fill="x", **pad)
+        self.active_var = tk.StringVar(value=self.active.id)
+        self.connecting = set()       # slot ids with a connect/disconnect queued
+        self.slot_widgets = {}
+        self.scope_rows = ttk.Frame(f)
+        self.scope_rows.pack(fill="x", padx=6, pady=(2, 0))
+        self.build_scope_rows()
+        row = ttk.Frame(f)
+        row.pack(fill="x", padx=6, pady=(4, 2))
+        # Which model "Add scope" adds. Every profile in scope_profiles is
+        # offered; one model may be added more than once (it gets its own
+        # profile instance, id and file tag).
+        self.model_names = {p.name: key
+                            for key, p in sorted(scope_profiles.PROFILES.items())}
+        self.model_var = tk.StringVar(value=self.prof.name)
+        self.model_box = ttk.Combobox(
+            row, textvariable=self.model_var, state="readonly", width=16,
+            values=sorted(self.model_names))
+        self.model_box.pack(side="left")
+        self.add_btn = ttk.Button(row, text="Add scope", command=self.do_add_scope)
+        self.add_btn.pack(side="left", padx=(4, 0))
+        self.remove_btn = ttk.Button(row, text="Remove shown",
+                                     command=self.do_remove_scope)
+        self.remove_btn.pack(side="left", padx=(4, 0))
+        ttk.Button(row, text="Load/save setups...",
+                   command=self.do_setups).pack(side="right")
+        row = ttk.Frame(f)
+        row.pack(fill="x", padx=6, pady=(0, 4))
+        ttk.Label(row, text="GRAB takes:").pack(side="left")
+        # Remembered between sessions; the GRAB button's own label says
+        # which it is, so "all" is never a surprise.
+        self.grab_all = tk.BooleanVar(value=False)
+        for text, val in (("the shown scope", False), ("every connected scope", True)):
+            ttk.Radiobutton(row, text=text, variable=self.grab_all, value=val,
+                            command=self.grab_target_changed).pack(
+                side="left", padx=(6, 0))
 
-        A profile decides the settings rows, which channels exist, the metadata
-        layout and the screenshot size, so changing it means rebuilding almost
-        every widget in the window. Restarting is the version of that which
-        cannot leave a half-rebuilt panel behind, and the config is already
-        where the choice is remembered.
+    def build_scope_rows(self):
+        for w in self.scope_rows.winfo_children():
+            w.destroy()
+        self.slot_widgets = {}
+        g = self.scope_rows
+        g.columnconfigure(4, weight=1)
+        for j, text in enumerate(("shown", "address (blank = find it)", "file tag")):
+            ttk.Label(g, text=text, foreground="#666").grid(
+                row=0, column=j, sticky="w", padx=(0, 4))
+        for i, slot in enumerate(self.registry, 1):
+            rb = ttk.Radiobutton(g, text=slot.prof.name, value=slot.id,
+                                 variable=self.active_var,
+                                 command=self.on_active_picked)
+            rb.grid(row=i, column=0, sticky="w", padx=(0, 4), pady=1)
+            addr = tk.StringVar(value=slot.resource)
+            addr.trace_add("write", lambda *_, sl=slot, v=addr:
+                           setattr(sl, "resource", v.get().strip()))
+            ae = ttk.Entry(g, textvariable=addr, width=24)
+            ae.grid(row=i, column=1, sticky="w", padx=(0, 4), pady=1)
+            tag = tk.StringVar(value=slot.tag)
+            tag.trace_add("write", lambda *_, sl=slot, v=tag: self.tag_changed(sl, v))
+            te = ttk.Entry(g, textvariable=tag, width=9)
+            te.grid(row=i, column=2, sticky="w", padx=(0, 4), pady=1)
+            btn = ttk.Button(g, text="Connect", width=10,
+                             command=lambda sl=slot: self.toggle_connect(sl))
+            btn.grid(row=i, column=3, sticky="w", pady=1)
+            st = ttk.Label(g, text="not connected", foreground="#a00")
+            st.grid(row=i, column=4, sticky="w", padx=(6, 0), pady=1)
+            self.slot_widgets[slot.id] = {"radio": rb, "addr": ae, "tag": te,
+                                          "btn": btn, "status": st}
+            if slot.connected:
+                self.slot_status(slot, short_idn(slot.scope.idn), "#060")
 
-        A grab or a sequence in flight is left alone - it holds the VISA session
-        and has files half-written."""
-        wanted = self.model_names.get(self.model_var.get())
-        if wanted is None or wanted == self.prof.key:
+    def slot_status(self, slot, text, colour):
+        w = self.slot_widgets.get(slot.id)
+        if w is not None:
+            w["status"].configure(text=text, foreground=colour)
+
+    def refresh_scope_rows(self, idle=None):
+        if idle is None:
+            idle = not (self.busy or self.seq_active)
+        for slot in self.registry:
+            w = self.slot_widgets.get(slot.id)
+            if w is None:
+                continue
+            moving = slot.id in self.connecting
+            w["radio"].configure(state="normal" if idle else "disabled")
+            w["btn"].configure(text="Disconnect" if slot.connected else "Connect",
+                               state="normal" if idle and not moving else "disabled")
+            # The address is what a connect uses; editing it under an open
+            # session would only mislead.
+            w["addr"].configure(state="disabled" if slot.connected or moving
+                                else "normal")
+        self.model_box.configure(state="readonly" if idle else "disabled")
+        self.add_btn.configure(state="normal" if idle else "disabled")
+        self.remove_btn.configure(
+            state="normal" if idle and len(self.registry) > 1
+            and not self.active.connected and self.active.id not in self.connecting
+            else "disabled")
+
+    def tag_changed(self, slot, var):
+        slot.tag = safe_tag(var.get())
+        if slot is self.active:
+            self.show_next_name()
+            self.prefix_changed()         # the browser and the tabs follow it
+        self.grab_target_changed()
+
+    def grab_text(self):
+        if self.grab_all.get():
+            return "GRAB ALL  (or press Space)"
+        return "GRAB  (or press Space)"
+
+    def grab_target_changed(self):
+        if not (self.busy or self.seq_active):
+            self.grab_btn.configure(text=self.grab_text())
+        self.show_next_name()
+        self.set_busy(self.busy)
+
+    def grab_targets(self, quiet=False):
+        """The scopes a GRAB (or a sequence run) captures from: the one on show,
+        or every connected one. [] when there is nothing to grab from - said
+        in the log unless `quiet`. Refused too when two of them would write
+        under the same prefix: their files would interleave as one series."""
+        if self.grab_all.get():
+            targets = self.registry.connected()
+            if not targets and not quiet:
+                self.log("No scope is connected.")
+        else:
+            targets = [self.active] if self.active.connected else []
+            if not targets and not quiet:
+                self.log(f"{self.active.label()} is not connected.")
+        prefixes = [self.slot_prefix(t) for t in targets]
+        if len(set(prefixes)) < len(prefixes):
+            if not quiet:
+                self.log("GRAB ALL: two scopes would write under the same file "
+                         "prefix - give each its own file tag in the Scopes box.")
+            return []
+        return targets
+
+    def toggle_connect(self, slot):
+        if slot.connected:
+            self.disconnect_slot(slot)
+        else:
+            self.connect_slot(slot)
+
+    def connect_slot(self, slot):
+        """Open one scope on its own worker; the others carry on."""
+        if slot.connected or slot.id in self.connecting:
             return
-        if self.busy or self.seq_active:
-            self.model_var.set(self.prof.name)
-            self.log("Cannot switch scope while a capture is running.")
-            return
-        other = scope_profiles.PROFILES[wanted]
-        if not messagebox.askyesno(
-                "Switch scope",
-                f"Switch this panel from {self.prof.name} to {other.name}?\n\n"
-                "The settings panel, the channel list and the metadata file are "
-                "all built from the instrument, so Scope Grab has to restart to "
-                "lay them out again. It will reconnect on its own.\n\n"
-                "Your folder, prefix and channel names are kept. Anything in the "
-                "settings panel that has not been applied will be lost.",
-                parent=self.root):
-            self.model_var.set(self.prof.name)
-            return
-        # Written before the restart, because the new process reads the model
-        # out of the config file - see read_config().
-        self.prof = other
-        try:
-            self.save_config()
-        except Exception as exc:
-            self.log(f"Could not save the scope choice: {exc}")
-            self.prof = scope_profiles.get_profile(self.model_names.get(
-                self.model_box.get()))
-            return
-        self.log(f"Switching to {other.name} - restarting...")
-        self.restart()
+        self.connecting.add(slot.id)
+        self.slot_status(slot, "connecting...", "#666")
 
-    def restart(self):
-        """Ask for a relaunch and close this window.
-
-        It does NOT start the new process here. Spawning before this one has
-        finished shutting down leaves both alive for a moment, both auto-connect
-        on startup, and the second one finds the instrument already claimed by
-        the first - VI_ERROR_NCIC, which reads as "no scope found". That is not
-        hypothetical; it is what happened the first time this shipped.
-
-        So the flag is set, the window closes, mainloop returns, and __main__
-        starts the replacement once this process has nothing open."""
-        self.stop_flag.set()
-        self.stop_sequence()
-        if self.auto_job is not None:
-            self.root.after_cancel(self.auto_job)
-            self.auto_job = None
-        self.scope.close()
-        self.relaunch = True
-        self.root.destroy()
-
-    def do_connect(self):
         def work():
             try:
-                idn = self.scope.connect()
-                self.root.after(0, lambda: self.status.configure(
-                    text=idn[:70], foreground="#060"))
-                self.log(f"Connected: {idn}")
-                self.log(f"Address:   {self.scope.addr}")
-                self.root.after(0, lambda: self.set_busy(False))
-                values = self.read_all_settings()
-                self.root.after(0, lambda v=values: self.show_settings(v))
+                idn = self.registry.connect(slot)
             except Exception as exc:
-                self.root.after(0, lambda: self.status.configure(
-                    text="Not connected", foreground="#a00"))
-                self.log(f"ERROR: {exc}")
-        threading.Thread(target=work, daemon=True).start()
+                self.log(f"ERROR ({slot.label()}): {exc}")
+                self.root.after(0, lambda: self._slot_settled(slot, None))
+                return
+            self.log(f"Connected {slot.label()}: {idn}")
+            self.log(f"  address: {slot.scope.addr}")
+            values = self.read_all_settings(slot)
+            self.root.after(0, lambda: self._slot_settled(slot, idn, values))
+        slot.submit(work)
+        self.refresh_scope_rows()
+
+    def disconnect_slot(self, slot):
+        if self.busy or self.seq_active or slot.id in self.connecting:
+            return
+        self.connecting.add(slot.id)
+
+        def work():
+            self.registry.disconnect(slot)
+            self.log(f"Disconnected {slot.label()}")
+            self.root.after(0, lambda: self._slot_settled(slot, None, gone=True))
+        slot.submit(work)
+        self.refresh_scope_rows()
+
+    def _slot_settled(self, slot, idn, values=None, gone=False):
+        self.connecting.discard(slot.id)
+        if idn:
+            self.slot_status(slot, short_idn(idn), "#060")
+            if values is not None:
+                self.show_settings_for(slot, values)
+            self.save_config()            # where it was found
+        else:
+            self.slot_status(slot, "not connected", "#666" if gone else "#a00")
+        self.set_busy(self.busy)
+
+    def do_connect(self):
+        """Connect every configured scope that is not open yet, each on its own
+        worker - one that is off or held by another program is logged and the
+        others still come up. Run once on startup."""
+        for slot in self.registry:
+            self.connect_slot(slot)
+
+    def on_active_picked(self):
+        slot = self.registry.get(self.active_var.get())
+        if slot is None or slot is self.active:
+            return
+        if self.busy or self.seq_active:
+            self.active_var.set(self.active.id)
+            self.log("Cannot switch scope while a capture is running.")
+            return
+        self.switch_to(slot)
+
+    def switch_to(self, slot):
+        """Show another scope: the channels, the action buttons and the
+        settings panel are laid out from its profile, so they are rebuilt in
+        place, and what the outgoing one had in them (names, ticks, unapplied
+        edits, the last reading) is kept on its slot for when it comes back.
+        Its connection is untouched - it stays open, and GRAB ALL still takes
+        it."""
+        self.stash_panel(self.active)
+        self.active = slot
+        self.active_var.set(slot.id)
+        for holder in (self.ch_holder, self.act_holder, self.set_holder):
+            for w in holder.winfo_children():
+                w.destroy()
+        self.build_channels(self.ch_holder, self.pad)
+        self.build_actions(self.act_holder)
+        self.build_settings(self.set_holder, self.pad)
+        self.restore_panel(slot)
+        self.root.title(f"Scope Grab - {slot.prof.name}")
+        self.preview_w, self.preview_h = slot.prof.preview_size
+        self.preview_box.configure(width=self.preview_w, height=self.preview_h)
+        self.refresh_shots(newest=True)
+        self.refresh_plots()
+        self.show_next_name()
+        self.set_busy(self.busy)
+        self.log(f"Showing {slot.label()}"
+                 + ("" if slot.connected else " (not connected)"))
+        self.save_config()
+
+    def stash_channels(self, slot):
+        slot.channel_names = {str(ch): v.get() for ch, v in self.ch_names.items()}
+        slot.channels = {str(ch): bool(v.get()) for ch, v in self.ch_vars.items()}
+
+    def stash_panel(self, slot):
+        self.stash_channels(slot)
+        slot.panel = {"vars": {k: v.get() for k, v in self.set_vars.items()},
+                      "scope": dict(self.set_scope), "stamp": self.read_stamp}
+
+    def restore_panel(self, slot):
+        p = slot.panel
+        if p:
+            for scpi, val in p["scope"].items():
+                if scpi in self.set_scope:
+                    self.set_scope[scpi] = val
+            for scpi, val in p["vars"].items():
+                if scpi in self.set_vars:
+                    self.set_vars[scpi].set(val)
+            self.read_stamp = p["stamp"]
+        slot.panel = None
+        self.setting_changed()
+        # Readings that arrived for it while another scope was on show.
+        parked, slot.parked = slot.parked, []
+        for values, overwrite in parked:
+            self.show_settings(values, overwrite)
+
+    def show_settings_for(self, slot, values, overwrite=False):
+        """Main thread. A reading lands in the panel if its scope is the one on
+        show, else it waits on the slot until that scope is shown again."""
+        if slot is self.active:
+            self.show_settings(values, overwrite)
+        else:
+            slot.parked.append((values, overwrite))
+
+    def do_add_scope(self):
+        if self.busy or self.seq_active:
+            return
+        model = self.model_names.get(self.model_var.get())
+        if model is None:
+            return
+        slot = self.registry.add(model)
+        self.log(f"Added {slot.label()}"
+                 + (f" - its files are named <prefix>-{slot.tag}_..." if slot.tag
+                    else ""))
+        self.build_scope_rows()
+        self.switch_to(slot)
+        self.connect_slot(slot)
+
+    def do_remove_scope(self):
+        slot = self.active
+        if (self.busy or self.seq_active or slot.connected or len(self.registry) < 2
+                or slot.id in self.connecting):
+            return
+        other = next(s for s in self.registry if s is not slot)
+        self.switch_to(other)
+        self.registry.remove(slot.id)
+        self.build_scope_rows()
+        self.set_busy(self.busy)
+        self.log(f"Removed {slot.label()}")
+        self.save_config()
+
+    def build_channels(self, parent, pad):
+        """The Channels box, for the scope on show, filled from its slot."""
+        chf = ttk.LabelFrame(parent, text="Channels")
+        chf.pack(fill="x", **pad)
+        self.ch_vars = {}
+        self.ch_names = {}
+        ttk.Label(chf, text="capture").grid(row=0, column=0, padx=(8, 4))
+        ttk.Label(chf, text="name").grid(row=0, column=1, sticky="w", padx=4)
+        ttk.Label(chf, text="CSV column").grid(row=0, column=2, sticky="w", padx=4)
+        slot = self.active
+        for i, ch in enumerate(self.prof.channels):
+            ticked = slot.channels.get(str(ch))
+            v = tk.BooleanVar(value=bool(ticked) if isinstance(ticked, (bool, int))
+                              else ch == self.prof.channels[0])
+            ttk.Checkbutton(chf, text=f"CH{ch}", variable=v).grid(
+                row=i + 1, column=0, sticky="w", padx=(8, 4), pady=1)
+            self.ch_vars[ch] = v
+            given = slot.channel_names.get(str(ch))
+            name = tk.StringVar(value=given if isinstance(given, str) else "")
+            self.ch_names[ch] = name
+            ttk.Entry(chf, textvariable=name, width=18).grid(
+                row=i + 1, column=1, sticky="w", padx=4, pady=1)
+            # Show the header the name will actually produce, so the sanitising
+            # is never a surprise after the fact.
+            shown = tk.StringVar(value=self.column_name(ch))
+            ttk.Label(chf, textvariable=shown, foreground="#666").grid(
+                row=i + 1, column=2, sticky="w", padx=4, pady=1)
+            name.trace_add("write",
+                           lambda *_, c=ch, s=shown: s.set(self.column_name(c)))
+
+    def build_actions(self, parent):
+        ttk.Label(parent, text="Scope:").pack(side="left", padx=(0, 4))
+        self.action_btns = []
+        for text, scpi, note, confirm, rewrites in self.prof.actions:
+            btn = ttk.Button(parent, text=text, width=max(6, len(text) + 1),
+                             state="disabled",
+                             command=lambda s=scpi, n=note, k=confirm, w=rewrites:
+                             self.do_action(s, n, k, w))
+            btn.pack(side="left", padx=(0, 4))
+            self.action_btns.append(btn)
 
     def do_peek(self):
         """Show the scope's screen without writing a file. Deliberately does not
         arm, stop or run the scope: it only asks for the rendered display, so a
         test in progress is left exactly as it was."""
-        if self.busy or self.seq_active or not self.scope.inst:
+        if self.busy or self.seq_active or not self.active.connected:
             return
         self.set_busy(True)
-        threading.Thread(target=self._peek_worker, daemon=True).start()
+        self.active.submit(self._peek_worker, self.active)
 
-    def _peek_worker(self):
+    def _peek_worker(self, slot):
         try:
-            img = self.scope.screenshot()
+            img = slot.scope.screenshot()
             self.log(f"screenshot pulled into the window, nothing saved "
                      f"({len(img)} bytes)")
-            self.root.after(0, lambda d=bytes(img): self.show_peek(d))
+            if slot is self.active:
+                self.root.after(0, lambda d=bytes(img): self.show_peek(d))
         except Exception as exc:
             self.log(f"ERROR: {exc}")
         finally:
@@ -2920,18 +3212,69 @@ class App:
         # seq_active as well as busy: between a sequence's runs nothing is busy,
         # but the next run is already scheduled. GRAB is greyed out then and
         # Space is not - it calls this directly, bypassing the button - so
-        # without the guard a space bar puts a second capture thread on the same
+        # without the guard a space bar puts a second capture on the same
         # VISA session as the run that is about to start, and the two of them
         # interleave their SCPI and fight over seq_inflight and grab_wrote.
-        if self.busy or self.seq_active or not self.scope.inst:
+        if self.busy or self.seq_active:
             return
-        chans = self.channels()
-        if not chans:
-            self.log("Pick at least one channel.")
+        targets = self.grab_targets()
+        if not targets:
+            return
+        jobs = self._grab_jobs(targets)
+        if jobs is None:
             return
         self.stop_flag.clear()
         self.set_busy(True)
-        threading.Thread(target=self._grab_worker, args=(chans,), daemon=True).start()
+        self._start_grabs(jobs)
+
+    def _grab_jobs(self, targets, label=None):
+        """One job per target scope, or None (said in the log) if one of them
+        has nothing to capture. Built here, on the main thread: the workers
+        read nothing from the window, so switching what it shows cannot change
+        a capture already under way."""
+        jobs = []
+        for slot in targets:
+            job = self._grab_job(slot, label)
+            if not job["chans"]:
+                self.log("Pick at least one channel"
+                         + (f" for {slot.label()}" if len(targets) > 1 else "")
+                         + ".")
+                return None
+            job["say"] = f"[{slot.label()}] " if len(targets) > 1 else ""
+            jobs.append(job)
+        return jobs
+
+    def _grab_job(self, slot, label=None, chans=None):
+        """What one scope's capture needs from the window, as plain values."""
+        if slot is self.active:
+            ticked = {ch: v.get() for ch, v in self.ch_vars.items()}
+            typed = {ch: v.get() for ch, v in self.ch_names.items()}
+        else:
+            ticked = {int(k): bool(v) for k, v in slot.channels.items()
+                      if str(k).isdigit()}
+            typed = {int(k): v for k, v in slot.channel_names.items()
+                     if str(k).isdigit() and isinstance(v, str)}
+        if chans is None:
+            chans = [ch for ch in slot.prof.channels if ticked.get(ch)]
+        names = {ch: (typed.get(ch) or "").strip() for ch in chans}
+        return {
+            "slot": slot, "label": label, "chans": list(chans), "names": names,
+            "cols": {ch: column_for(ch, typed.get(ch) or "") for ch in chans},
+            "outdir": self.outdir.get(), "prefix": self.slot_prefix(slot),
+            "ext": "." + self.data_fmt.get().lower(),
+            "existing": self.use_existing.get(),
+            "wait_s": self.trigger_wait_s(), "points": self.transfer_points(),
+            "save_png": self.save_png.get(), "rec_meas": self.rec_meas.get(),
+            "say": "",
+        }
+
+    def _start_grabs(self, jobs):
+        """Hand each job to its scope's worker. They run side by side, one per
+        scope; the run is over when every one has reported back."""
+        self.grab_pending = len(jobs)
+        self.grab_results = []
+        for job in jobs:
+            job["slot"].submit(self._grab_worker, job=job)
 
     def toggle_existing(self):
         """The trigger wait is meaningless when we are not waiting for one."""
@@ -2966,56 +3309,65 @@ class App:
                      f"taking the whole record.")
             return None
 
-    def _grab_worker(self, chans, label=None):
-        self.grab_wrote = False
+    def _grab_worker(self, chans=None, label=None, job=None):
+        """One scope's capture, on that scope's worker. `job` is what
+        _grab_job took from the window; called without one (the tests do,
+        on the main thread) it is taken from the scope on show."""
+        if job is None:
+            job = self._grab_job(self.active, label, chans)
+        slot, label, chans = job["slot"], job["label"], job["chans"]
+        scope, prof = slot.scope, slot.prof
+        say = lambda text: self.log(job["say"] + text)
+        phase = lambda text: self.set_phase(job["say"] + text)
+        wrote = False
         try:
-            outdir = self.outdir.get()
+            outdir = job["outdir"]
             os.makedirs(outdir, exist_ok=True)
             # A sequence run is identified by its number; a one-off by the clock.
             # Either way the wall-clock time is recorded inside the .txt file.
             tag = label or datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            base = os.path.join(outdir, f"{self.safe_prefix()}_{tag}")
+            base = os.path.join(outdir, f"{job['prefix']}_{tag}")
             # Never write over a capture that is already there. A one-off's
             # timestamp only resolves to a second, so two grabs inside the same
             # second would collide; a sequence's labels are checked ahead of the
             # run by first_free(), but the folder and the prefix can both be
             # changed while one is going, so both paths come through here.
             wanted, base = base, free_base(base)
-            ext = "." + self.data_fmt.get().lower()
+            ext = job["ext"]
             if base != wanted:
-                self.log(f"  {os.path.basename(wanted)} is already there - "
-                         f"writing {os.path.basename(base)}{ext} instead")
+                say(f"  {os.path.basename(wanted)} is already there - "
+                    f"writing {os.path.basename(base)}{ext} instead")
 
-            existing = self.use_existing.get()
+            existing = job["existing"]
             # A channel the scope is not displaying has no record to hand over:
             # :WAVeform:DATA? answers +109 "No Data For Operation" and the read
             # then waits out the whole VISA timeout before failing with nothing
             # in it that names the channel. Asked of the instrument rather than
             # the panel, so a channel switched on at the front panel since the
             # last read does not get a grab refused over a stale copy.
-            dark = [ch for ch in chans if self.scope.is_displayed(ch) is False]
+            dark = [ch for ch in chans if scope.is_displayed(ch) is False]
             if dark:
                 one = len(dark) == 1
-                self.log(f"  {', '.join(f'CH{ch}' for ch in dark)} "
-                         f"{'is' if one else 'are'} switched off on the scope, so "
-                         f"there is nothing to read from {'it' if one else 'them'}"
-                         f" - nothing saved")
-                self.log("    turn the channel on under Display in the settings "
-                         "panel, or untick it under Channels")
+                say(f"  {', '.join(f'CH{ch}' for ch in dark)} "
+                    f"{'is' if one else 'are'} switched off on the scope, so "
+                    f"there is nothing to read from {'it' if one else 'them'}"
+                    f" - nothing saved")
+                say("    turn the channel on under Display in the settings "
+                    "panel, or untick it under Channels")
                 return
             # Asked even for a use-existing grab: the read further down needs to
             # know whether it is looking at an averaged record, because which
             # points modes will serve one is not the same as for a plain trace.
-            avg_want = self.scope.averaging_depth()
+            avg_want = scope.averaging_depth()
             armed_at = time.time()
             if existing:
                 # Take what is in acquisition memory now. Put the run state back
                 # afterwards so a scope that was live stays live.
-                self.set_phase("reading the trace on screen")
-                resume = self.scope.freeze()
-                self.log("  using the trace already on the scope"
-                         + (" (it was running, so it was stopped first)" if resume
-                            else " (it was already stopped)"))
+                phase("reading the trace on screen")
+                resume = scope.freeze()
+                say("  using the trace already on the scope"
+                    + (" (it was running, so it was stopped first)" if resume
+                       else " (it was already stopped)"))
             elif avg_want:
                 # The scope is averaging, and arming a single acquisition can
                 # take exactly one hit while claiming the full depth - the trap
@@ -3023,120 +3375,121 @@ class App:
                 # full average instead, restarting it so the record is entirely
                 # this grab's waveform and none of whatever played before.
                 resume = True
-                wait_s = self.trigger_wait_s()
-                self.set_phase(f"building a {avg_want}-deep average")
-                hits = self.scope.accumulate(
+                wait_s = job["wait_s"]
+                phase(f"building a {avg_want}-deep average")
+                hits = scope.accumulate(
                     avg_want, wait_s=wait_s, cancelled=self.stop_flag.is_set,
-                    progress=lambda sec: self.set_phase(
+                    progress=lambda sec: phase(
                         f"building a {avg_want}-deep average - {sec:.0f} s"),
                     channels=chans)
                 if hits is None:
-                    self.log("  cancelled while the average was building - "
-                             "nothing saved")
-                    self.scope.run()
+                    say("  cancelled while the average was building - "
+                        "nothing saved")
+                    scope.run()
                     return
                 if hits == 0:
-                    self.log(f"  no trigger within {wait_s:g} s - nothing saved")
-                    self.log("    raise 'Wait for trigger', or set it to 0 to "
-                             "wait indefinitely")
-                    self.scope.run()
+                    say(f"  no trigger within {wait_s:g} s - nothing saved")
+                    say("    raise 'Wait for trigger', or set it to 0 to "
+                        "wait indefinitely")
+                    scope.run()
                     return
                 if hits < 0:
-                    self.log("  ! the scope would not say how deep the average "
-                             "got - saving the trace it built anyway")
+                    say("  ! the scope would not say how deep the average "
+                        "got - saving the trace it built anyway")
                 elif hits < avg_want:
-                    self.log(f"  ! triggers dried up at {hits} of {avg_want} "
-                             f"averages - saving the shallow trace they left")
+                    say(f"  ! triggers dried up at {hits} of {avg_want} "
+                        f"averages - saving the shallow trace they left")
             else:
                 resume = True
-                wait_s = self.trigger_wait_s()
-                self.set_phase("waiting for trigger" + ("" if wait_s else " (no limit)"))
-                triggered = self.scope.single(wait_s=wait_s,
-                                              cancelled=self.stop_flag.is_set)
+                wait_s = job["wait_s"]
+                phase("waiting for trigger" + ("" if wait_s else " (no limit)"))
+                triggered = scope.single(wait_s=wait_s,
+                                         cancelled=self.stop_flag.is_set)
                 if triggered is None:
-                    self.log("  cancelled while waiting for a trigger - nothing saved")
-                    self.scope.run()
+                    say("  cancelled while waiting for a trigger - nothing saved")
+                    scope.run()
                     return
                 if triggered is False:
-                    self.log(f"  no trigger within {wait_s:g} s - nothing saved")
-                    self.log("    raise 'Wait for trigger', or set it to 0 to wait "
-                             "indefinitely")
-                    self.scope.run()
+                    say(f"  no trigger within {wait_s:g} s - nothing saved")
+                    say("    raise 'Wait for trigger', or set it to 0 to wait "
+                        "indefinitely")
+                    scope.run()
                     return
             t_armed = time.time() - armed_at
             # Everything that needs the instrument happens first, so the scope
             # goes live again before the slow business of writing files. It is
             # not armed during either phase - see the missed-trigger note below.
-            self.set_phase("reading from scope")
+            phase("reading from scope")
             read_at = time.time()
-            points = self.transfer_points()
-            names = {ch: self.ch_names[ch].get().strip() for ch in chans}
+            points = job["points"]
+            names = job["names"]
             # Which points mode will serve the record, and whether a
             # transfer limit still means anything at the size an averaged one
             # comes in at, are both per-instrument - see transfer_plan on the
             # profile for why this scope answers the way it does.
-            mode, points = self.scope.transfer_plan(bool(avg_want), points)
+            mode, points = scope.transfer_plan(bool(avg_want), points)
             # Kept as the scope sent them; the CSV turns them into volts at
             # write time, the NPZ stores them as they are. The time base is the
             # first channel's either way, as it always was.
             recs = {}
             for ch in chans:
-                recs[self.column_name(ch)] = self.scope.record(
+                recs[job["cols"][ch]] = scope.record(
                     ch, points_mode=mode, points=points)
 
             # One settings read per grab: the panel and the metadata file are
             # built from the same snapshot.
-            settings = self.read_all_settings()
+            settings = self.read_all_settings(slot)
             # Asked here rather than in the settings read: the waveform transfer
             # above has just succeeded, so there is certainly a record for the
             # scope to describe.
-            hits = self.scope.hit_count()
+            hits = scope.hit_count()
             if hits is not None:
-                settings[self.prof.wave_count] = hits
-            if self.rec_meas.get() and self.prof.meas_results:
+                settings[prof.wave_count] = hits
+            if job["rec_meas"] and prof.meas_results:
                 # The scope's own measurement results, for the Measurements
                 # tab. RESults? reports what is already being measured on the
                 # screen and installs nothing; it has not been tried on this
                 # scope, so it is asked with the short timeout and the device
                 # clear behind it rather than letting an unterminated reply
                 # hold a fast sequence for the full VISA timeout.
-                meas = self.scope.try_get(self.prof.meas_results)
+                meas = scope.try_get(prof.meas_results)
                 if meas:
-                    settings[self.prof.meas_results] = meas
-            self.report_averaging(settings, existing=existing)
+                    settings[prof.meas_results] = meas
+            self.report_averaging(settings, existing=existing, slot=slot,
+                                  say=say)
             # The screenshot has to be taken before :RUN, while the captured
             # trace is still the one on screen.
-            img = self.scope.screenshot() if self.save_png.get() else None
+            img = scope.screenshot() if job["save_png"] else None
             if resume:
-                self.scope.run()
+                scope.run()
             t_read = time.time() - read_at
 
-            self.set_phase("writing files")
+            phase("writing files")
             write_at = time.time()
             data_path = write_capture(
                 base, ext, recs,
-                self.scope.metadata(chans, settings, names, label, existing))
+                scope.metadata(chans, settings, names, label, existing))
             first = next(iter(recs.values()))
-            self.log(f"{os.path.basename(data_path)}  "
-                     f"({len(first)} pts x {len(recs) + 1} cols, "
-                     f"{os.path.getsize(data_path) / 1e6:.1f} MB)")
-            self.grab_wrote = True
+            say(f"{os.path.basename(data_path)}  "
+                f"({len(first)} pts x {len(recs) + 1} cols, "
+                f"{os.path.getsize(data_path) / 1e6:.1f} MB)")
+            wrote = True
 
             if img is not None:
                 png_path = base + ".png"
                 with open(png_path, "wb") as fh:
                     fh.write(img)
-                self.log(f"{os.path.basename(png_path)}  ({len(img)} bytes)")
+                say(f"{os.path.basename(png_path)}  ({len(img)} bytes)")
                 self.root.after(0, self.refresh_shots)
             # The data tabs follow a capture the way the screenshot pane does:
             # with the Runs box blank the newest run is what they draw.
             self.root.after(0, self.refresh_plots)
             t_write = time.time() - write_at
 
-            self.root.after(0, lambda v=settings: self.show_settings(v))
-            self.log(f"  {'run ' + label if label else 'grab'}: {t_armed:.1f} s armed, "
-                     f"{t_read:.1f} s reading, {t_write:.1f} s writing "
-                     f"= {t_armed + t_read + t_write:.1f} s")
+            self.root.after(0, lambda v=settings: self.show_settings_for(slot, v))
+            say(f"  {'run ' + label if label else 'grab'}: {t_armed:.1f} s armed, "
+                f"{t_read:.1f} s reading, {t_write:.1f} s writing "
+                f"= {t_armed + t_read + t_write:.1f} s")
             # Only a sequence can silently lose shots to this. On a one-off
             # grab a trigger already waiting is just a running signal.
             #
@@ -3150,18 +3503,35 @@ class App:
                 # The scope cannot be armed while it is being read out, so a
                 # trigger that is already pending the moment it re-arms means
                 # earlier ones came and went unrecorded.
-                self.log("  ! a trigger was already waiting when the scope armed:")
-                self.log("    triggers are arriving faster than a run takes, so some "
-                         "are being missed")
-                self.log("    lower 'Transfer points', or leave more than "
-                         f"{t_read + t_write:.0f} s between triggers")
+                say("  ! a trigger was already waiting when the scope armed:")
+                say("    triggers are arriving faster than a run takes, so some "
+                    "are being missed")
+                say("    lower 'Transfer points', or leave more than "
+                    f"{t_read + t_write:.0f} s between triggers")
             self.root.after(0, self.save_config)
         except Exception as exc:
-            self.log(f"ERROR: {exc}")
+            say(f"ERROR: {exc}")
         finally:
-            self.root.after(0, self.grab_done)
+            self.root.after(0, lambda: self._grab_one_done(slot, wrote))
 
-    def report_averaging(self, settings, existing=False):
+    def _grab_one_done(self, slot, wrote):
+        """Main thread: one scope's part of a run has finished. The run is done
+        when every scope in it has; it counts as written only if every one of
+        them wrote, so a sequence stops on a run that is missing a scope."""
+        self.grab_results.append((slot, wrote))
+        self.grab_pending -= 1
+        if self.grab_pending > 0:
+            return
+        results, self.grab_results = self.grab_results, []
+        self.grab_pending = 0
+        self.grab_wrote = bool(results) and all(w for _, w in results)
+        if len(results) > 1 and any(w for _, w in results):
+            missed = [s.label() for s, w in results if not w]
+            if missed:
+                self.log(f"  {', '.join(missed)} saved nothing in this run")
+        self.grab_done()
+
+    def report_averaging(self, settings, existing=False, slot=None, say=None):
         """Record how deep the average in this trace actually is.
 
         Averaging is the one setting where what was asked for and what the trace
@@ -3181,25 +3551,27 @@ class App:
         The warning below states that as fact. It was measured on the MSO-X and
         is exactly the sort of thing a second scope may do differently, so it
         moves onto the profile once there is one to compare against."""
-        if not self.scope.averaging(settings.get(self.prof.acq_type, "")):
+        slot = slot or self.active
+        say = say or self.log
+        if not slot.scope.averaging(settings.get(slot.prof.acq_type, "")):
             return
         try:
-            got = int(float(settings[self.prof.wave_count]))
-            want = int(float(settings[self.prof.acq_count]))
+            got = int(float(settings[slot.prof.wave_count]))
+            want = int(float(settings[slot.prof.acq_count]))
         except (KeyError, TypeError, ValueError):
-            self.log("  averaging: the scope would not say how many hits are in "
+            say("  averaging: the scope would not say how many hits are in "
                      "this trace")
             return
         if not existing:
-            self.log(f"  averaging: {got} hits" if got >= want
+            say(f"  averaging: {got} hits" if got >= want
                      else f"  averaging: {got} of {want} hits in this trace")
             return
-        self.log(f"  ! averaging: the scope reports {got} of {want} hits")
-        self.log("    this trace was not built by this grab, so that count is "
+        say(f"  ! averaging: the scope reports {got} of {want} hits")
+        say("    this trace was not built by this grab, so that count is "
                  "not to be trusted: if the scope was running, it is the "
                  "setting rather than the depth, and the record carries an "
                  "exponential average of whatever played before")
-        self.log("    untick 'take the trace already on the scope' to have the "
+        say("    untick 'take the trace already on the scope' to have the "
                  "average built and counted out instead")
 
     # -- plots ------------------------------------------------------------
@@ -4218,14 +4590,16 @@ class App:
             self.log(f"  (panel: kept {kept} unapplied edit(s), scope value differs)")
         self.setting_changed()
 
-    def read_all_settings(self):
-        """Instrument thread only. Returns the scope's own replies, unrounded, as
-        {scpi root: reply} - show_settings formats them for display and
-        Scope.metadata writes them verbatim."""
+    def read_all_settings(self, slot=None):
+        """Instrument thread only (`slot`'s worker; the scope on show if not
+        given). Returns the scope's own replies, unrounded, as {scpi root:
+        reply} for every root its settings panel shows - show_settings formats
+        them for display and Scope.metadata writes them verbatim."""
+        slot = slot or self.active
         values = {}
-        for scpi in self.set_kinds:
+        for scpi in setting_roots(slot.prof):
             try:
-                values[scpi] = self.scope.get(scpi)
+                values[scpi] = slot.scope.get(scpi)
             except Exception as exc:
                 self.log(f"  {scpi}? failed: {exc}")
         return values
@@ -4238,7 +4612,7 @@ class App:
         through typing a change, and wrong when the edit is stale and what you
         want is the instrument's own state, which is the usual reason for
         pressing this. So it asks, rather than picking one for you."""
-        if self.busy or self.seq_active or not self.scope.inst:
+        if self.busy or self.seq_active or not self.active.connected:
             return
         pending = [scpi for scpi in self.set_marks if self.edited(scpi)]
         overwrite = False
@@ -4254,8 +4628,7 @@ class App:
             if not overwrite:
                 self.log(f"Read from scope: keeping {len(pending)} unapplied edit(s).")
         self.set_busy(True)
-        threading.Thread(target=self._settings_worker, args=(None, overwrite),
-                         daemon=True).start()
+        self.active.submit(self._settings_worker, None, overwrite, self.active)
 
     def do_apply_settings(self):
         """Write the fields edited in this window.
@@ -4267,7 +4640,7 @@ class App:
         would reach for does nothing. Rather than a second button for the case,
         an empty Apply asks whether to send the panel as it stands - which is
         almost always why it was pressed with nothing marked."""
-        if self.busy or self.seq_active or not self.scope.inst:
+        if self.busy or self.seq_active or not self.active.connected:
             return
         # Info rows are excluded the way panel_settings() and a saved setup
         # exclude them: they are results rather than knobs, and writing one back
@@ -4278,7 +4651,7 @@ class App:
             self.offer_send_all()
             return
         self.set_busy(True)
-        threading.Thread(target=self._settings_worker, args=(changes,), daemon=True).start()
+        self.active.submit(self._settings_worker, changes, False, self.active)
 
     def offer_send_all(self):
         """Apply found nothing marked. Offer to write the whole panel instead."""
@@ -4308,7 +4681,7 @@ class App:
         knobs have been turned used to mean Read from scope - which overwrites
         the panel with the state you are trying to leave - then re-typing the
         old value from memory."""
-        if self.busy or self.seq_active or not self.scope.inst:
+        if self.busy or self.seq_active or not self.active.connected:
             return
         changes = self.panel_settings()
         if not changes:
@@ -4316,15 +4689,16 @@ class App:
             return
         self.log(f"Sending all {len(changes)} panel setting(s) to the scope:")
         self.set_busy(True)
-        threading.Thread(target=self._settings_worker, args=(changes,), daemon=True).start()
+        self.active.submit(self._settings_worker, changes, False, self.active)
 
-    def _settings_worker(self, changes, overwrite=False):
+    def _settings_worker(self, changes, overwrite=False, slot=None):
+        slot = slot or self.active
         try:
             if changes:
                 # A mode has to be in place before the fields it governs, or the
                 # scope takes the write and quietly does nothing with it. Sorting
                 # is stable, so everything else keeps panel order.
-                first = self.prof.write_first
+                first = slot.prof.write_first
                 ordered = sorted(changes.items(),
                                  key=lambda kv: first.index(kv[0])
                                  if kv[0] in first else len(first))
@@ -4335,25 +4709,26 @@ class App:
                         except ValueError:
                             self.log(f"  {scpi} <- '{value}' is not a number, skipped")
                             continue
-                    self.scope.put(scpi, value)
+                    slot.scope.put(scpi, value)
                     self.log(f"  {scpi} <- {value}")
-                for err in self.scope.errors():
+                for err in slot.scope.errors():
                     self.log(f"  scope rejected something: {err}")
             # Read back either way: after a write the scope is the authority on
             # what it actually accepted, since it clamps values it dislikes.
-            values = self.read_all_settings()
+            values = self.read_all_settings(slot)
             # After a write the scope is the authority on what it accepted, so
             # that always overwrites. A plain read only does when asked to.
             wins = overwrite or bool(changes)
             self.root.after(0,
-                            lambda v=values: self.show_settings(v, overwrite=wins))
+                            lambda v=values: self.show_settings_for(slot, v, wins))
             if changes:
                 # Show what the change did. The display needs a sweep to redraw
                 # after something like a timebase change, so give it a moment.
                 time.sleep(0.4)
                 try:
-                    img = self.scope.screenshot()
-                    self.root.after(0, lambda d=bytes(img): self.show_peek(d))
+                    img = slot.scope.screenshot()
+                    if slot is self.active:
+                        self.root.after(0, lambda d=bytes(img): self.show_peek(d))
                 except Exception as exc:
                     self.log(f"  (screenshot after applying failed: {exc})")
         except Exception as exc:
@@ -4367,30 +4742,31 @@ class App:
         clear display, autoscale. `rewrites` says the command changes the
         settings rather than just the run state, which decides whether the
         re-read afterwards may overwrite an unapplied edit."""
-        if self.busy or self.seq_active or not self.scope.inst:
+        if self.busy or self.seq_active or not self.active.connected:
             return
         if confirm and not messagebox.askyesno("Scope Grab", confirm, parent=self.root):
             self.log(f"  {scpi} cancelled")
             return
         self.set_busy(True)
-        threading.Thread(target=self._action_worker, args=(scpi, note, rewrites),
-                         daemon=True).start()
+        self.active.submit(self._action_worker, scpi, note, rewrites, self.active)
 
-    def _action_worker(self, scpi, note, rewrites=False):
+    def _action_worker(self, scpi, note, rewrites=False, slot=None):
+        slot = slot or self.active
         try:
-            self.scope.command(scpi)
+            slot.scope.command(scpi)
             self.log(f"{scpi} - {note}")
-            for err in self.scope.errors():
+            for err in slot.scope.errors():
                 self.log(f"  scope rejected it: {err}")
-            values = self.read_all_settings()
+            values = self.read_all_settings(slot)
             # Autoscale and its like rewrite the settings, so they are the ones
             # allowed to overwrite pending edits in the panel; the rest leave an
             # unapplied edit where it is.
-            self.root.after(0, lambda v=values: self.show_settings(v, overwrite=rewrites))
+            self.root.after(0, lambda v=values: self.show_settings_for(slot, v, rewrites))
             # Same as after an Apply: show what it did, without saving anything.
             time.sleep(0.4)
-            img = self.scope.screenshot()
-            self.root.after(0, lambda d=bytes(img): self.show_peek(d))
+            img = slot.scope.screenshot()
+            if slot is self.active:
+                self.root.after(0, lambda d=bytes(img): self.show_peek(d))
         except Exception as exc:
             self.log(f"ERROR: {exc}")
         finally:
@@ -4485,7 +4861,7 @@ class App:
         if self.seq_active:
             self.stop_sequence(aborted=True)
             return
-        if self.busy or not self.scope.inst:
+        if self.busy:
             return
         try:
             count = int(self.seq_count.get())
@@ -4497,9 +4873,8 @@ class App:
         if count < 1 or start < 1:
             self.log("Sequence: runs and first label must be at least 1.")
             return
-        chans = self.channels()
-        if not chans:
-            self.log("Pick at least one channel.")
+        targets = self.grab_targets()
+        if not targets or self._grab_jobs(targets) is None:
             return
         if self.use_existing.get():
             # Nothing re-arms, so acquisition memory never changes: every run
@@ -4515,7 +4890,7 @@ class App:
             self.log("Sequence: switched auto-grab off.")
 
         self.seq_width = max(3, len(str(start + count - 1)))
-        first = self.first_free(start, self.seq_width, count)
+        first = self.first_free(start, self.seq_width, count, targets)
         if first != start:
             # Naming the labels rather than the whole filename keeps this on one
             # line whatever the prefix is.
@@ -4526,6 +4901,7 @@ class App:
         self.seq_first = first
         self.seq_last = first + count - 1
         self.seq_gap = max(0.0, gap)
+        self.seq_targets = targets
         self.seq_dither_plan = {}
         if self.seq_dither.get():
             try:
@@ -4536,16 +4912,26 @@ class App:
             if count < 2:
                 self.log("Sequence: a dither needs at least two runs to average.")
                 return
-            try:
-                self.seq_dither_plan = self.scope.dither_plan(chans, codes)
-            except DitherError as err:
-                self.log(f"Sequence: could not read CH{err.ch}'s scale/offset "
-                         f"for the dither ({err.exc}) - running without it")
-                self.seq_dither_plan = {}
-            if self.seq_dither_plan:
-                self.log("Sequence: dithering " + ", ".join(
+            # One plan per scope, read on that scope's worker. Nothing else is
+            # running (not busy), so this waits only for the read itself.
+            for slot in targets:
+                say = f"{slot.label()}: " if len(targets) > 1 else ""
+                chans = self._grab_job(slot)["chans"]
+                try:
+                    plan = slot.submit(slot.scope.dither_plan, chans,
+                                       codes).result(timeout=30)
+                except DitherError as err:
+                    self.log(f"Sequence: {say}could not read CH{err.ch}'s "
+                             f"scale/offset for the dither ({err.exc}) - "
+                             f"running without it")
+                    continue
+                except Exception as exc:
+                    self.log(f"Sequence: {say}no dither ({exc})")
+                    continue
+                self.seq_dither_plan[slot.id] = plan
+                self.log(f"Sequence: {say}dithering " + ", ".join(
                     f"CH{ch} over {span*1e3:.0f} mV ({codes} code{'s' if codes > 1 else ''})"
-                    for ch, (_, span) in self.seq_dither_plan.items())
+                    for ch, (_, span) in plan.items())
                     + f" across the {count} runs; offsets restored at the end")
         self.seq_done = 0
         self.seq_t0 = time.time()
@@ -4554,22 +4940,24 @@ class App:
         self.seq_btn.configure(text="Stop sequence")
         self.log(f"Sequence: {count} runs labelled "
                  f"{first:0{self.seq_width}d}-{self.seq_last:0{self.seq_width}d}, "
-                 f"{self.seq_gap:g} s apart")
+                 f"{self.seq_gap:g} s apart"
+                 + (f", on {len(targets)} scopes" if len(targets) > 1 else ""))
         self.run_sequence_step()
 
-    def first_free(self, start, width, count=1):
-        """First label from which `count` consecutive captures are all free, so a
-        repeated sequence adds to the series instead of overwriting it. This,
-        rather than winding the First label box on, is what stacks one sequence
-        on the next.
+    def first_free(self, start, width, count=1, targets=None):
+        """First label from which `count` consecutive captures are all free -
+        for every scope the run will capture from - so a repeated sequence
+        adds to the series instead of overwriting it. This, rather than winding
+        the First label box on, is what stacks one sequence on the next.
 
         The whole run has to be clear, not just its first label. Stopping at the
         first gap is what this used to do, and a series with a hole in it - one
         bad run deleted - then started in the hole and wrote straight over
         everything after it."""
-        outdir, prefix = self.outdir.get(), self.safe_prefix()
-        taken = lambda i: capture_exists(
-            os.path.join(outdir, f"{prefix}_{i:0{width}d}"))
+        outdir = self.outdir.get()
+        prefixes = self.target_prefixes(targets)
+        taken = lambda i: any(capture_exists(
+            os.path.join(outdir, f"{prefix}_{i:0{width}d}")) for prefix in prefixes)
         i = start
         while True:
             clash = next((j for j in range(i, i + max(1, count)) if taken(j)), None)
@@ -4577,26 +4965,54 @@ class App:
                 return i
             i = clash + 1
 
+    def target_prefixes(self, targets=None):
+        """The file prefixes a grab would write under: the given scopes', else
+        those GRAB would take now, else the one on show."""
+        if targets is None:
+            targets = self.grab_targets(quiet=True) or [self.active]
+        return [self.slot_prefix(t) for t in targets]
+
     def run_sequence_step(self):
         self.seq_job = None
         if not self.seq_active:
             return
         label = f"{self.seq_index:0{self.seq_width}d}"
+        lost = [s.label() for s in self.seq_targets if not s.connected]
+        jobs = None if lost else self._grab_jobs(self.seq_targets, label)
+        if jobs is None:
+            if lost:
+                self.log(f"Sequence stopped at {label}: {', '.join(lost)} "
+                         f"is no longer connected.")
+            self.stop_sequence(aborted=True)
+            return
         self.seq_inflight = label
         self.seq_status.configure(
             text=f"run {label} of {self.seq_last:0{self.seq_width}d}", foreground="#060")
         self.seq_started = time.time()
-        if self.seq_dither_plan:
-            # evenly spaced across the span, centred on the original offset;
-            # the preamble's yorigin carries it, so the CSV volts are true
-            failed = self.scope.dither_step(
-                self.seq_dither_plan, self.seq_index - self.seq_first,
-                self.seq_last - self.seq_first + 1)
-            for ch, exc in failed.items():
-                self.log(f"  dither: could not set CH{ch} offset ({exc})")
+        for slot in self.seq_targets:
+            plan = self.seq_dither_plan.get(slot.id)
+            if plan:
+                # evenly spaced across the span, centred on the original
+                # offset; the preamble's yorigin carries it, so the volts are
+                # true. Queued on the scope's worker, so it lands before this
+                # run's grab and never during another's transfer.
+                slot.submit(self._dither_step_job, slot, plan,
+                            self.seq_index - self.seq_first,
+                            self.seq_last - self.seq_first + 1)
         self.set_busy(True)
-        threading.Thread(target=self._grab_worker, args=(self.channels(), label),
-                         daemon=True).start()
+        self._start_grabs(jobs)
+
+    def _dither_step_job(self, slot, plan, k, count):
+        for ch, exc in slot.scope.dither_step(plan, k, count).items():
+            self.log(f"  dither: could not set {slot.label()} CH{ch} offset ({exc})")
+
+    def _restore_job(self, slot, plan):
+        failed = slot.scope.restore_offsets(plan)
+        for ch, exc in failed.items():
+            self.log(f"  dither: could not restore {slot.label()} CH{ch} offset "
+                     f"{plan[ch][0]:+.5g} V ({exc})")
+        self.log(f"  dither: {slot.label()} offsets restored"
+                 + (" except the above" if failed else ""))
 
     def grab_done(self):
         """Every grab ends here, whether one-off or part of a sequence."""
@@ -4636,14 +5052,14 @@ class App:
             self.root.after_cancel(self.seq_job)
             self.seq_job = None
         self.seq_active = False
-        if self.seq_dither_plan:
-            failed = self.scope.restore_offsets(self.seq_dither_plan)
-            for ch, exc in failed.items():
-                off0 = self.seq_dither_plan[ch][0]
-                self.log(f"  dither: could not restore CH{ch} offset "
-                         f"{off0:+.5g} V ({exc})")
-            self.log("  dither: offsets restored")
-            self.seq_dither_plan = {}
+        # Queued on each scope's worker: a run still in flight there finishes
+        # its transfer first, and only then do the offsets go back. (They used
+        # to be written from this thread, straight across that transfer.)
+        for slot_id, plan in self.seq_dither_plan.items():
+            slot = self.registry.get(slot_id)
+            if slot is not None and plan:
+                slot.submit(self._restore_job, slot, plan)
+        self.seq_dither_plan = {}
         self.seq_btn.configure(text="Start sequence")
         self.seq_status.configure(
             text=f"stopped after {self.seq_done}" if aborted else f"done ({self.seq_done} runs)",
@@ -4687,7 +5103,7 @@ class App:
         # not in a position to run, so an interval shorter than a capture takes
         # was dropping most of the ticks with nothing but the gaps in the series
         # to show for it.
-        if not self.scope.inst:
+        if not self.grab_targets(quiet=True):
             self.log("Auto-grab: not connected, so this tick captured nothing.")
         elif self.busy or self.seq_active:
             self.log(f"Auto-grab: the last grab is still going, so this tick is "
@@ -4702,33 +5118,13 @@ class App:
         self.save_config()
         self.auto.set(False)
         self.toggle_auto()
-        self.scope.close()
+        # Every scope, then the shared RM. A worker stuck in a transfer gets a
+        # few seconds to finish before its session is closed under it.
+        self.registry.close(timeout=3.0)
         self.root.destroy()
-
-
-def relaunch_now():
-    """Start a fresh Scope Grab. Called after mainloop has returned, so this
-    process is holding no VISA session by the time the new one scans.
-
-    pythonw rather than sys.executable: that is python.exe when the app was
-    started from a console, and relaunching through it would leave a console
-    window behind that was not there before."""
-    exe = sys.executable
-    gui = os.path.join(os.path.dirname(exe), "pythonw.exe")
-    if os.path.exists(gui):
-        exe = gui
-    os.spawnv(os.P_NOWAIT, exe, [f'"{exe}"', f'"{os.path.abspath(__file__)}"'])
 
 
 if __name__ == "__main__":
     root = tk.Tk()
     app = App(root)
     root.mainloop()
-    # Switching scope rebuilds the whole window, which is done by starting
-    # again rather than rebuilding in place. Here, not in restart(), so the old
-    # process has released its VISA sessions before the new one looks for them.
-    if getattr(app, "relaunch", False):
-        try:
-            relaunch_now()
-        except Exception as exc:
-            print(f"could not restart Scope Grab: {exc}", file=sys.stderr)

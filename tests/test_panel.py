@@ -140,21 +140,12 @@ def panel_checks(prof):
               str(app.model_box.cget("values")))
         check("it shows the profile in force", app.model_var.get() == prof.name)
         check("names map back to keys", app.model_names[prof.name] == prof.key)
-        # Re-picking what is already selected must not offer to restart.
-        restarted = []
-        app.restart = lambda: restarted.append(True)
-        app.on_model_picked()
-        check("picking the current scope does nothing", not restarted)
-        # Nor may it act mid-capture: that would abandon a VISA session
-        # and a half-written file. It must refuse and put the box back.
-        others = [n for n in app.model_names if n != prof.name]
-        if others:
-            app.busy = True
-            app.model_var.set(others[0])
-            app.on_model_picked()
-            check("refuses to switch during a capture", not restarted)
-            check("and puts the box back", app.model_var.get() == prof.name)
-            app.busy = False
+        # Switching scopes in place, several at once, is tests/test_multi.py.
+        check("nothing restarts any more",
+              not hasattr(app, "restart") and not hasattr(scope_grab, "relaunch_now"))
+        check("one scope configured, and it is the one on show",
+              [s.id for s in app.registry] == [prof.key]
+              and app.active_var.get() == prof.key)
         app.set_busy(True)
         check("selector greys out while busy",
               str(app.model_box.cget("state")) == "disabled")
