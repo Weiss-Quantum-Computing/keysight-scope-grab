@@ -11,7 +11,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 SUITES = ["test_output.py", "test_panel.py", "test_capture_files.py",
           "test_probe.py", "test_path_import.py", "test_headless.py",
-          "test_consumer_api.py"]
+          "test_consumer_api.py", "test_registry.py"]
 
 
 def main():

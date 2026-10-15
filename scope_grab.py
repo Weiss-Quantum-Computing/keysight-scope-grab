@@ -17,6 +17,7 @@ Run with:  pythonw scope_grab.py      (pythonw = no console window)
 """
 
 import base64
+import concurrent.futures
 import csv
 import datetime
 import io
@@ -1041,9 +1042,16 @@ class Scope:
     here is the same whichever one is plugged in. Nothing above this class knows
     a SCPI string."""
 
-    def __init__(self, prof):
+    def __init__(self, prof, rm_source=None):
         self.prof = prof
         self.rm = None
+        # A ResourceManager lent by whoever owns it - the panel's registry of
+        # scopes - as a callable returning it. A borrowed RM is never closed
+        # here: pyvisa hands every default caller the same cached one, so
+        # closing it would end every other instrument's session too. Without
+        # one, this Scope makes its own and closes it, as it always did.
+        self._rm_source = rm_source
+        self._rm_borrowed = False
         self.inst = None
         self.idn = ""
         self.addr = ""
@@ -1055,6 +1063,8 @@ class Scope:
         self.averaged_depth = None
 
     def _make_rm(self):
+        if self._rm_source is not None:
+            return self._rm_source()
         # A profile may name a VISA implementation to prefer, so a
         # primary/secondary mixup between two of them cannot break us.
         dll = self.prof.visa_dll
@@ -1067,20 +1077,35 @@ class Scope:
                 pass
         return pyvisa.ResourceManager()
 
-    def connect(self, addr=None):
+    def connect(self, addr=None, skip=(), prefer=None):
         """Find and open the instrument this profile describes.
 
         A device that answers but is not this profile's is not silently passed
         over: its *IDN? is kept, and if it turns out to be a scope one of the
         other profiles would have handled, the error says so. Having the wrong
-        model selected otherwise looks exactly like an unplugged cable."""
+        model selected otherwise looks exactly like an unplugged cable.
+
+        `skip` names resources a scan must not open - the ones another scope
+        in this program already has open, which a scan would otherwise *IDN?
+        in the middle of whatever that scope is doing. `prefer` is tried first
+        (where this scope was found last time)."""
         self.close()
+        skip = {r.strip().upper() for r in skip if r}
+        if addr and addr.strip().upper() in skip:
+            raise RuntimeError(f"{addr} is already open on another scope in "
+                               f"this window.")
         self.rm = self._make_rm()
+        self._rm_borrowed = self._rm_source is not None
         if addr:
             candidates = [addr]
         else:
             candidates = [r for r in self.rm.list_resources()
-                          if r.startswith(tuple(self.prof.resource_hints))]
+                          if r.startswith(tuple(self.prof.resource_hints))
+                          and r.strip().upper() not in skip]
+            if prefer:
+                first = [r for r in candidates
+                         if r.strip().upper() == prefer.strip().upper()]
+                candidates = first + [r for r in candidates if r not in first]
         seen, refused = [], []
         for res in candidates:
             dev = None
@@ -1115,11 +1140,14 @@ class Scope:
         # Nothing matched, so nothing owns this resource manager any more.
         # Leaving it open holds a VISA session for the life of the program and
         # is half of how a second copy of this program locks the first out.
-        try:
-            self.rm.close()
-        except Exception:
-            pass
+        # Unless it was lent: then the other scopes are still using it.
+        if not self._rm_borrowed:
+            try:
+                self.rm.close()
+            except Exception:
+                pass
         self.rm = None
+        self._rm_borrowed = False
         raise RuntimeError(self._nothing_found(seen, refused))
 
     def _nothing_found(self, seen, refused=()):
@@ -1176,8 +1204,10 @@ class Scope:
         msg = (f"No {self.prof.name} found. Check the rear-panel USB-B cable and "
                f"that Connection Expert sees the scope.")
         for idn in seen:
+            # By key, not identity: a scope may hold its own instance of a
+            # profile (two of one model in the registry).
             other = next((p for p in scope_profiles.PROFILES.values()
-                          if p is not self.prof and p.matches(idn)), None)
+                          if p.key != self.prof.key and p.matches(idn)), None)
             if other is not None:
                 return (f"{msg}\n\nA {other.name} answered instead:\n{idn}\n\n"
                         f"That is a scope this program handles - it is the panel "
@@ -1190,13 +1220,14 @@ class Scope:
         return msg
 
     def close(self):
-        for obj in (self.inst, self.rm):
+        for obj in (self.inst, None if self._rm_borrowed else self.rm):
             try:
                 if obj is not None:
                     obj.close()
             except Exception:
                 pass
         self.inst = self.rm = None
+        self._rm_borrowed = False
         # Cleared with the session: a saved setup stamps itself with scope.idn,
         # and holding the last instrument's name after it has gone would put it
         # on a setup saved with nothing plugged in.
@@ -1525,6 +1556,330 @@ class Scope:
             self.inst.write(self.prof.cmd_run)
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Several scopes at once
+#
+# The panel used to hold one Scope and restart itself to talk to another. It
+# now keeps a registry: every configured scope is a slot with its own Scope,
+# its own worker thread and its own lock, and any number of them can be open
+# at once. Headless callers can use the same classes - nothing here needs Tk.
+#
+# Three things bit the programs that already drive several instruments from
+# one process (EOM-ILC's ilc_bench, the polarimeter's rampol/hw), and the
+# registry is built around them:
+#
+# * pyvisa hands every default ResourceManager() caller the SAME cached RM,
+#   and a Scope closes the RM it thinks it made - so one scope's close() (or a
+#   failed connect) kills the other's session. The registry owns one RM, hands
+#   it to every slot's Scope as a borrowed one, and is the only thing that
+#   ever closes it. Default VISA, as EOM-ILC measured (the MSO-X profile's
+#   ktvisa32 preference half-loads once NI's visa32 is in the process).
+# * The profiles' resource hints overlap (the MSO-X scans USB, the DS1054Z USB
+#   and TCPIP), so a scan for the second scope would *IDN? the first one's
+#   open session, possibly in the middle of a waveform transfer. A scan skips
+#   every resource another slot holds, and scans never run two at once.
+# * Two actions on one instrument from two threads interleave their SCPI. Each
+#   slot runs its jobs on ONE thread, in the order they were submitted (the
+#   polarimeter's _bg_awg lesson: a thread per click let a Park that started
+#   first finish last), each under the slot's lock.
+# ---------------------------------------------------------------------------
+
+def _norm_res(res):
+    return (res or "").strip().upper()
+
+
+class ScopeSlot:
+    """One configured scope: its profile, its Scope, where to find it, what
+    its files are called, and the one thread its instrument I/O runs on.
+
+    `resource` is the address typed for it (blank = find it by scanning);
+    `last_addr` where it was found last time, tried first in a scan; `tag`
+    goes into its file names (see file_prefix). `channel_names`/`channels`
+    are its channel boxes ({"1": name}, {"1": ticked}), kept here so each
+    scope remembers its own. `panel` holds the panel's view of it while
+    another scope is on show; `parked` settings reads that arrived then."""
+
+    def __init__(self, slot_id, prof, rm_source=None, resource="", tag="",
+                 last_addr="", channel_names=None, channels=None):
+        self.id = slot_id
+        self.prof = prof
+        self.scope = Scope(prof, rm_source=rm_source)
+        self.resource = resource or ""
+        self.last_addr = last_addr or ""
+        self.tag = tag or ""
+        self.channel_names = dict(channel_names or {})
+        self.channels = dict(channels or {})
+        self.panel = None
+        self.parked = []
+        self.lock = threading.RLock()
+        self._jobs = queue.Queue()
+        self._thread = None
+        self._tlock = threading.Lock()
+        self.pending = 0
+
+    @property
+    def connected(self):
+        return self.scope.inst is not None
+
+    @property
+    def busy(self):
+        """Jobs submitted and not finished yet (including the running one)."""
+        return self.pending > 0
+
+    def label(self):
+        return self.prof.name + (f" [{self.tag}]" if self.tag else "")
+
+    def submit(self, fn, *args, **kwargs):
+        """Run fn(*args, **kwargs) on this scope's worker thread, after every
+        job submitted before it, holding self.lock. Returns a
+        concurrent.futures.Future with its result or exception."""
+        fut = concurrent.futures.Future()
+        with self._tlock:
+            self.pending += 1
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(
+                    target=self._loop, daemon=True, name=f"scope-{self.id}")
+                self._thread.start()
+        self._jobs.put((fut, fn, args, kwargs))
+        return fut
+
+    def _loop(self):
+        while True:
+            job = self._jobs.get()
+            if job is None:
+                return
+            fut, fn, args, kwargs = job
+            try:
+                if fut.set_running_or_notify_cancel():
+                    with self.lock:
+                        result = fn(*args, **kwargs)
+                    fut.set_result(result)
+            except BaseException as exc:      # noqa: BLE001 - handed to the caller
+                fut.set_exception(exc)
+            finally:
+                with self._tlock:
+                    self.pending -= 1
+
+    def stop(self):
+        """Let the worker finish what it has and end."""
+        with self._tlock:
+            if self._thread is not None and self._thread.is_alive():
+                self._jobs.put(None)
+            self._thread = None
+
+    def config(self):
+        return {"id": self.id, "model": self.prof.key,
+                "resource": self.resource, "last_addr": self.last_addr,
+                "tag": self.tag, "channel_names": dict(self.channel_names),
+                "channels": dict(self.channels)}
+
+
+def migrate_config(cfg):
+    """(slot dicts, active id) from a session config of either vintage.
+
+    A config written before several scopes existed has the model, the channel
+    names and the ticks at the top level: it becomes one slot, with no file
+    tag, so its captures keep the names they always had. Entries naming a
+    model this version does not have are dropped (the panel says so)."""
+    cfg = cfg if isinstance(cfg, dict) else {}
+    out, ids = [], set()
+    for entry in cfg.get("scopes") or []:
+        if not isinstance(entry, dict):
+            continue
+        model = entry.get("model")
+        if model not in scope_profiles.PROFILES:
+            continue
+        sid = entry.get("id") if isinstance(entry.get("id"), str) else model
+        sid = sid.strip() or model
+        while sid in ids:
+            sid += "+"
+        ids.add(sid)
+        s = lambda k: entry.get(k) if isinstance(entry.get(k), str) else ""
+        d = lambda k: entry.get(k) if isinstance(entry.get(k), dict) else {}
+        out.append({"id": sid, "model": model, "resource": s("resource"),
+                    "last_addr": s("last_addr"), "tag": safe_tag(s("tag")),
+                    "channel_names": d("channel_names"), "channels": d("channels")})
+    if not out:
+        model = cfg.get("model")
+        if model not in scope_profiles.PROFILES:
+            model = scope_profiles.DEFAULT_PROFILE
+        d = lambda k: cfg.get(k) if isinstance(cfg.get(k), dict) else {}
+        out = [{"id": model, "model": model, "resource": "", "last_addr": "",
+                "tag": "", "channel_names": d("channel_names"),
+                "channels": d("channels")}]
+    active = cfg.get("active")
+    if active not in {e["id"] for e in out}:
+        active = out[0]["id"]
+    return out, active
+
+
+def safe_tag(text):
+    """A file tag: what goes between the prefix and the label for one scope's
+    captures. Same characters as a prefix may hold, no spaces or '_' (the
+    label's separator), so a tagged prefix still splits back cleanly."""
+    t = "".join("-" if (c in BAD_NAME_CHARS or c.isspace() or c == "_") else c
+                for c in (text or "").strip())
+    while "--" in t:
+        t = t.replace("--", "-")
+    return t.strip("-")
+
+
+def file_prefix(prefix, tag):
+    """The prefix one scope's files are written under: the typed prefix, or
+    <prefix>-<tag> when the scope has a tag. '-' and not '_' so that the runs
+    of <prefix> (capture_files, sequence_files: <prefix>_<run>) never pick up
+    another scope's <prefix>-<tag>_<run>."""
+    return f"{prefix}-{tag}" if tag else prefix
+
+
+class ScopeRegistry:
+    """Every configured scope, in order, and the one ResourceManager they all
+    borrow. See the note above ScopeSlot for why it is built this way.
+
+    `rm_factory` makes that RM when the first connect needs it (never
+    before: building the registry opens nothing). Default: pyvisa's default
+    VISA. Tests pass a fake."""
+
+    def __init__(self, rm_factory=None):
+        self.slots = {}
+        self._rm = None
+        self._rm_factory = rm_factory
+        self._rm_lock = threading.Lock()
+        self.scan_lock = threading.Lock()
+
+    # -- the shared resource manager --------------------------------------
+
+    def rm(self):
+        with self._rm_lock:
+            if self._rm is not None:
+                try:
+                    self._rm.session          # a closed pyvisa RM raises here
+                except AttributeError:
+                    pass                      # not a pyvisa RM (a test's fake)
+                except Exception:
+                    self._rm = None
+            if self._rm is None:
+                make = self._rm_factory or (lambda: pyvisa.ResourceManager())
+                self._rm = make()
+            return self._rm
+
+    # -- slots -------------------------------------------------------------
+
+    def __iter__(self):
+        return iter(list(self.slots.values()))
+
+    def __len__(self):
+        return len(self.slots)
+
+    def get(self, slot_id):
+        return self.slots.get(slot_id)
+
+    def add(self, model, resource="", tag=None, slot_id=None, last_addr="",
+            channel_names=None, channels=None):
+        """A new slot for `model` (a scope_profiles key). Its profile is the
+        shared one from PROFILES unless another slot already uses that, in
+        which case it gets its own instance - a profile may keep state about
+        the instrument it is reading (the DS1054Z keeps its last preamble).
+        With no tag given, the first slot gets none (file names as they always
+        were) and every later one its model key, made unique."""
+        base = scope_profiles.PROFILES.get(model)
+        if base is None:
+            raise ValueError(f"no scope profile called {model!r}")
+        prof = (base if not any(s.prof is base for s in self.slots.values())
+                else type(base)())
+        sid = slot_id or model
+        n = 2
+        while sid in self.slots:
+            sid, n = f"{slot_id or model}-{n}", n + 1
+        if tag is None:
+            tag = "" if not self.slots else self.free_tag(model)
+        slot = ScopeSlot(sid, prof, rm_source=self.rm, resource=resource,
+                         tag=safe_tag(tag), last_addr=last_addr,
+                         channel_names=channel_names, channels=channels)
+        self.slots[sid] = slot
+        return slot
+
+    def free_tag(self, want):
+        taken = {s.tag for s in self.slots.values()}
+        tag, n = safe_tag(want) or "scope", 2
+        base = tag
+        while tag in taken:
+            tag, n = f"{base}{n}", n + 1
+        return tag
+
+    def remove(self, slot_id):
+        """Forget a slot. It must not be connected or busy."""
+        slot = self.slots.get(slot_id)
+        if slot is None:
+            return
+        if slot.connected or slot.busy:
+            raise RuntimeError(f"{slot.label()} is still connected - "
+                               f"disconnect it first")
+        slot.stop()
+        del self.slots[slot_id]
+
+    def connected(self):
+        return [s for s in self.slots.values() if s.connected]
+
+    def held(self, but=None):
+        """Every resource a slot other than `but` has open."""
+        return {_norm_res(s.scope.addr) for s in self.slots.values()
+                if s is not but and s.connected and s.scope.addr}
+
+    # -- connecting --------------------------------------------------------
+
+    def connect(self, slot):
+        """Open `slot`'s scope: its typed address if it has one, else a scan
+        that tries its last address first and never touches a resource another
+        slot holds. Scans run one at a time. Returns the *IDN? reply. Call it
+        on the slot's worker (slot.submit(registry.connect, slot)) or hold
+        slot.lock."""
+        with slot.lock, self.scan_lock:
+            idn = slot.scope.connect(slot.resource.strip() or None,
+                                     skip=self.held(but=slot),
+                                     prefer=slot.last_addr or None)
+            slot.last_addr = slot.scope.addr
+            return idn
+
+    def disconnect(self, slot):
+        with slot.lock:
+            slot.scope.close()
+
+    def close(self):
+        """Close every scope, then the shared RM - the one place it closes."""
+        for slot in self:
+            try:
+                self.disconnect(slot)
+            except Exception:
+                pass
+            slot.stop()
+        with self._rm_lock:
+            if self._rm is not None:
+                try:
+                    self._rm.close()
+                except Exception:
+                    pass
+            self._rm = None
+
+    # -- config ------------------------------------------------------------
+
+    def to_config(self):
+        return [s.config() for s in self.slots.values()]
+
+    @classmethod
+    def from_config(cls, cfg, rm_factory=None):
+        """(registry, active slot id) from a session config, migrated."""
+        reg = cls(rm_factory)
+        entries, active = migrate_config(cfg)
+        for e in entries:
+            reg.add(e["model"], resource=e["resource"], tag=e["tag"],
+                    slot_id=e["id"], last_addr=e["last_addr"],
+                    channel_names=e["channel_names"], channels=e["channels"])
+        if active not in reg.slots:
+            active = next(iter(reg.slots))
+        return reg, active
 
 
 # ---------------------------------------------------------------------------
