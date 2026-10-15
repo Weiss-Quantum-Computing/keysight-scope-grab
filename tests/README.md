@@ -18,6 +18,9 @@ nothing opens a VISA session.
 | `test_probe.py` | `tools/probe_scope.py` driven against mock instruments |
 | `test_path_import.py` | That EOM-ILC can still load `scope_grab.py` by file path |
 | `test_headless.py` | The API another program drives a `Scope` through: settings snapshot, offset dither, capture files, each against what the panel does |
+| `test_consumer_api.py` | Every name EOM-ILC and the polarimeter reach into this file for, loaded by path, and their shared-ResourceManager monkeypatch |
+| `test_registry.py` | Several scopes without the window: `ScopeRegistry`/`ScopeSlot`, the config migration, two scopes on one fake USB bus (no scan opens the other's session, one close never drops the other, parallel workers) |
+| `test_multi.py` | The window with two scopes: switching in place (no restart), Connect/Disconnect each, GRAB one or all (in parallel, per-scope names and file tags), a dithered sequence across both, the config round trip |
 | `golden/` | Expected output, byte for byte |
 
 ## What the goldens are

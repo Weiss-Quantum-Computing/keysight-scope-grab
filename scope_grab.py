@@ -5118,6 +5118,15 @@ class App:
         self.save_config()
         self.auto.set(False)
         self.toggle_auto()
+        # Let each scope's worker finish what is queued - the dither restore
+        # that stop_sequence just queued is the one that matters - before the
+        # sessions close. A transfer that will not end gets a few seconds.
+        for slot in self.registry:
+            if slot.connected and slot.busy:
+                try:
+                    slot.submit(lambda: None).result(timeout=3.0)
+                except Exception:
+                    pass
         # Every scope, then the shared RM. A worker stuck in a transfer gets a
         # few seconds to finish before its session is closed under it.
         self.registry.close(timeout=3.0)

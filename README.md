@@ -3,9 +3,11 @@
 One-click waveform capture from a bench oscilloscope. No BenchVue, no
 instrument-control licences - just PyVISA over the rear-panel USB-B port.
 
-Which scope it drives is set by a **profile**. One is written today, for the
-Keysight InfiniiVision MSO-X 2014A; see [Instrument
-profiles](#instrument-profiles) for what a second one has to supply.
+Which scope it drives is set by a **profile**: the Keysight InfiniiVision
+MSO-X 2014A, and a Rigol DS1054Z (measured on the bench for short screen-depth
+records; its deep-memory readout is deliberately not built). See [Instrument
+profiles](#instrument-profiles). Several scopes can be open in one window at
+once - see [Several scopes](#several-scopes).
 
 Press GRAB (or the space bar) and you get, in your chosen folder:
 
@@ -46,8 +48,9 @@ pythonw scope_grab.py
 `pythonw` keeps the console window from appearing. `scope_profiles.py` has to sit
 beside it - the two files travel together.
 
-The app auto-connects to the first instrument matching the current profile; hit
-**Connect** to retry. A device that answers but is not the profile's is reported
+The app auto-connects every scope in its **Scopes** box on startup, each on its
+own (one that is off is logged and the others still come up); a row's
+**Connect** retries that one. A device that answers but is not the profile's is reported
 rather than passed over in silence, and if it turns out to be a scope another
 profile would have handled, the error says which - having the wrong model
 selected otherwise looks exactly like an unplugged cable.
@@ -76,6 +79,41 @@ selected otherwise looks exactly like an unplugged cable.
 - **save screenshot?** - whether each grab also writes the PNG. The preview only
   updates when this is on, since it displays the file that was written.
 - **Data:** - NPZ or CSV, what the samples are saved as. See below.
+
+## Several scopes
+
+The **Scopes** box at the top of the window has one row per scope: which one the
+window is **shown** for, its VISA **address** (blank = find it by scanning),
+its **file tag**, **Connect / Disconnect**, and what is connected. **Add scope**
+adds a row for the model picked beside it (the same model may be added twice);
+**Remove shown** drops the shown row once it is disconnected.
+
+- **Any number can be open at once.** Each scope does all its instrument I/O on
+  a thread of its own, in the order things were asked of it; all of them share
+  one VISA resource manager that only the window closes, so disconnecting one
+  never drops another's session. A scan for one scope never opens an address
+  another scope has open.
+- **Switching what is shown never restarts and never disconnects.** Picking
+  another row rebuilds the channel boxes, the scope buttons and the settings
+  panel from that scope's profile in place. Each scope keeps its own channel
+  names and ticks, its last reading and any unapplied edits; a reading that
+  arrives for a scope that is not shown waits and appears when it is. Switching
+  waits while a capture or a sequence is running.
+- **GRAB takes:** *the shown scope*, or *every connected scope*. With all of
+  them, each scope arms, waits for its trigger and reads out on its own thread at
+  the same time, and the run is over when every one has written; a sequence
+  stops on a run where any scope saved nothing. Sequences, auto-grab, the offset
+  dither (one plan per scope, put back on each scope once its last run has read
+  out) and Space all follow the same choice.
+- **File names.** A scope with no file tag writes `<prefix>_<run>` as always; a
+  tagged one writes `<prefix>-<tag>_<run>` (e.g. `eom_003.npz` from the MSO-X
+  and `eom-ds1054z_003.npz` from the Rigol). The first scope of an old config
+  has no tag, so its file names do not change; an added one gets its model as
+  its tag. GRAB ALL refuses if two scopes would write under the same prefix. A
+  sequence picks labels that are free for every scope it captures from.
+- The screenshot browser, the plot tabs, **Average sequence...**, the next-name
+  line and setups follow the **shown** scope (compare another scope's runs by
+  typing its prefix, `eom-ds1054z`, in the Compare box).
 
 ## Data format: NPZ or CSV
 
@@ -708,7 +746,8 @@ again.
 
 ## Remembered settings
 
-The scope model, the output folder, the setups folder and setup prefix, filename
+The scopes (each one's model, address, file tag, channel names and ticks), which
+one is shown, what GRAB takes, the output folder, the setups folder and setup prefix, filename
 prefix, channel names, which
 channels are ticked, the trigger wait, the transfer point count, the three
 sequence boxes - runs, interval and first label - the auto-grab interval,
@@ -748,9 +787,14 @@ surviving a restart would have the app capturing, or saving a stale trace as a n
 one, before anyone had looked at what the scope was set to. Both start off every
 time.
 
-`model` is read before the window is built, because the settings panel is laid
-out from the profile it names. A model this version does not have falls back to
-the default one and says so in the log, rather than refusing to start.
+`scopes` and `active` are read before the window is built, because the
+settings panel is laid out from the profile of the scope on show. A config
+written before there were several scopes (just `model`, `channel_names`,
+`channels`) becomes one scope with no file tag. A model this version does not
+have is left out and the log says so, rather than refusing to start. The
+single-scope keys are still written, mirroring the scope on show, because the
+bench copy of Scope Grab reads the same file (it will drop `scopes` if it saves
+it - the next start here then comes back with one scope).
 
 Delete the file to go back to defaults. A missing, truncated or malformed file is
 ignored - each value falls back to its default independently, and the log notes
@@ -800,13 +844,10 @@ anything resets it, whether the hit count reports the setting or the depth, and
 which points modes will serve a record stopped one way rather than another are
 all things this program got wrong until they were measured on the bench.
 
-The **Scope** box on the connection row picks which one the panel is for. It
-restarts the program: the settings rows, the channel list, the metadata layout
-and the screenshot box are all built from the profile, so switching in place
-would mean rebuilding almost every widget in the window, and a restart is the
-version of that which cannot leave a half-built panel behind. Your folder,
-prefix and channel names are kept; unapplied settings edits are not. It refuses
-while a capture or a sequence is running.
+Once registered, a profile is offered in the **Scopes** box's model list -
+see [Several scopes](#several-scopes). Nothing restarts: the settings rows, the
+channel list and the screenshot box are rebuilt from the profile in place when
+the scope on show changes.
 
 ### Driving a scope from another program
 
@@ -823,8 +864,11 @@ would have written:
 | `write_capture(base, ext, recs, metadata)` | the NPZ or CSV plus the `.txt` sidecar |
 | `read_npz()`, `load_capture()` | reading either format back |
 
-The panel and another program cannot use the scope at the same time; close the
-panel first.
+`ScopeRegistry` / `ScopeSlot` (several scopes, one worker thread and lock each,
+one shared resource manager) are module-level too and need no window.
+
+The panel and another program cannot use the same scope at the same time;
+close the panel first (or disconnect that scope in it).
 
 ### Tests
 
