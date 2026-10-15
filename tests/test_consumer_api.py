@@ -143,12 +143,49 @@ def main():
           not shared.closed and sc.inst is None and sc.idn == "")
     check("and closed the instrument session", shared.opened[-1].closed)
 
-    own = FakeRM({"USB0::x::INSTR": good})
-    sc = sg.Scope(prof)
-    sc._make_rm = lambda: own
-    sc.connect()
-    sc.close()
-    check("a Scope left to itself still closes the RM it made", own.closed)
+    print("\na failed connect never closes an RM the Scope did not make")
+    # The polarimeter's case (found by the 15 Oct review, G6): one RM shared
+    # by the scope, the 4063B and the DS345; a scope Connect that finds no
+    # scope used to call rm.close() directly and kill the AWG's session.
+    for how in ("host-replaced _make_rm", "Scope(prof, rm=shared)"):
+        shared = FakeRM({"USB0::0xF4EC::0xEE38::574D22116::INSTR":
+                         "B&K Precision,4063B,574D22116,1.0"})
+        awg = shared.open_resource("USB0::0xF4EC::0xEE38::574D22116::INSTR")
+        if how.startswith("host"):
+            sc = sg.Scope(prof)
+            sc._make_rm = lambda: shared
+        else:
+            sc = sg.Scope(prof, rm=shared)
+        try:
+            sc.connect()
+            refused = False
+        except RuntimeError:
+            refused = True
+        check(f"{how}: no scope found is an error", refused)
+        check(f"{how}: the shared RM and the AWG session survive it",
+              not shared.closed and not awg.closed)
+        sc.close()
+        check(f"{how}: and close() leaves them too",
+              not shared.closed and not awg.closed)
+
+    print("\nan RM the Scope made itself is still its own to close")
+    real = sg.pyvisa.ResourceManager
+    try:
+        own = FakeRM({"USB0::x::INSTR": good})
+        sg.pyvisa.ResourceManager = lambda *a: own
+        sc = sg.Scope(prof)
+        sc.connect()
+        sc.close()
+        check("closed on close()", own.closed)
+        own = FakeRM({})
+        sc = sg.Scope(prof)
+        try:
+            sc.connect()
+        except RuntimeError:
+            pass
+        check("and on a connect that found nothing", own.closed)
+    finally:
+        sg.pyvisa.ResourceManager = real
 
     print()
     if FAILS:

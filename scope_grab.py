@@ -1056,16 +1056,22 @@ class Scope:
     here is the same whichever one is plugged in. Nothing above this class knows
     a SCPI string."""
 
-    def __init__(self, prof, rm_source=None):
+    def __init__(self, prof, rm_source=None, rm=None):
         self.prof = prof
         self.rm = None
-        # A ResourceManager lent by whoever owns it - the panel's registry of
-        # scopes - as a callable returning it. A borrowed RM is never closed
-        # here: pyvisa hands every default caller the same cached one, so
-        # closing it would end every other instrument's session too. Without
-        # one, this Scope makes its own and closes it, as it always did.
+        # A ResourceManager lent by whoever owns it: `rm` itself, or
+        # `rm_source`, a callable returning it (the panel's registry of
+        # scopes). pyvisa hands every default caller the same cached RM, so
+        # closing one that is shared ends every other instrument's session too
+        # - an AWG's, a DS345's, another scope's. So this Scope closes an RM
+        # only if its own _make_rm made it (_rm_made): never a lent one, and
+        # never one from a _make_rm that a host replaced (EOM-ILC's
+        # ilc_bench.make_scope and rampol's hw.share_rm do that), not even on
+        # a failed connect.
+        if rm is not None and rm_source is None:
+            rm_source = lambda: rm
         self._rm_source = rm_source
-        self._rm_borrowed = False
+        self._rm_made = None
         self.inst = None
         self.idn = ""
         self.addr = ""
@@ -1082,14 +1088,20 @@ class Scope:
         # A profile may name a VISA implementation to prefer, so a
         # primary/secondary mixup between two of them cannot break us.
         dll = self.prof.visa_dll
+        rm = None
         if dll and os.path.exists(dll):
             try:
                 rm = pyvisa.ResourceManager(dll)
                 rm.list_resources()
-                return rm
             except Exception:
-                pass
-        return pyvisa.ResourceManager()
+                rm = None
+        if rm is None:
+            rm = pyvisa.ResourceManager()
+        self._rm_made = rm            # ours, so ours to close
+        return rm
+
+    def _owns_rm(self):
+        return self.rm is not None and self.rm is self._rm_made
 
     def connect(self, addr=None, skip=(), prefer=None):
         """Find and open the instrument this profile describes.
@@ -1109,7 +1121,6 @@ class Scope:
             raise RuntimeError(f"{addr} is already open on another scope in "
                                f"this window.")
         self.rm = self._make_rm()
-        self._rm_borrowed = self._rm_source is not None
         if addr:
             candidates = [addr]
         else:
@@ -1154,14 +1165,16 @@ class Scope:
         # Nothing matched, so nothing owns this resource manager any more.
         # Leaving it open holds a VISA session for the life of the program and
         # is half of how a second copy of this program locks the first out.
-        # Unless it was lent: then the other scopes are still using it.
-        if not self._rm_borrowed:
+        # Unless it is not ours: a lent or host-supplied RM is still carrying
+        # other instruments' sessions (a failed scope Connect used to close
+        # the polarimeter's shared RM under its AWG and DS345).
+        if self._owns_rm():
             try:
                 self.rm.close()
             except Exception:
                 pass
+            self._rm_made = None
         self.rm = None
-        self._rm_borrowed = False
         raise RuntimeError(self._nothing_found(seen, refused))
 
     def _nothing_found(self, seen, refused=()):
@@ -1234,14 +1247,16 @@ class Scope:
         return msg
 
     def close(self):
-        for obj in (self.inst, None if self._rm_borrowed else self.rm):
+        own = self._owns_rm()
+        for obj in (self.inst, self.rm if own else None):
             try:
                 if obj is not None:
                     obj.close()
             except Exception:
                 pass
+        if own:
+            self._rm_made = None
         self.inst = self.rm = None
-        self._rm_borrowed = False
         # Cleared with the session: a saved setup stamps itself with scope.idn,
         # and holding the last instrument's name after it has gone would put it
         # on a setup saved with nothing plugged in.

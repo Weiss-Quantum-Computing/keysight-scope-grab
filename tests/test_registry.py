@@ -272,11 +272,24 @@ def registry_checks():
 def standalone_checks():
     print("\na Scope on its own is unchanged")
     rm = FakeRM({MSOX_RES: MSOX_IDN})
-    s = sg.Scope(sg.scope_profiles.PROFILES["msox2014a"])
-    s._make_rm = lambda: rm
-    s.connect()
-    s.close()
+    sg.pyvisa.ResourceManager = lambda *a: rm
+    try:
+        s = sg.Scope(sg.scope_profiles.PROFILES["msox2014a"])
+        s.connect()
+        s.close()
+    finally:
+        sg.pyvisa.ResourceManager = _no_real_visa
     check("closes the RM it made", rm.closed == 1)
+    host = FakeRM({})
+    s = sg.Scope(sg.scope_profiles.PROFILES["msox2014a"])
+    s._make_rm = lambda: host
+    try:
+        s.connect()
+    except RuntimeError:
+        pass
+    s.close()
+    check("but not one a host's _make_rm handed it, even on a failed connect",
+          host.closed == 0)
     rm2 = FakeRM({MSOX_RES: MSOX_IDN, RIGOL_RES: RIGOL_IDN})
     s = sg.Scope(sg.scope_profiles.PROFILES["msox2014a"], rm_source=lambda: rm2)
     s.connect(prefer=MSOX_RES)
