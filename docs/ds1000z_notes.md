@@ -212,6 +212,26 @@ it; an 8-deep average builds in 0.9 s and raises the trace from 21 to 32
 distinct levels; the screenshot is a PNG; the metadata file comes out with no
 unknowns; and every setting it touched came home.
 
+## A second DS1054Z on older firmware, 19 Nov 2026
+
+DS1054Z `DS1ZA171408768`, firmware **00.04.03**, over USB with NI-VISA.
+`tools/check_profile.py ds1054z` passes in full - all 47 fields, the plain
+capture, the 8-deep software average, the metadata, every setting home - with
+one change to the profile:
+
+- **`:DISPlay:DATA? ON,0,PNG` is not understood.** The scope queues
+  `-220,"Parameter error"` and sends nothing, so the read waits out the whole
+  VISA timeout, and afterwards the USB session does not answer even `*IDN?`
+  until a device clear. The bare `:DISPlay:DATA?` answers with an 800x480
+  BMP24, 1152054 bytes, in 0.3 s.
+- So `screenshot()` now reads the firmware out of `*IDN?` first: 00.04.04 and
+  later get the PNG form as before; anything older, or a version it cannot
+  read, gets the bare form, re-encoded to PNG by `bmp_to_png()` (standard
+  library and numpy, no Pillow). It never tries the PNG form and recovers,
+  because the failure costs a timeout and a wedged session.
+- Exactly which firmware first took the parameters is not known - only that
+  00.04.03 does not and 00.04.04.SP1 does.
+
 ## Running the probe
 
 ```

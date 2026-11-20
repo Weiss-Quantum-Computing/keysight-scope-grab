@@ -24,9 +24,62 @@ turns out to be common can move up when there is a second one to compare
 against.
 """
 
+import re
+import struct
 import time
+import zlib
 
 import numpy as np
+
+
+def firmware_version(idn):
+    """The numeric part of the firmware field of an *IDN? reply, as a tuple:
+    "RIGOL TECHNOLOGIES,DS1054Z,DS1Z...,00.04.04.SP1" gives (0, 4, 4).
+    Returns None when there is no fourth field or it does not start with a
+    number, so a caller can treat an unknown version as the cautious case."""
+    parts = idn.split(",")
+    if len(parts) < 4:
+        return None
+    nums = re.findall(r"\d+", parts[3].split(".SP")[0])
+    return tuple(int(n) for n in nums) or None
+
+
+def bmp_to_png(bmp):
+    """Re-encode an uncompressed 24- or 32-bit BMP as PNG bytes.
+
+    Standard library and numpy only, so a scope that can only send a BMP still
+    produces the PNG the rest of the program expects without making Pillow a
+    requirement. Handles both row orders (a positive BMP height is bottom-up)
+    and the 4-byte row padding."""
+    bmp = bytes(bmp)
+    if bmp[:2] != b"BM":
+        raise ValueError(f"not a BMP: starts {bmp[:4]!r}")
+    offset = struct.unpack_from("<I", bmp, 10)[0]
+    width, height = struct.unpack_from("<ii", bmp, 18)
+    bpp = struct.unpack_from("<H", bmp, 28)[0]
+    compression = struct.unpack_from("<I", bmp, 30)[0]
+    if bpp not in (24, 32) or compression not in (0, 3):
+        raise ValueError(f"unsupported BMP: {bpp} bpp, compression {compression}")
+    top_down = height < 0
+    height = abs(height)
+    step = bpp // 8
+    stride = (width * step + 3) & ~3
+    rows = np.frombuffer(bmp, np.uint8, count=stride * height, offset=offset)
+    rgb = rows.reshape(height, stride)[:, :width * step]
+    rgb = rgb.reshape(height, width, step)[:, :, 2::-1]   # BGR(A) -> RGB
+    if not top_down:
+        rgb = rgb[::-1]
+    raw = np.zeros((height, width * 3 + 1), np.uint8)    # filter byte 0 per row
+    raw[:, 1:] = rgb.reshape(height, width * 3)
+
+    def chunk(kind, data):
+        return (struct.pack(">I", len(data)) + kind + data +
+                struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF))
+
+    return (b"\x89PNG\r\n\x1a\n" +
+            chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)) +
+            chunk(b"IDAT", zlib.compress(raw.tobytes(), 6)) +
+            chunk(b"IEND", b""))
 
 
 class Record:
@@ -492,7 +545,9 @@ class KeysightInfiniiVision(ScopeProfile):
 
 class RigolDS1000Z(ScopeProfile):
     """Rigol MSO1000Z/DS1000Z. Established against a DS1054Z on firmware
-    00.04.04.SP1, 2 Sep 2026; the probe reports are in docs/.
+    00.04.04.SP1, 2 Sep 2026; the probe reports are in docs/. Also run
+    against a second DS1054Z on 00.04.03, 19 Nov 2026, where everything held
+    except the screenshot - see screenshot().
 
     More carries over from the Keysight than expected - the waveform preamble
     has the same ten fields in the same order, and :ACQuire:TYPE answers with
@@ -817,12 +872,32 @@ class RigolDS1000Z(ScopeProfile):
         return Record((xinc, xorig, xref), codes=raw.astype(np.uint8),
                       y=(yinc, yref + yorig, 0.0))
 
+    # The first firmware the parameterised :DISPlay:DATA? is known to work on.
+    png_firmware = (0, 4, 4)
+
     def screenshot(self, scope):
-        # MEASURED: 800x480 PNG, 36-43 kB. The parameters are
-        # [<color>,<invert>,<format>] and the default format is BMP24, so all
-        # three have to be given to get a PNG.
-        return scope.inst.query_binary_values(":DISPlay:DATA? ON,0,PNG",
-                                              datatype="B", container=bytearray)
+        """MEASURED on 00.04.04.SP1: `:DISPlay:DATA? ON,0,PNG` returns an
+        800x480 PNG, 36-43 kB. The parameters are [<color>,<invert>,<format>]
+        and the default format is BMP24, so all three have to be given to get
+        a PNG.
+
+        MEASURED on 00.04.03, 19 Nov 2026: that firmware does not take the
+        parameters. It queues -220 "Parameter error", sends nothing, and the
+        read waits out the whole VISA timeout - after which the USB session
+        stops answering even *IDN? until a device clear. The bare
+        `:DISPlay:DATA?` works on it: an 800x480 BMP24, 1152054 bytes, in
+        0.3 s, re-encoded to PNG here. So the form is chosen from the firmware
+        in *IDN? before asking, never by trying the PNG form and recovering,
+        and an unreadable version gets the bare form, which every firmware
+        answers."""
+        fw = firmware_version(getattr(scope, "idn", "") or "")
+        if fw is not None and fw >= self.png_firmware:
+            return scope.inst.query_binary_values(":DISPlay:DATA? ON,0,PNG",
+                                                  datatype="B",
+                                                  container=bytearray)
+        bmp = scope.inst.query_binary_values(":DISPlay:DATA?", datatype="B",
+                                             container=bytearray)
+        return bytearray(bmp_to_png(bmp))
 
     def hit_count(self, scope):
         """There is no :WAVeform:COUNt here; the count is preamble field 3.
